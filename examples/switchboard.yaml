@@ -1,0 +1,52 @@
+# Modo framework: o roteador sem banco nem console, configurado só por este arquivo.
+#
+#   uv run switchboard -c examples/switchboard.yaml check
+#   uv run switchboard -c examples/switchboard.yaml agents
+#   uv run switchboard -c examples/switchboard.yaml ask "Qual o horário de atendimento aos sábados?"
+#
+# Também serve de configuração para o router sem banco:
+#   SWITCHBOARD_CONFIG_FILE=examples/switchboard.yaml uv run switchboard-router
+#
+# ${VAR} e ${VAR:-padrão} são lidos do ambiente; "env:NOME" em chaves é resolvido na hora da chamada.
+
+models:
+  - name: offline
+    provider: offline
+
+  - name: openai
+    provider: openai
+    base_url: https://api.openai.com/v1
+    model: ${OPENAI_MODEL:-gpt-5-mini}
+    api_key: env:OPENAI_API_KEY
+
+  - name: claude
+    provider: anthropic
+    model: ${ANTHROPIC_MODEL:-claude-sonnet-4-5}
+    api_key: env:ANTHROPIC_API_KEY
+
+  - name: ollama
+    provider: openai
+    base_url: http://localhost:11434/v1
+    model: ${OLLAMA_MODEL:-qwen3:8b}
+
+agents:
+  - name: credito
+    url: http://localhost:8101/mcp
+    description: Simulações de financiamento e empréstimo (tabela Price e SAC).
+  - name: chamados
+    url: http://localhost:8102/mcp
+    description: Abertura e consulta de chamados de suporte.
+
+knowledge_bases:
+  - name: manual
+    description: Manual de atendimento e políticas da Acme (fictícia).
+    paths: [knowledge]          # relativo a este arquivo
+    embedder:
+      kind: hashing             # ou: kind: model, connection: openai, model: text-embedding-3-small
+
+profiles:
+  - name: default
+    model: offline              # troque por openai, claude ou ollama
+    agents: [credito, chamados]
+    knowledge_bases: [manual]
+    min_score: 0.15

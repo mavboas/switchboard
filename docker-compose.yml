@@ -1,0 +1,130 @@
+# Stack completa do Switchboard:
+#   postgres (pgvector) · console (UI + API admin) · router (API de chat)
+#   · dois agentes MCP de exemplo (crédito e chamados).
+#
+#   cp .env.example .env      # ou: make env (gera uma SWITCHBOARD_SECRET_KEY aleatória)
+#   docker compose up -d --build
+#
+# Console: http://localhost:8000 · Router: http://localhost:8080 (docs em /docs)
+# As portas ficam presas a 127.0.0.1; para expor na rede, ajuste CONSOLE_BIND/ROUTER_BIND
+# no .env e defina SWITCHBOARD_CONSOLE_PASSWORD e SWITCHBOARD_API_KEYS.
+
+name: switchboard
+
+x-app-env: &app-env
+  SWITCHBOARD_DATABASE_URL: postgresql://${POSTGRES_USER:-switchboard}:${POSTGRES_PASSWORD:-switchboard}@postgres:5432/${POSTGRES_DB:-switchboard}
+  # chave mestra que cifra os segredos gravados pelo console. Vazia = gerada na
+  # primeira subida e guardada no volume "secrets" (compartilhado com o router)
+  SWITCHBOARD_SECRET_KEY: ${SWITCHBOARD_SECRET_KEY:-}
+  SWITCHBOARD_SECRET_KEY_FILE: /var/lib/switchboard/secret.key
+  SWITCHBOARD_ALLOWED_ENV_SECRETS: ${SWITCHBOARD_ALLOWED_ENV_SECRETS:-*_API_KEY,MCP_*}
+  SWITCHBOARD_LOG_LEVEL: ${SWITCHBOARD_LOG_LEVEL:-info}
+  # chaves de provedores: no console, use env:OPENAI_API_KEY (etc.) no campo da chave
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
+  GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+  OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+  GROQ_API_KEY: ${GROQ_API_KEY:-}
+
+x-python-healthcheck: &python-healthcheck
+  interval: 10s
+  timeout: 5s
+  retries: 12
+  start_period: 10s
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-switchboard}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-switchboard}
+      POSTGRES_DB: ${POSTGRES_DB:-switchboard}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  console:
+    build:
+      context: .
+      args:
+        PACKAGE: switchboard-console
+    image: switchboard-console:dev
+    command: ["switchboard-console"]
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      SWITCHBOARD_ROUTER_URL: http://router:8080
+      SWITCHBOARD_ROUTER_PUBLIC_URL: ${SWITCHBOARD_ROUTER_PUBLIC_URL:-http://localhost:8080}
+      SWITCHBOARD_ROUTER_API_KEY: ${SWITCHBOARD_ROUTER_API_KEY:-}
+      SWITCHBOARD_CONSOLE_PASSWORD: ${SWITCHBOARD_CONSOLE_PASSWORD:-}
+      SWITCHBOARD_CONSOLE_ALLOWED_HOSTS: ${SWITCHBOARD_CONSOLE_ALLOWED_HOSTS:-localhost,127.0.0.1,[::1]}
+      SWITCHBOARD_SEED_DEMO: ${SWITCHBOARD_SEED_DEMO:-true}
+      SWITCHBOARD_DEMO_CREDITO_URL: http://agent-credito:8101/mcp
+      SWITCHBOARD_DEMO_CHAMADOS_URL: http://agent-chamados:8102/mcp
+    ports:
+      - "${CONSOLE_BIND:-127.0.0.1}:${CONSOLE_PORT:-8000}:8000"
+    volumes:
+      - secrets:/var/lib/switchboard
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      <<: *python-healthcheck
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+
+  router:
+    build:
+      context: .
+      args:
+        PACKAGE: switchboard-router
+    image: switchboard-router:dev
+    command: ["switchboard-router"]
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      SWITCHBOARD_API_KEYS: ${SWITCHBOARD_API_KEYS:-}
+      SWITCHBOARD_ALLOWED_HOSTS: ${SWITCHBOARD_ALLOWED_HOSTS:-localhost,127.0.0.1,[::1],router}
+      SWITCHBOARD_DEFAULT_PROFILE: ${SWITCHBOARD_DEFAULT_PROFILE:-default}
+    ports:
+      - "${ROUTER_BIND:-127.0.0.1}:${ROUTER_PORT:-8080}:8080"
+    volumes:
+      - secrets:/var/lib/switchboard
+    depends_on:
+      postgres:
+        condition: service_healthy
+      console:
+        condition: service_healthy
+    healthcheck:
+      <<: *python-healthcheck
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=3)"]
+
+  agent-credito:
+    build:
+      context: .
+      args:
+        PACKAGE: switchboard-example-agents
+    image: switchboard-agents:dev
+    command: ["switchboard-agent", "credito", "--host", "0.0.0.0", "--port", "8101"]
+    restart: unless-stopped
+    ports:
+      - "${AGENTS_BIND:-127.0.0.1}:8101:8101"
+
+  agent-chamados:
+    image: switchboard-agents:dev
+    pull_policy: never
+    command: ["switchboard-agent", "chamados", "--host", "0.0.0.0", "--port", "8102"]
+    restart: unless-stopped
+    ports:
+      - "${AGENTS_BIND:-127.0.0.1}:8102:8102"
+    depends_on:
+      - agent-credito
+
+volumes:
+  pgdata:
+  secrets:

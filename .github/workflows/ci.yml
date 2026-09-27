@@ -1,0 +1,70 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: "0.8.17"
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: switchboard
+          POSTGRES_PASSWORD: switchboard
+          POSTGRES_DB: switchboard_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U switchboard -d switchboard_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      SWITCHBOARD_TEST_DATABASE_URL: postgresql://switchboard:switchboard@localhost:5432/switchboard_test
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: "0.8.17"
+      - run: uv sync --frozen
+      - run: uv run pytest -q
+
+  compose-smoke:
+    # sobe a stack inteira como o usuário faria e testa um pedido de ponta a ponta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: cp .env.example .env
+      - run: docker compose up -d --build --wait --wait-timeout 300
+      - name: Resposta direta (RAG) e delegação via MCP
+        run: |
+          set -euo pipefail
+          ask() {
+            curl -sf http://localhost:8080/v1/chat -H 'Content-Type: application/json' \
+              -d "{\"message\": \"$1\"}" | python3 -c "import sys, json; d = json.load(sys.stdin); print(d['route'], d.get('tool')); assert d['route'] == '$2', d"
+          }
+          ask "Qual o horário de atendimento aos sábados?" direct
+          ask "Simule um empréstimo de R\$ 50 mil em 24 meses a 1,5% ao mês" delegated
+          curl -sf http://localhost:8000/ > /dev/null
+      - if: failure()
+        run: docker compose logs --no-color
+      - if: always()
+        run: docker compose down -v
