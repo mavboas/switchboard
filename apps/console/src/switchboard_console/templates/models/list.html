@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% from "_macros.html" import delete_button, empty %}
+{% block title %}Modelos{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Modelos</h1>
+    <p>Conexões com provedores de LLM. Troque o modelo de um roteador sem mudar código: OpenAI, Anthropic, Azure, Gemini, Ollama ou qualquer API compatível com OpenAI.</p>
+  </div>
+  <div class="actions"><a class="btn primary" href="/models/new">Novo modelo</a></div>
+</div>
+
+<div class="card">
+  {% if models %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Nome</th><th>Provedor</th><th>Modelo</th><th>Chave</th><th>Usado por</th><th class="right">Ações</th></tr></thead>
+    <tbody>
+    {% for m in models %}
+      <tr>
+        <td><a href="/models/{{ m.id }}"><strong>{{ m.name }}</strong></a>{% if m.base_url %}<span class="sub mono">{{ m.base_url }}</span>{% endif %}</td>
+        <td><span class="badge">{{ presets[m.preset].label if m.preset in presets else m.provider }}</span></td>
+        <td class="mono">{{ m.model or '—' }}</td>
+        <td class="small">{{ m.api_key|secret }}</td>
+        <td>{% for p in m.used_by %}<span class="pill">{{ p }}</span> {% else %}<span class="muted">—</span>{% endfor %}</td>
+        <td class="right nowrap">
+          <form class="inline" method="post" action="/models/{{ m.id }}/test"><button class="btn small" type="submit">Testar</button></form>
+          <a class="btn small" href="/models/{{ m.id }}">Editar</a>
+          {{ delete_button("/models/" ~ m.id ~ "/delete", confirm="Remover o modelo " ~ m.name ~ "?") }}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}
+  {{ empty("Nenhum modelo cadastrado", "Cadastre a conexão com o LLM que o roteador vai usar.", "/models/new", "Novo modelo") }}
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Atalhos</h2>
+  <div class="pill-list">
+    {% for key, p in presets.items() %}<a class="btn small" href="/models/new?preset={{ key }}">{{ p.label }}</a>{% endfor %}
+  </div>
+</div>
+{% endblock %}

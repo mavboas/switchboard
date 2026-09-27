@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% from "_macros.html" import field, textarea, checkbox %}
+{% block title %}{{ 'Editar' if values.id else 'Registrar' }} agente{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <div class="crumbs"><a href="/agents">Agentes MCP</a> /</div>
+    <h1>{{ values.name if values.id else 'Registrar agente' }}</h1>
+    <p>Informe o endpoint MCP do agente. Ao salvar, o console conecta, faz o handshake e lista as tools para você conferir.</p>
+  </div>
+</div>
+
+{% if error %}<div class="flash error">{{ error }}</div>{% endif %}
+
+<form method="post" action="{{ '/agents/' ~ values.id if values.id else '/agents' }}" class="card">
+  <div class="form-grid">
+    {{ field("name", "Nome", values.name, placeholder="ex.: credito", required=true, help="Minúsculas, números, - ou _. É o nome que o LLM vê no catálogo.") }}
+    <div class="field">
+      <label for="f-transport">Transporte</label>
+      <select id="f-transport" name="transport">
+        <option value="streamable-http" {% if values.transport != 'sse' %}selected{% endif %}>Streamable HTTP (recomendado)</option>
+        <option value="sse" {% if values.transport == 'sse' %}selected{% endif %}>SSE (legado)</option>
+      </select>
+    </div>
+    {{ field("url", "URL do endpoint MCP", values.url, type="url", placeholder="http://localhost:8101/mcp", required=true, cls="full") }}
+    {{ textarea("description", "Descrição para o roteador", values.description, help="Quando delegar para este agente. Se ficar vazia, usamos as <em>instructions</em> que o próprio servidor MCP publica.", cls="full", rows=2) }}
+
+    <div class="field">
+      <label for="f-auth_token">Token de acesso (opcional)</label>
+      <input type="password" id="f-auth_token" name="auth_token" autocomplete="off"
+             placeholder="{{ 'deixe em branco para manter: ' ~ (values.auth_token|secret) if values.auth_token else 'enviado como Authorization: Bearer' }}">
+      <div class="help">Texto (fica cifrado{% if not secrets_enabled %}; exige <code>SWITCHBOARD_SECRET_KEY</code>{% endif %}) ou <code>env:NOME</code>.</div>
+      {% if values.auth_token %}<label class="small"><input type="checkbox" name="clear_auth_token"> remover o token atual</label>{% endif %}
+    </div>
+    {{ field("allowed_tools", "Tools liberadas (allowlist)", values.allowed_tools, placeholder="vazio = todas", help="Nomes separados por vírgula. Tools fora da lista ficam invisíveis para o roteador e não podem ser chamadas.") }}
+
+    {{ field("timeout_s", "Timeout (segundos)", values.timeout_s, type="number", attrs='min="1" step="1"') }}
+    {{ checkbox("enabled", "Habilitado", values.enabled, "Agentes desabilitados saem do catálogo de todos os roteadores.") }}
+  </div>
+  <div class="form-actions">
+    <button class="btn primary" type="submit">Salvar e descobrir</button>
+    <a class="btn ghost" href="/agents">Cancelar</a>
+  </div>
+</form>
+{% endblock %}

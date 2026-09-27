@@ -1,0 +1,1 @@
+"""Agentes MCP de exemplo."""

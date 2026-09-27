@@ -1,0 +1,77 @@
+{% macro icon(name) -%}
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+{%- if name == "dashboard" -%}
+<rect x="3.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.5"/>
+{%- elif name == "models" -%}
+<rect x="6" y="6" width="12" height="12" rx="2"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/><path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3"/>
+{%- elif name == "agents" -%}
+<circle cx="12" cy="12" r="3"/><circle cx="5" cy="5" r="2"/><circle cx="19" cy="5" r="2"/><circle cx="12" cy="20" r="2"/><path d="M6.5 6.5l3.3 3.3M17.5 6.5l-3.3 3.3M12 15v3"/>
+{%- elif name == "knowledge" -%}
+<path d="M5 4.5h9.5a3 3 0 0 1 3 3V20H8a3 3 0 0 1-3-3z"/><path d="M5 17a3 3 0 0 1 3-3h9.5"/><path d="M9 8.5h5"/>
+{%- elif name == "profiles" -%}
+<circle cx="6" cy="6" r="2.2"/><circle cx="6" cy="18" r="2.2"/><circle cx="18" cy="12" r="2.2"/><path d="M8.2 6h2.3a3 3 0 0 1 3 3v0a3 3 0 0 0 3 3h-.3M8.2 18h2.3a3 3 0 0 0 3-3v0a3 3 0 0 1 3-3"/>
+{%- elif name == "playground" -%}
+<path d="M4.5 5.5h15v10h-8l-4.5 3.5v-3.5h-2.5z"/><path d="M8.5 10.5h.01M12 10.5h.01M15.5 10.5h.01"/>
+{%- elif name == "traces" -%}
+<path d="M3 12h4l2.5-6 5 12 2.5-6h4"/>
+{%- elif name == "api" -%}
+<path d="M8.5 7L3.5 12l5 5M15.5 7l5 5-5 5M13.5 5l-3 14"/>
+{%- endif -%}
+</svg>
+{%- endmacro %}
+
+{% macro logo() -%}
+<svg width="30" height="30" viewBox="0 0 32 32" aria-hidden="true">
+  <rect x="1" y="1" width="30" height="30" rx="8" fill="#0f9d8a" opacity=".18"/>
+  {% for y in [8, 16, 24] %}{% for x in [8, 16, 24] %}<circle cx="{{ x }}" cy="{{ y }}" r="2.2" fill="#7dd3c7" opacity=".55"/>{% endfor %}{% endfor %}
+  <path d="M8 8 C 8 18, 24 14, 24 24" fill="none" stroke="#2dd4bf" stroke-width="2.4" stroke-linecap="round"/>
+  <circle cx="8" cy="8" r="3" fill="#2dd4bf"/><circle cx="24" cy="24" r="3" fill="#2dd4bf"/>
+</svg>
+{%- endmacro %}
+
+{% macro route_badge(route) -%}
+<span class="badge route-{{ route }}"><span class="dot"></span>{{ route_labels.get(route, route) }}</span>
+{%- endmacro %}
+
+{% macro status_badge(info) -%}
+{% if info is none %}<span class="badge">desabilitado</span>
+{% elif info.status == "online" %}<span class="badge ok"><span class="dot"></span>online</span>
+{% else %}<span class="badge danger" title="{{ info.error }}"><span class="dot"></span>offline</span>{% endif %}
+{%- endmacro %}
+
+{% macro field(name, label, value="", type="text", help="", placeholder="", required=false, cls="", attrs="") -%}
+<div class="field {{ cls }}">
+  <label for="f-{{ name }}">{{ label }}</label>
+  <input type="{{ type }}" id="f-{{ name }}" name="{{ name }}" value="{{ value if value is not none else '' }}" placeholder="{{ placeholder }}" {% if required %}required{% endif %} {{ attrs|safe }}>
+  {% if help %}<div class="help">{{ help|safe }}</div>{% endif %}
+</div>
+{%- endmacro %}
+
+{% macro textarea(name, label, value="", help="", placeholder="", cls="", rows=4, code=false) -%}
+<div class="field {{ cls }}">
+  <label for="f-{{ name }}">{{ label }}</label>
+  <textarea id="f-{{ name }}" name="{{ name }}" rows="{{ rows }}" placeholder="{{ placeholder }}" class="{{ 'code' if code }}">{{ value if value is not none else '' }}</textarea>
+  {% if help %}<div class="help">{{ help|safe }}</div>{% endif %}
+</div>
+{%- endmacro %}
+
+{% macro checkbox(name, title, checked=false, help="", cls="") -%}
+<label class="check {{ cls }}">
+  <input type="checkbox" name="{{ name }}" {% if checked %}checked{% endif %}>
+  <div><strong>{{ title }}</strong>{% if help %}<span>{{ help }}</span>{% endif %}</div>
+</label>
+{%- endmacro %}
+
+{% macro delete_button(action, label="Remover", confirm="Tem certeza?") -%}
+<form class="inline" method="post" action="{{ action }}" onsubmit='return confirm({{ confirm|tojson }})'>
+  <button class="btn small danger" type="submit">{{ label }}</button>
+</form>
+{%- endmacro %}
+
+{% macro empty(title, text, href="", cta="") -%}
+<div class="empty">
+  <strong>{{ title }}</strong>
+  <div>{{ text }}</div>
+  {% if href %}<p><a class="btn primary" href="{{ href }}">{{ cta }}</a></p>{% endif %}
+</div>
+{%- endmacro %}

@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+{% from "_macros.html" import delete_button, empty %}
+{% block title %}{{ kb.name }}{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <div class="crumbs"><a href="/knowledge">Conhecimento</a> /</div>
+    <h1>{{ kb.name }}</h1>
+    <p>{{ kb.description or 'Sem descrição.' }}</p>
+  </div>
+  <div class="actions">
+    <a class="btn" href="/knowledge/{{ kb.id }}/edit">Configurar</a>
+    {{ delete_button("/knowledge/" ~ kb.id ~ "/delete", label="Remover base", confirm="Remover a base " ~ kb.name ~ " e todos os documentos?") }}
+  </div>
+</div>
+
+{% if kb.stats.stale %}
+<div class="flash warn">
+  {{ kb.stats.stale }} documento(s) foram indexados com outro embedder e não aparecem na busca até reindexar.
+  <form class="inline" method="post" action="/knowledge/{{ kb.id }}/reindex"><button class="btn small" type="submit">Reindexar agora</button></form>
+</div>
+{% endif %}
+
+<div class="stats" style="grid-template-columns: repeat(4, minmax(0,1fr))">
+  <div class="stat"><div class="label">Documentos</div><div class="value">{{ kb.stats.documents }}</div></div>
+  <div class="stat"><div class="label">Trechos</div><div class="value">{{ kb.stats.chunks }}</div></div>
+  <div class="stat"><div class="label">Embedder</div><div class="value" style="font-size:15px">{{ kb.label }}</div><div class="hint">trechos de {{ kb.chunk_size }} chars, sobreposição {{ kb.chunk_overlap }}</div></div>
+  <div class="stat"><div class="label">Usada por</div><div class="value" style="font-size:15px">{{ profiles|join(', ') or '—' }}</div><div class="hint">roteadores</div></div>
+</div>
+
+<div class="grid grid-2">
+  <div class="card">
+    <h2>Adicionar documentos</h2>
+    <form method="post" action="/knowledge/{{ kb.id }}/documents" enctype="multipart/form-data" class="stack">
+      <div class="field">
+        <label for="f-files">Arquivos</label>
+        <input type="file" id="f-files" name="files" multiple>
+        <div class="help">Aceitos: {{ extensions }}. Conteúdo repetido é ignorado.</div>
+      </div>
+      <div class="field">
+        <label for="f-title">…ou cole um texto</label>
+        <input type="text" id="f-title" name="title" placeholder="Título">
+      </div>
+      <textarea name="content" rows="5" placeholder="Conteúdo (Markdown é bem-vindo: os títulos viram seções)"></textarea>
+      <button class="btn primary" type="submit">Indexar</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>Testar a busca</h2>
+    <form method="post" action="/knowledge/{{ kb.id }}/search" class="stack">
+      <input type="search" name="query" value="{{ search.query if search else '' }}" placeholder="Faça uma pergunta como o usuário faria">
+      <button class="btn" type="submit">Buscar</button>
+    </form>
+    {% if search %}
+      <div style="margin-top:14px">
+      {% if search.error %}<div class="flash error">{{ search.error }}</div>{% endif %}
+      {% for h in search.hits %}
+        <div class="source">
+          <div class="head"><span><strong>{{ h.document }}</strong>{% if h.section %} › {{ h.section }}{% endif %}</span><span class="mono">{{ '%.3f'|format(h.score) }}</span></div>
+          <div>{{ h.content|truncate(360) }}</div>
+          <div class="score-bar"><span style="width: {{ [h.score * 100, 100]|min }}%"></span></div>
+        </div>
+      {% else %}
+        {% if not search.error %}<p class="muted">Nenhum trecho encontrado.</p>{% endif %}
+      {% endfor %}
+      </div>
+    {% endif %}
+  </div>
+</div>
+
+<div class="card">
+  <h2>Documentos</h2>
+  {% if documents %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Título</th><th>Origem</th><th>Trechos</th><th>Embedder</th><th>Indexado em</th><th class="right"></th></tr></thead>
+    <tbody>
+    {% for d in documents %}
+      <tr>
+        <td><strong>{{ d.title }}</strong><span class="sub">{{ (d.size / 1024)|round(1) }} KB</span></td>
+        <td class="mono small">{{ d.source }}</td>
+        <td>{{ d.chunks }}</td>
+        <td>{% if d.embedder == kb.label %}<span class="badge">{{ d.embedder }}</span>{% else %}<span class="badge warn">{{ d.embedder }}</span>{% endif %}</td>
+        <td class="nowrap">{{ d.created|datetime }}</td>
+        <td class="right">{{ delete_button("/knowledge/" ~ kb.id ~ "/documents/" ~ d.id ~ "/delete", confirm="Remover " ~ d.title ~ "?") }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}
+  {{ empty("Base vazia", "Envie arquivos ou cole um texto para indexar.") }}
+  {% endif %}
+</div>
+{% endblock %}

@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% from "_macros.html" import route_badge %}
+{% block title %}Execução {{ trace.trace_id[:8] }}{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <div class="crumbs"><a href="/traces">Execuções</a> /</div>
+    <h1>Execução <span class="mono">{{ trace.trace_id[:12] }}</span> {{ route_badge(trace.route) }}</h1>
+    <p>{{ trace.created|datetime }} · roteador <strong>{{ trace.profile }}</strong> · {{ '%.0f'|format(trace.latency_ms) }} ms</p>
+  </div>
+  <div class="actions"><a class="btn" href="/playground?profile={{ trace.profile }}">Abrir no playground</a></div>
+</div>
+
+{% if trace.error %}<div class="flash error">{{ trace.error }}</div>{% endif %}
+{% for w in trace.warnings %}<div class="flash warn">{{ w }}</div>{% endfor %}
+
+<div class="grid grid-2">
+  <div class="card">
+    <h2>Pedido</h2>
+    <pre class="block">{{ trace.question }}</pre>
+    <h2 style="margin-top:16px">Resposta</h2>
+    <pre class="block">{{ trace.answer }}</pre>
+  </div>
+  <div class="card">
+    <h2>Decisão</h2>
+    <dl class="kv">
+      <dt>Rota</dt><dd>{{ route_badge(trace.route) }}</dd>
+      <dt>Motivo</dt><dd>{{ trace.reason or '—' }}</dd>
+      <dt>Modelo</dt><dd class="mono">{{ trace.model }}</dd>
+      <dt>Agente</dt><dd>{% if trace.agent %}<span class="mono">{{ trace.agent }} / {{ trace.tool }}</span>{% else %}—{% endif %}</dd>
+      <dt>Tokens</dt><dd>{{ trace.usage.input_tokens }} entrada · {{ trace.usage.output_tokens }} saída</dd>
+    </dl>
+    {% if trace.arguments %}
+    <h2 style="margin-top:16px">Argumentos da tool</h2>
+    <pre class="block">{{ trace.arguments|tojson(indent=2) }}</pre>
+    {% endif %}
+  </div>
+</div>
+
+{% if trace.sources %}
+<div class="card">
+  <h2>Fontes (RAG)</h2>
+  {% for s in trace.sources %}
+  <div class="source">
+    <div class="head"><span><strong>[{{ s.index }}] {{ s.document }}</strong>{% if s.section %} › {{ s.section }}{% endif %} <span class="muted">· {{ s.kb }}</span></span><span class="mono">{{ '%.3f'|format(s.score) }}</span></div>
+    <div>{{ s.snippet }}</div>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+<div class="card">
+  <h2>Etapas</h2>
+  <ul class="timeline">
+    {% for step in trace.steps %}
+    <li><span class="step-name">{{ step.name }}</span><span class="step-ms">{{ '%.1f'|format(step.duration_ms) }} ms</span>
+      <pre class="block">{{ step.detail|tojson(indent=2) }}</pre></li>
+    {% endfor %}
+  </ul>
+</div>
+{% endblock %}

@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% from "_macros.html" import field, textarea %}
+{% block title %}{{ 'Editar' if values.id else 'Nova' }} base{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <div class="crumbs"><a href="/knowledge">Conhecimento</a> /</div>
+    <h1>{{ values.name if values.id else 'Nova base de conhecimento' }}</h1>
+    <p>O embedder transforma cada trecho em vetor. Comece com o <strong>hashing</strong> (offline, sem chave); troque por um modelo de embeddings para busca semântica de verdade. Trocar o embedder exige reindexar.</p>
+  </div>
+</div>
+
+{% if error %}<div class="flash error">{{ error }}</div>{% endif %}
+
+<form method="post" action="{{ '/knowledge/' ~ values.id if values.id else '/knowledge' }}" class="card">
+  <div class="form-grid">
+    {{ field("name", "Nome", values.name, placeholder="ex.: manual-atendimento", required=true) }}
+    {{ field("description", "Descrição", values.description, placeholder="O que esta base cobre") }}
+
+    <div class="section-title">Embeddings</div>
+    <div class="field">
+      <label for="f-embedder_kind">Embedder</label>
+      <select id="f-embedder_kind" name="embedder_kind">
+        <option value="hashing" {% if values.embedder_kind != 'model' %}selected{% endif %}>Hashing (offline, determinístico)</option>
+        <option value="model" {% if values.embedder_kind == 'model' %}selected{% endif %}>Modelo de embeddings (API /embeddings)</option>
+      </select>
+    </div>
+    {{ field("embedder_dim", "Dimensões (hashing)", values.embedder_dim, type="number", attrs='min="16" step="16"') }}
+    <div class="field">
+      <label for="f-embedding_model_id">Conexão (modelo compatível com OpenAI)</label>
+      <select id="f-embedding_model_id" name="embedding_model_id">
+        <option value="">—</option>
+        {% for c in connections %}<option value="{{ c.id }}" {% if values.embedding_model_id == c.id %}selected{% endif %}>{{ c.name }} · {{ c.base_url }}</option>{% endfor %}
+      </select>
+      <div class="help">Usa a URL e a chave desse modelo. Cadastre em <a href="/models">Modelos</a>.</div>
+    </div>
+    {{ field("embedding_model", "Modelo de embeddings", values.embedding_model, placeholder="ex.: text-embedding-3-small ou nomic-embed-text") }}
+
+    <div class="section-title">Trechos</div>
+    {{ field("chunk_size", "Tamanho do trecho (caracteres)", values.chunk_size, type="number", attrs='min="200" max="8000"') }}
+    {{ field("chunk_overlap", "Sobreposição (caracteres)", values.chunk_overlap, type="number", attrs='min="0" max="2000"') }}
+  </div>
+  <div class="form-actions">
+    <button class="btn primary" type="submit">Salvar</button>
+    <a class="btn ghost" href="{{ '/knowledge/' ~ values.id if values.id else '/knowledge' }}">Cancelar</a>
+  </div>
+</form>
+{% endblock %}

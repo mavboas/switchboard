@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% from "_macros.html" import field, textarea, checkbox %}
+{% block title %}{{ 'Editar' if values.id else 'Novo' }} modelo{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <div class="crumbs"><a href="/models">Modelos</a> /</div>
+    <h1>{{ values.name if values.id else 'Novo modelo' }}</h1>
+    <p>Escolha um atalho de provedor para preencher URL e cabeçalho da chave. Os nomes de modelo são exemplos; confira o catálogo do seu provedor.</p>
+  </div>
+</div>
+
+{% if error %}<div class="flash error">{{ error }}</div>{% endif %}
+
+<form method="post" action="{{ '/models/' ~ values.id if values.id else '/models' }}" class="card">
+  <div class="form-grid">
+    <div class="field">
+      <label for="f-preset">Atalho de provedor</label>
+      <select id="f-preset" name="preset">
+        {% for key, p in presets.items() %}<option value="{{ key }}" {% if values.preset == key %}selected{% endif %}>{{ p.label }}</option>{% endfor %}
+      </select>
+      <div class="help" id="preset-notes"></div>
+    </div>
+    {{ field("name", "Nome", values.name, placeholder="ex.: gpt-principal", required=true, help="Identificador usado nos roteadores: minúsculas, números, - ou _.") }}
+
+    <div class="field">
+      <label for="f-provider">Tipo de API</label>
+      <select id="f-provider" name="provider">
+        <option value="openai" {% if values.provider == 'openai' %}selected{% endif %}>Compatível com OpenAI (chat/completions)</option>
+        <option value="anthropic" {% if values.provider == 'anthropic' %}selected{% endif %}>Anthropic (Messages API)</option>
+        <option value="offline" {% if values.provider == 'offline' %}selected{% endif %}>Offline (heurístico, sem LLM)</option>
+      </select>
+    </div>
+    {{ field("model", "Modelo", values.model, placeholder="ex.: gpt-5-mini", help="Nome do modelo no provedor (no Azure, o nome do deployment).") }}
+
+    {{ field("base_url", "URL base", values.base_url, placeholder="https://api.openai.com/v1", cls="full") }}
+
+    <div class="field">
+      <label for="f-api_key">Chave de API</label>
+      <input type="password" id="f-api_key" name="api_key" autocomplete="off"
+             placeholder="{{ 'deixe em branco para manter: ' ~ (values.api_key|secret) if values.api_key else 'sk-... ou env:OPENAI_API_KEY' }}">
+      <div class="help">Cole a chave (fica cifrada no banco{% if not secrets_enabled %} — exige <code>SWITCHBOARD_SECRET_KEY</code>{% endif %}) ou use <code>env:NOME</code> para ler de uma variável de ambiente do router.</div>
+      {% if values.api_key %}<label class="small"><input type="checkbox" name="clear_api_key"> remover a chave atual</label>{% endif %}
+    </div>
+    {{ field("api_key_header", "Cabeçalho da chave", values.api_key_header or "Authorization", help="<code>Authorization</code> envia <code>Bearer &lt;chave&gt;</code>; no Azure use <code>api-key</code>.") }}
+
+    <div class="section-title">Geração</div>
+    {{ field("temperature", "Temperatura", values.temperature, type="number", attrs='step="0.1" min="0" max="2"', help="Vazio para usar o padrão do provedor.") }}
+    {{ field("max_tokens", "Máximo de tokens na resposta", values.max_tokens, type="number", attrs='min="1"') }}
+    {{ field("timeout_s", "Timeout (segundos)", values.timeout_s, type="number", attrs='step="1" min="1"') }}
+    {{ checkbox("json_mode", "Modo JSON", values.json_mode, "Pede response_format=json_object na decisão de rota (desligado sozinho se o servidor recusar).") }}
+    {{ textarea("extra_headers", "Cabeçalhos extras", values.extra_headers, help="Um por linha, no formato <code>Nome: valor</code>. Aceita <code>env:NOME</code> como valor.", cls="full", rows=3, code=true) }}
+  </div>
+  <div class="form-actions">
+    <button class="btn primary" type="submit">Salvar</button>
+    <a class="btn ghost" href="/models">Cancelar</a>
+  </div>
+</form>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  window.SWITCHBOARD_PRESETS = {{ presets_json|safe }};
+  window.SWITCHBOARD_EDITING = {{ 'true' if values.id else 'false' }};
+</script>
+<script src="{{ url_for('static', path='app.js') }}?v={{ version }}"></script>
+<script>SwitchboardUI.modelForm();</script>
+{% endblock %}

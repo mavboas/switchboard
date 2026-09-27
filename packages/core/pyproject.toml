@@ -1,0 +1,28 @@
+[project]
+name = "switchboard-core"
+version = "0.1.0"
+description = "Framework do Switchboard: roteamento entre responder, delegar via MCP ou esclarecer, com RAG"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = [
+    "anyio>=4.4",
+    "cryptography>=43",
+    "httpx>=0.27",
+    "mcp>=2.2,<3",
+    "psycopg[binary]>=3.2",
+    "pydantic>=2.8",
+    "pypdf>=5.0",
+    "pyyaml>=6.0",
+    "sqlalchemy>=2.0.30",
+]
+
+[project.scripts]
+switchboard = "switchboard.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/switchboard"]

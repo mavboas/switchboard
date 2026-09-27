@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% from "_macros.html" import status_badge, delete_button %}
+{% block title %}{{ agent.name }}{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <div class="crumbs"><a href="/agents">Agentes MCP</a> /</div>
+    <h1>{{ agent.name }} {% if agent.enabled %}{{ status_badge(info) }}{% else %}<span class="badge">desabilitado</span>{% endif %}</h1>
+    <p>{{ agent.description or info.description or 'Sem descrição.' }}</p>
+  </div>
+  <div class="actions">
+    <a class="btn" href="/agents/{{ agent.id }}?refresh=1">Descobrir de novo</a>
+    <a class="btn" href="/agents/{{ agent.id }}/edit">Editar</a>
+    {{ delete_button("/agents/" ~ agent.id ~ "/delete", confirm="Remover o agente " ~ agent.name ~ "?") }}
+  </div>
+</div>
+
+<div class="grid grid-2">
+  <div class="card">
+    <h2>Conexão</h2>
+    <dl class="kv">
+      <dt>Endpoint</dt><dd class="mono">{{ agent.url }}</dd>
+      <dt>Transporte</dt><dd>{{ agent.transport }}</dd>
+      <dt>Servidor</dt><dd>{{ info.server_name or '—' }}</dd>
+      <dt>Latência</dt><dd>{{ '%.0f'|format(info.latency_ms) }} ms (handshake + tools/list)</dd>
+      <dt>Token</dt><dd>{{ agent.auth_token|secret }}</dd>
+      <dt>Allowlist</dt><dd>{{ agent.allowed_tools or 'todas as tools' }}</dd>
+    </dl>
+    {% if info.error %}<div class="flash error" style="margin-top:14px">{{ info.error }}</div>{% endif %}
+  </div>
+
+  <div class="card">
+    <h2>Testar uma tool</h2>
+    {% if info.tools %}
+    <form method="post" action="/agents/{{ agent.id }}/call" class="stack">
+      <select name="tool">
+        {% for t in info.tools %}<option value="{{ t.name }}" {% if call and call.tool == t.name %}selected{% endif %}>{{ t.name }}</option>{% endfor %}
+      </select>
+      <textarea name="arguments" class="code" rows="4" placeholder='{"campo": "valor"}'>{{ call.arguments if call else '{}' }}</textarea>
+      <button class="btn primary" type="submit">Chamar via MCP</button>
+    </form>
+    {% if call %}
+      <div style="margin-top:14px">
+        <div class="small muted">{{ call.tool }} · {{ '%.0f'|format(call.ms) }} ms {% if call.is_error %}<span class="badge danger">erro</span>{% else %}<span class="badge ok">ok</span>{% endif %}</div>
+        <pre class="block" style="margin-top:6px">{{ call.result }}</pre>
+      </div>
+    {% endif %}
+    {% else %}
+    <p class="muted">Nenhuma tool disponível{% if info.status != 'online' %} — o agente está offline{% endif %}.</p>
+    {% endif %}
+  </div>
+</div>
+
+<div class="card">
+  <h2>Tools descobertas <span class="muted">({{ info.tools|length }})</span></h2>
+  {% for t in info.tools %}
+    <details {% if loop.first %}open{% endif %} style="padding:10px 0;border-bottom:1px solid var(--border)">
+      <summary><strong class="mono">{{ t.name }}</strong> <span class="muted">— {{ t.description }}</span></summary>
+      <table style="margin-top:8px">
+        <thead><tr><th>Argumento</th><th>Tipo</th><th>Obrigatório</th><th>Descrição</th></tr></thead>
+        <tbody>
+        {% for name, prop in (t.input_schema.properties or {}).items() %}
+          <tr>
+            <td class="mono">{{ name }}</td>
+            <td class="small">{{ prop.type or ('enum' if prop.enum else '—') }}{% if prop.enum %}: {{ prop.enum|join(', ') }}{% endif %}</td>
+            <td>{{ 'sim' if name in (t.input_schema.required or []) else 'não' }}</td>
+            <td class="small">{{ prop.description or '' }}{% if prop.default is defined %} <span class="muted">(padrão: {{ prop.default }})</span>{% endif %}</td>
+          </tr>
+        {% else %}
+          <tr><td colspan="4" class="muted">sem argumentos</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </details>
+  {% else %}
+    <p class="muted">Nada descoberto.</p>
+  {% endfor %}
+</div>
+{% endblock %}

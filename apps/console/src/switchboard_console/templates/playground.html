@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Playground{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Playground</h1>
+    <p>Converse com um roteador como o usuário final faria. Cada resposta mostra a rota escolhida e o trace completo; clique numa resposta para ver o trace dela.</p>
+  </div>
+</div>
+
+<div class="playground" id="playground">
+  <div class="card chat">
+    <div class="chat-toolbar">
+      <label for="profile-select" class="muted small">Roteador</label>
+      <select id="profile-select">
+        {% for name in profiles %}<option value="{{ name }}" {% if name == selected %}selected{% endif %}>{{ name }}</option>{% else %}<option value="">nenhum roteador ativo</option>{% endfor %}
+      </select>
+      <span style="flex:1"></span>
+      <button class="btn small" id="reset" type="button">Nova conversa</button>
+    </div>
+    <div class="messages" id="messages"></div>
+    <div class="suggestions" id="suggestions">
+      <button class="btn small" type="button" data-text="Olá!">Olá!</button>
+      <button class="btn small" type="button" data-text="Qual o horário de atendimento aos sábados?">Horário aos sábados</button>
+      <button class="btn small" type="button" data-text="Simule um empréstimo de R$ 50 mil em 24 meses a 1,5% ao mês">Simular 50 mil em 24x</button>
+      <button class="btn small" type="button" data-text="Compare Price e SAC para 100 mil em 36 meses a 2% ao mês">Comparar Price x SAC</button>
+      <button class="btn small" type="button" data-text="Quero abrir um chamado">Abrir chamado</button>
+      <button class="btn small" type="button" data-text="Quais documentos preciso para pedir crédito?">Documentos para crédito</button>
+    </div>
+    <div class="composer">
+      <textarea id="composer-input" rows="1" placeholder="Escreva uma mensagem (Enter envia, Shift+Enter quebra linha)"></textarea>
+      <button class="btn primary" id="composer-send" type="button">Enviar</button>
+    </div>
+  </div>
+  <div class="card trace-panel" id="trace"></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', path='app.js') }}?v={{ version }}"></script>
+<script>SwitchboardUI.playground();</script>
+{% endblock %}

@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% from "_macros.html" import field, textarea, checkbox %}
+{% block title %}{{ 'Editar' if values.id else 'Novo' }} roteador{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <div class="crumbs"><a href="/profiles">Roteadores</a> /</div>
+    <h1>{{ values.name if values.id else 'Novo roteador' }}</h1>
+    <p>O roteador decide, a cada pedido: <strong>responder</strong> (com as bases), <strong>delegar</strong> a uma tool de agente via MCP ou <strong>esclarecer</strong> quando falta informação.</p>
+  </div>
+  {% if values.id %}<div class="actions"><a class="btn" href="/playground?profile={{ values.name }}">Testar no playground</a></div>{% endif %}
+</div>
+
+{% if error %}<div class="flash error">{{ error }}</div>{% endif %}
+
+<form method="post" action="{{ '/profiles/' ~ values.id if values.id else '/profiles' }}" class="card">
+  <div class="form-grid">
+    {{ field("name", "Nome", values.name, placeholder="ex.: default", required=true, help="Vai no campo <code>model</code> da API compatível com OpenAI.") }}
+    <div class="field">
+      <label for="f-model_id">Modelo</label>
+      <select id="f-model_id" name="model_id" required>
+        <option value="">—</option>
+        {% for m in models %}<option value="{{ m.id }}" {% if values.model_id == m.id %}selected{% endif %}>{{ m.name }} · {{ m.label }}</option>{% endfor %}
+      </select>
+      <div class="help">Não achou? <a href="/models/new">Cadastre um modelo</a>.</div>
+    </div>
+    {{ field("description", "Descrição", values.description, cls="full") }}
+    {{ textarea("system_prompt", "Instruções (system prompt)", values.system_prompt, help="Tom, persona e regras do negócio. As regras de roteamento o Switchboard acrescenta sozinho.", cls="full", rows=4) }}
+
+    <div class="section-title">Agentes que pode acionar</div>
+    <div class="choices full">
+      {% for a in agents %}
+      <label class="check"><input type="checkbox" name="agent_ids" value="{{ a.id }}" {% if a.id in values.agent_ids %}checked{% endif %}>
+        <div><strong>{{ a.name }}{% if not a.enabled %} (desabilitado){% endif %}</strong><span>{{ a.description or 'sem descrição' }}</span></div></label>
+      {% else %}<p class="muted">Nenhum agente registrado. <a href="/agents/new">Registrar</a></p>{% endfor %}
+    </div>
+
+    <div class="section-title">Bases de conhecimento</div>
+    <div class="choices full">
+      {% for k in kbs %}
+      <label class="check"><input type="checkbox" name="kb_ids" value="{{ k.id }}" {% if k.id in values.kb_ids %}checked{% endif %}>
+        <div><strong>{{ k.name }}</strong><span>{{ k.description or 'sem descrição' }}</span></div></label>
+      {% else %}<p class="muted">Nenhuma base criada. <a href="/knowledge/new">Criar</a></p>{% endfor %}
+    </div>
+
+    <div class="section-title">Comportamento</div>
+    {{ field("top_k", "Trechos por pergunta (top-k)", values.top_k, type="number", attrs='min="1" max="20"') }}
+    {{ field("min_score", "Similaridade mínima", values.min_score, type="number", attrs='step="0.01" min="0" max="1"', help="Trechos abaixo disso não entram no prompt. Com o embedder hashing, 0,15 a 0,25 costuma ir bem.") }}
+    {{ checkbox("synthesize", "Sintetizar a resposta do agente", values.synthesize, "O modelo reescreve o resultado da tool para o usuário. Desligado, devolve o texto do agente como veio.") }}
+    {{ checkbox("allow_clarify", "Fazer perguntas de esclarecimento", values.allow_clarify, "Quando falta um dado obrigatório para acionar a tool, pergunta em vez de chutar.") }}
+    {{ checkbox("enabled", "Ativo", values.enabled, "Roteadores desativados respondem 404 na API.") }}
+  </div>
+  <div class="form-actions">
+    <button class="btn primary" type="submit">Salvar</button>
+    <a class="btn ghost" href="/profiles">Cancelar</a>
+  </div>
+</form>
+
+{% if values.id %}
+<div class="card">
+  <h2>Como chamar</h2>
+  <p class="muted small">API nativa (devolve rota, agente, fontes e trace):</p>
+  <pre class="block">curl -s {{ settings.public_router_url }}/v1/chat -H 'Content-Type: application/json' \
+  -d '{"profile": "{{ values.name }}", "message": "sua pergunta"}'</pre>
+  <p class="muted small" style="margin-top:14px">Qualquer SDK da OpenAI (o roteador aparece como um "modelo"):</p>
+  <pre class="block">from openai import OpenAI
+
+client = OpenAI(base_url="{{ settings.public_router_url }}/v1", api_key="SUA_CHAVE_DO_ROUTER_OU_QUALQUER_TEXTO")
+resposta = client.chat.completions.create(
+    model="{{ values.name }}",
+    messages=[{"role": "user", "content": "sua pergunta"}],
+)
+print(resposta.choices[0].message.content)</pre>
+</div>
+{% endif %}
+{% endblock %}

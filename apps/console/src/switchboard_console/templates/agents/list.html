@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% from "_macros.html" import status_badge, delete_button, empty %}
+{% block title %}Agentes MCP{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Agentes MCP</h1>
+    <p>Cada agente é um servidor MCP. O roteador pergunta a cada um quais tools ele oferece (<code>tools/list</code>) e aciona a tool certa (<code>tools/call</code>) quando o pedido pede uma ação ou cálculo.</p>
+  </div>
+  <div class="actions"><a class="btn primary" href="/agents/new">Registrar agente</a></div>
+</div>
+
+<div class="card">
+  {% if agents %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Agente</th><th>Status</th><th>Tools descobertas</th><th>Endpoint MCP</th><th class="right">Ações</th></tr></thead>
+    <tbody>
+    {% for a in agents %}
+      <tr>
+        <td><a href="/agents/{{ a.id }}"><strong>{{ a.name }}</strong></a><span class="sub">{{ a.description or (a.info.description if a.info else '') }}</span></td>
+        <td>{% if a.enabled %}{{ status_badge(a.info) }}{% else %}<span class="badge">desabilitado</span>{% endif %}
+          {% if a.info and a.info.status == 'online' %}<span class="sub">{{ '%.0f'|format(a.info.latency_ms) }} ms</span>{% endif %}</td>
+        <td>
+          {% if a.info and a.info.tools %}<div class="pill-list">{% for t in a.info.tools %}<span class="pill mono">{{ t.name }}</span>{% endfor %}</div>
+          {% elif a.info and a.info.error %}<span class="small muted">{{ a.info.error|truncate(90) }}</span>
+          {% else %}<span class="muted">—</span>{% endif %}
+          {% if a.allowed_tools %}<span class="sub">allowlist: {{ a.allowed_tools }}</span>{% endif %}
+        </td>
+        <td class="mono small">{{ a.url }}<span class="sub">{{ a.transport }}</span></td>
+        <td class="right nowrap">
+          <a class="btn small" href="/agents/{{ a.id }}?refresh=1">Descobrir</a>
+          <a class="btn small" href="/agents/{{ a.id }}/edit">Editar</a>
+          {{ delete_button("/agents/" ~ a.id ~ "/delete", confirm="Remover o agente " ~ a.name ~ "?") }}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}
+  {{ empty("Nenhum agente registrado", "Registre a URL de um servidor MCP (Streamable HTTP ou SSE).", "/agents/new", "Registrar agente") }}
+  {% endif %}
+</div>
+{% endblock %}

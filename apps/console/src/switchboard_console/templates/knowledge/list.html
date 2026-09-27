@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% from "_macros.html" import delete_button, empty %}
+{% block title %}Conhecimento{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Bases de conhecimento</h1>
+    <p>Documentos que o roteador consulta (RAG) para responder direto, sem acionar agentes. Os trechos mais parecidos com a pergunta entram no prompt, com a fonte citada.</p>
+  </div>
+  <div class="actions"><a class="btn primary" href="/knowledge/new">Nova base</a></div>
+</div>
+
+<div class="card">
+  {% if kbs %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Base</th><th>Embeddings</th><th>Documentos</th><th>Trechos</th><th class="right">Ações</th></tr></thead>
+    <tbody>
+    {% for k in kbs %}
+      <tr>
+        <td><a href="/knowledge/{{ k.id }}"><strong>{{ k.name }}</strong></a><span class="sub">{{ k.description }}</span></td>
+        <td><span class="badge">{{ k.label }}</span>{% if k.stats.stale %}<span class="sub"><span class="badge warn">reindexar {{ k.stats.stale }}</span></span>{% endif %}</td>
+        <td>{{ k.stats.documents }}</td>
+        <td>{{ k.stats.chunks }}</td>
+        <td class="right nowrap">
+          <a class="btn small" href="/knowledge/{{ k.id }}">Abrir</a>
+          <a class="btn small" href="/knowledge/{{ k.id }}/edit">Editar</a>
+          {{ delete_button("/knowledge/" ~ k.id ~ "/delete", confirm="Remover a base " ~ k.name ~ " e todos os documentos?") }}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}
+  {{ empty("Nenhuma base ainda", "Crie uma base e envie documentos (.md, .txt, .pdf, .html…).", "/knowledge/new", "Nova base") }}
+  {% endif %}
+</div>
+{% endblock %}
