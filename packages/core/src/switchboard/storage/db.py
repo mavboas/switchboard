@@ -58,6 +58,9 @@ class Database:
                 kwargs["poolclass"] = StaticPool
         else:
             kwargs["pool_pre_ping"] = True
+            if self.url.startswith("postgresql+psycopg"):
+                # garante texto como str mesmo em bancos criados com SQL_ASCII
+                kwargs["connect_args"] = {"client_encoding": "utf8"}
         self.engine = create_engine(self.url, **kwargs)
         if self.dialect == "sqlite":
 
@@ -65,6 +68,10 @@ class Database:
             def _sqlite_pragmas(dbapi_conn, _record):  # pragma: no cover - trivial
                 cursor = dbapi_conn.cursor()
                 cursor.execute("PRAGMA foreign_keys=ON")
+                # console e router podem abrir o mesmo arquivo: WAL + espera evitam "database is locked"
+                cursor.execute("PRAGMA busy_timeout=5000")
+                if self.url not in ("sqlite://", "sqlite:///:memory:"):
+                    cursor.execute("PRAGMA journal_mode=WAL")
                 cursor.close()
 
         self._sessions = sessionmaker(self.engine, expire_on_commit=False)

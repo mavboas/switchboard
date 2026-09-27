@@ -20,8 +20,8 @@ import anyio.to_thread
 from switchboard.agents import AgentCatalog
 from switchboard.app import Switchboard
 from switchboard.config import ModelSpec
-from switchboard.errors import ConfigError
-from switchboard.llm import build_chat_model
+from switchboard.errors import ConfigError, SwitchboardError
+from switchboard.llm import OfflineChat, build_chat_model
 from switchboard.llm.base import ChatModel
 from switchboard.routing import ResolvedProfile, RouterEngine, RouterResult
 from switchboard.secrets import SecretBox
@@ -44,7 +44,7 @@ class Runtime(Protocol):
 
     async def record(self, result: RouterResult) -> None: ...
 
-    def ready(self) -> bool: ...
+    async def ready(self) -> bool: ...
 
     async def aclose(self) -> None: ...
 
@@ -109,11 +109,22 @@ class DbRuntime:
             cached = self._engines.get(profile)
             if cached and cached[0] == fingerprint:
                 return cached[1]
+            warnings: list[str] = []
+            try:
+                chat = self._chat(resolved.model)
+            except SwitchboardError as exc:
+                # segredo ilegível ou config inválida: atende em modo offline e avisa em cada trace
+                log.error("modelo '%s' indisponível: %s", resolved.model.name, exc)
+                chat = OfflineChat(label=f"offline (fallback de {resolved.model.name})")
+                warnings.append(
+                    f"modelo '{resolved.model.name}' indisponível, usando o modo offline: {exc}"
+                )
             engine = RouterEngine(
                 resolved,
-                chat=self._chat(resolved.model),
+                chat=chat,
                 catalog=self.catalog,
                 retriever=self.knowledge,
+                warnings=warnings,
             )
             self._engines[profile] = (fingerprint, engine)
             self._retire_unused_models()
@@ -128,8 +139,10 @@ class DbRuntime:
                 asyncio.get_running_loop().create_task(self._close_later(model))
 
     @staticmethod
-    async def _close_later(model: ChatModel, delay: float = 30.0) -> None:
-        await asyncio.sleep(delay)  # deixa terminar pedidos em andamento
+    async def _close_later(model: ChatModel, delay: float = 300.0) -> None:
+        # deixa terminar pedidos em andamento; se algum ainda usar o cliente depois
+        # disso, o adaptador devolve LLMError e o motor cai para o modo offline
+        await asyncio.sleep(delay)
         with contextlib.suppress(Exception):
             await model.aclose()
 
@@ -150,8 +163,8 @@ class DbRuntime:
         except Exception:  # trace perdido não pode derrubar o atendimento
             log.exception("falha ao gravar o trace %s", result.trace_id)
 
-    def ready(self) -> bool:
-        return self.db.ping()
+    async def ready(self) -> bool:
+        return await anyio.to_thread.run_sync(self.db.ping)
 
     async def aclose(self) -> None:
         for model in self._models.values():
@@ -183,7 +196,7 @@ class FileRuntime:
     async def record(self, result: RouterResult) -> None:
         return None  # no modo YAML o trace sai só no log
 
-    def ready(self) -> bool:
+    async def ready(self) -> bool:
         return True
 
     async def aclose(self) -> None:

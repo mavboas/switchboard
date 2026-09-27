@@ -16,18 +16,43 @@ HISTORY_LIMIT = 12
 SNIPPET_LIMIT = 900
 
 
-def compact_schema(schema: dict[str, Any]) -> dict[str, Any]:
-    """Remove ruído do JSON Schema (títulos gerados) para economizar tokens."""
-    props = {}
-    for name, prop in (schema.get("properties") or {}).items():
-        item: dict[str, Any] = {}
-        for key in ("type", "description", "enum", "default", "items", "anyOf", "format"):
-            if key in prop:
-                item[key] = prop[key]
-        props[name] = item
-    out: dict[str, Any] = {"properties": props}
-    if schema.get("required"):
-        out["required"] = schema["required"]
+_SCHEMA_MAPS = {"properties", "$defs", "definitions", "patternProperties", "dependentSchemas"}
+_SCHEMA_LISTS = {"anyOf", "oneOf", "allOf", "prefixItems"}
+_SCHEMA_SINGLE = {
+    "items",
+    "additionalProperties",
+    "additionalItems",
+    "unevaluatedProperties",
+    "propertyNames",
+    "contains",
+    "not",
+    "if",
+    "then",
+    "else",
+}
+
+
+def compact_schema(schema: Any) -> Any:
+    """Remove só o ruído (``title`` gerado, ``$schema``) e preserva o resto.
+
+    Objetos aninhados, ``$defs``/``$ref``, limites e formatos continuam lá —
+    o LLM precisa deles para montar argumentos de tools mais ricas. Nomes de
+    propriedades nunca são tocados (uma propriedade pode se chamar "title").
+    """
+    if not isinstance(schema, dict):
+        return schema
+    out: dict[str, Any] = {}
+    for key, value in schema.items():
+        if key in ("title", "$schema"):
+            continue
+        if key in _SCHEMA_MAPS and isinstance(value, dict):
+            out[key] = {name: compact_schema(sub) for name, sub in value.items()}
+        elif key in _SCHEMA_LISTS and isinstance(value, list):
+            out[key] = [compact_schema(sub) for sub in value]
+        elif key in _SCHEMA_SINGLE:
+            out[key] = compact_schema(value)
+        else:
+            out[key] = value
     return out
 
 

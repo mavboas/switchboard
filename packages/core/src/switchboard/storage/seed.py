@@ -1,6 +1,6 @@
 """Configuração de demonstração: roda sem nenhuma chave de API.
 
-Cria (só se o banco ainda não tiver nenhum roteador):
+Cria (só se o banco estiver vazio: sem modelos, agentes, bases e roteadores):
 
 * o modelo ``offline`` (decisor heurístico);
 * os agentes MCP de exemplo ``credito`` e ``chamados``;
@@ -22,7 +22,7 @@ from ..rag.loaders import extract_text, guess_title, iter_files
 from ..secrets import SecretBox
 from .db import Database
 from .knowledge import KnowledgeService
-from .orm import KnowledgeBase, RouterProfile
+from .orm import Agent, KnowledgeBase, LlmModel, RouterProfile
 from .repo import save_agent, save_knowledge_base, save_model, save_profile
 
 log = logging.getLogger(__name__)
@@ -43,8 +43,11 @@ async def seed_demo(
     """Popula o banco com a demo; devolve False se já havia configuração."""
     box = box or SecretBox(None)
     with db.session() as session:
-        if session.scalars(select(RouterProfile.id)).first() is not None:
-            return False
+        # só semeia um banco realmente vazio: se o usuário apagou o roteador da
+        # demo mas manteve o resto, não recriamos nada (nem colidimos com nomes)
+        for table in (RouterProfile, LlmModel, Agent, KnowledgeBase):
+            if session.scalars(select(table.id).limit(1)).first() is not None:
+                return False
         model = save_model(
             session, {"name": "offline", "provider": "offline", "preset": "offline"}, box=box
         )

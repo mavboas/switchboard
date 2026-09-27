@@ -16,7 +16,7 @@ from fastapi.templating import Jinja2Templates
 from switchboard import __version__
 from switchboard.agents import AgentCatalog
 from switchboard.llm import PRESETS
-from switchboard.secrets import SecretBox
+from switchboard.secrets import SecretBox, load_master_key
 from switchboard.storage import Database, EmbedderCache, KnowledgeService
 
 from .settings import Settings
@@ -68,7 +68,10 @@ class Console:
     ) -> Console:
         db = Database(settings.database_url, vector_backend=settings.vector_backend)
         db.init()
-        box = SecretBox(settings.secret_key)
+        box = SecretBox(
+            load_master_key(settings.secret_key, settings.secret_key_file),
+            settings.allowed_env_secrets,
+        )
         return cls(
             settings=settings,
             db=db,

@@ -7,6 +7,7 @@ import json
 import time
 from typing import Any
 
+import anyio.to_thread
 import httpx
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, Response
@@ -16,6 +17,7 @@ from switchboard.config import DEFAULT_SYSTEM_PROMPT
 from switchboard.errors import SwitchboardError
 from switchboard.llm import PRESETS, Message, build_chat_model
 from switchboard.rag import SUPPORTED_EXTENSIONS, extract_text, guess_title
+from switchboard.secrets import MASK
 from switchboard.storage import repo
 from switchboard.storage.orm import Agent, Document, KnowledgeBase, LlmModel, RouterProfile, Trace
 
@@ -39,7 +41,12 @@ def _model_dict(row: LlmModel, used_by: list[str] | None = None) -> dict[str, An
         "base_url": row.base_url or "",
         "api_key": row.api_key,
         "api_key_header": row.api_key_header,
-        "extra_headers": forms.headers_text(row.extra_headers),
+        "extra_headers": forms.headers_text(
+            {
+                k: (MASK if str(v).startswith("enc:") else v)
+                for k, v in (row.extra_headers or {}).items()
+            }
+        ),
         "temperature": row.temperature,
         "max_tokens": row.max_tokens,
         "timeout_s": row.timeout_s,
@@ -213,7 +220,7 @@ async def models_new(
         "base_url": p.base_url,
         "api_key_header": p.api_key_header,
         "temperature": 0.2,
-        "max_tokens": 1024,
+        "max_tokens": 4096,
         "timeout_s": 60,
         "json_mode": True,
     }
@@ -277,9 +284,9 @@ async def models_test(model_id: int, console: Console = Depends(get_console)):
     try:
         chat = build_chat_model(spec, resolve_secret=console.box.open)
         try:
+            # sem limite baixo de tokens: modelos com raciocínio gastam tokens antes de responder
             result = await chat.chat(
-                [Message("user", "Teste de conexão do Switchboard. Responda apenas: ok")],
-                max_tokens=20,
+                [Message("user", "Teste de conexão do Switchboard. Responda apenas: ok")]
             )
         finally:
             await chat.aclose()
@@ -557,12 +564,17 @@ async def knowledge_add(request: Request, kb_id: int, console: Console = Depends
     for upload in form.getlist("files"):
         if not getattr(upload, "filename", None):
             continue
-        data = await upload.read()
+        too_big = f"{upload.filename}: maior que {console.settings.max_upload_mb} MB"
+        if (getattr(upload, "size", None) or 0) > limit:
+            errors.append(too_big)
+            continue
+        data = await upload.read(limit + 1)
         if len(data) > limit:
-            errors.append(f"{upload.filename}: maior que {console.settings.max_upload_mb} MB")
+            errors.append(too_big)
             continue
         try:
-            text = extract_text(upload.filename, data)
+            # extrair texto (PDF, HTML…) é CPU: roda fora do event loop
+            text = await anyio.to_thread.run_sync(extract_text, upload.filename, data)
             items.append((guess_title(upload.filename, text), upload.filename, text))
         except SwitchboardError as exc:
             errors.append(f"{upload.filename}: {exc}")

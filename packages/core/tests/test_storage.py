@@ -44,11 +44,14 @@ def test_models_agents_profiles_crud(db):
                 "name": "calc",
                 "url": "http://calc/mcp",
                 "allowed_tools": "somar, subtrair",
-                "auth_token": "env:T",
+                "auth_token": "env:MCP_CALC_TOKEN",
             },
             box=BOX,
         )
-        assert agent.allowed_tools == ["somar", "subtrair"] and agent.auth_token == "env:T"
+        assert (
+            agent.allowed_tools == ["somar", "subtrair"]
+            and agent.auth_token == "env:MCP_CALC_TOKEN"
+        )
         kb = repo.save_knowledge_base(s, {"name": "faq"})
         profile = repo.save_profile(
             s,
@@ -204,3 +207,40 @@ def test_database_mode(db):
         assert db.vector_mode == "pgvector"
     else:
         assert db.vector_mode == "json"
+
+
+def test_extra_headers_are_sealed_and_masked(db):
+    from switchboard.secrets import MASK
+
+    with db.session() as s:
+        m = repo.save_model(
+            s,
+            {
+                "name": "h",
+                "model": "x",
+                "extra_headers": {"X-Chave": "segredo", "X-Env": "env:ACME_API_KEY"},
+            },
+            box=BOX,
+        )
+        model_id = m.id
+        assert (
+            m.extra_headers["X-Chave"].startswith("enc:")
+            and m.extra_headers["X-Env"] == "env:ACME_API_KEY"
+        )
+    with db.session() as s:
+        # a UI devolve a máscara no lugar do valor cifrado: o valor gravado é mantido
+        repo.save_model(
+            s,
+            {"name": "h", "model": "x", "extra_headers": {"X-Chave": MASK}},
+            box=BOX,
+            model_id=model_id,
+        )
+        assert BOX.open(s.get(LlmModel, model_id).extra_headers["X-Chave"]) == "segredo"
+    with db.session() as s:
+        # sem chave mestra, cabeçalhos comuns continuam salváveis (em texto)
+        m = repo.save_model(
+            s,
+            {"name": "sem", "model": "x", "extra_headers": {"HTTP-Referer": "https://app"}},
+            box=SecretBox(None),
+        )
+        assert m.extra_headers == {"HTTP-Referer": "https://app"}

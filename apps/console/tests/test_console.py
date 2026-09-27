@@ -51,7 +51,7 @@ def make_client(db_url: str, **overrides) -> TestClient:
         demo_knowledge_dir=str(KNOWLEDGE_DIR),
         demo_credito_url="http://credito/mcp",
         demo_chamados_url="http://chamados/mcp",
-        **overrides,
+        **{"console_allowed_hosts": "console,localhost", **overrides},
     )
     app = create_app(
         settings,
@@ -332,3 +332,64 @@ def test_admin_json_api(db_url):
         assert [p["name"] for p in client.get("/api/profiles").json()] == ["api"]
         assert client.get("/api/presets").json()[0]["key"] == "openai"
         assert client.get("/api/traces").json() == []
+
+
+def test_unexpected_host_is_rejected(db_url):
+    """Proteção contra DNS rebinding: só os nomes configurados são atendidos."""
+    with make_client(db_url, seed_demo=False) as client:
+        assert client.get("/", headers={"Host": "evil.example"}).status_code == 400
+        assert client.get("/healthz", headers={"Host": "localhost:8000"}).status_code == 200
+        # health check de orquestrador chega pelo IP do contêiner
+        assert client.get("/healthz", headers={"Host": "10.1.2.3:8000"}).status_code == 200
+
+
+def test_non_ascii_password_does_not_crash(db_url):
+    with make_client(db_url, seed_demo=False, console_password="senhaçã") as client:
+        assert client.get("/").status_code == 401
+        token = base64.b64encode("admin:senhaçã".encode()).decode()
+        assert client.get("/", headers={"Authorization": f"Basic {token}"}).status_code == 200
+        wrong = base64.b64encode("admin:outra-ç".encode()).decode()
+        assert client.get("/", headers={"Authorization": f"Basic {wrong}"}).status_code == 401
+        raw = {"Authorization": "Basic ç".encode("latin-1")}  # navegadores podem mandar latin-1
+        assert client.get("/", headers=raw).status_code == 401
+
+
+def test_console_restarts_after_demo_router_is_deleted(db_url):
+    with make_client(db_url) as client:
+        profile_id = _ids(client.get("/profiles").text, "profiles")[0]
+        assert client.post(f"/profiles/{profile_id}/delete").status_code == 200
+    with make_client(db_url) as client:  # segunda subida: não recria a demo nem quebra
+        assert client.get("/healthz").status_code == 200
+        assert _ids(client.get("/profiles").text, "profiles") == []
+        assert "offline" in client.get("/models").text
+
+
+def test_forbidden_env_reference_is_explained(db_url):
+    with make_client(db_url, seed_demo=False) as client:
+        resp = client.post(
+            "/agents",
+            data={
+                "name": "x",
+                "url": "https://externo.example/mcp",
+                "auth_token": "env:SWITCHBOARD_SECRET_KEY",
+                "enabled": "on",
+            },
+        )
+        assert resp.status_code == 200 and "não está liberada" in resp.text
+        api = client.post("/api/models", json={"name": "m", "model": "x", "api_key": "env:PATH"})
+        assert api.status_code == 400
+
+
+def test_upload_limit(db_url):
+    with make_client(db_url, seed_demo=False, max_upload_mb=0) as client:
+        kb = client.post("/api/knowledge-bases", json={"name": "faq"}).json()
+        too_big = client.post(
+            f"/api/knowledge-bases/{kb['id']}/files",
+            files={"file": ("a.txt", b"conteudo", "text/plain")},
+        )
+        assert too_big.status_code == 413
+        page = client.post(
+            f"/knowledge/{kb['id']}/documents",
+            files={"files": ("a.txt", b"conteudo", "text/plain")},
+        )
+        assert "maior que 0 MB" in page.text

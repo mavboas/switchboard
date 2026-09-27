@@ -64,7 +64,7 @@ class ModelSpec(_Spec):
     api_key_header: str = "Authorization"
     extra_headers: dict[str, str] = Field(default_factory=dict)
     temperature: float | None = 0.2
-    max_tokens: int | None = 1024
+    max_tokens: int | None = 4096
     timeout_s: float = 60.0
     json_mode: bool = True
 
@@ -219,6 +219,16 @@ def _interpolate(text: str) -> str:
     return _ENV_PATTERN.sub(repl, text)
 
 
+def _interpolate_tree(value):
+    if isinstance(value, str):
+        return _interpolate(value)
+    if isinstance(value, list):
+        return [_interpolate_tree(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _interpolate_tree(v) for k, v in value.items()}
+    return value
+
+
 def load_yaml(path: str | Path) -> SwitchboardSpec:
     """Lê e valida um ``switchboard.yaml``."""
     path = Path(path)
@@ -227,9 +237,10 @@ def load_yaml(path: str | Path) -> SwitchboardSpec:
     except OSError as exc:
         raise ConfigError(f"não consegui ler {path}: {exc}") from exc
     try:
-        data = yaml.safe_load(_interpolate(raw)) or {}
+        data = yaml.safe_load(raw) or {}
     except yaml.YAMLError as exc:
         raise ConfigError(f"{path}: YAML inválido: {exc}") from exc
+    data = _interpolate_tree(data)  # só nos valores: comentários ficam de fora
     try:
         return SwitchboardSpec.model_validate(data)
     except ValidationError as exc:

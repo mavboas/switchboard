@@ -142,20 +142,31 @@ def result_text(result: Any) -> tuple[str, bool, dict[str, Any] | None]:
 
 
 class AgentCatalog:
+    """Catálogo de agentes com cache "stale-while-revalidate".
+
+    Um agente lento ou fora do ar nunca trava os pedidos: enquanto houver
+    resultado em cache (mesmo vencido), ele é devolvido na hora e a nova
+    descoberta roda em segundo plano. Só o primeiro pedido para um agente
+    ainda desconhecido espera a descoberta, limitada a ``discovery_timeout_s``.
+    """
+
     def __init__(
         self,
         *,
         ttl_s: float = 30.0,
-        offline_ttl_s: float = 5.0,
+        offline_ttl_s: float = 15.0,
+        discovery_timeout_s: float = 5.0,
         connector: Connector = http_connector,
         resolve_secret: Callable[[str | None], str | None] = resolve_env,
     ):
         self.ttl_s = ttl_s
         self.offline_ttl_s = offline_ttl_s
+        self.discovery_timeout_s = discovery_timeout_s
         self._connector = connector
         self._resolve = resolve_secret
         self._cache: dict[str, tuple[float, AgentInfo]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        self._background: set[asyncio.Task] = set()
 
     @staticmethod
     def _key(spec: AgentSpec) -> str:
@@ -172,27 +183,51 @@ class AgentCatalog:
 
     async def describe(self, spec: AgentSpec, *, refresh: bool = False) -> AgentInfo:
         key = self._key(spec)
-        now = time.monotonic()
         cached = self._cache.get(key)
-        if cached and not refresh and cached[0] > now:
-            return cached[1]
+        if cached and not refresh:
+            expires, info = cached
+            if expires <= time.monotonic():
+                self._revalidate(spec, key)  # devolve o que tem e atualiza por trás
+            return info
+        return await self._probe_and_store(spec, key, force=refresh)
+
+    def _revalidate(self, spec: AgentSpec, key: str) -> None:
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        if lock.locked():
+            return  # já tem uma descoberta em andamento
+        task = asyncio.get_running_loop().create_task(self._probe_and_store(spec, key, force=True))
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    async def _probe_and_store(self, spec: AgentSpec, key: str, *, force: bool) -> AgentInfo:
         lock = self._locks.setdefault(key, asyncio.Lock())
         async with lock:
             cached = self._cache.get(key)
-            if cached and not refresh and cached[0] > time.monotonic():
+            if cached and not force and cached[0] > time.monotonic():
                 return cached[1]
             info = await self._probe(spec)
             ttl = self.ttl_s if info.status == "online" else self.offline_ttl_s
             self._cache[key] = (time.monotonic() + ttl, info)
             return info
 
+    async def _list_all_tools(self, client: Any) -> list[Any]:
+        tools: list[Any] = []
+        cursor = None
+        for _page in range(50):  # tools/list é paginado
+            listing = await (client.list_tools(cursor=cursor) if cursor else client.list_tools())
+            tools.extend(listing.tools)
+            cursor = getattr(listing, "next_cursor", None) or getattr(listing, "nextCursor", None)
+            if not cursor:
+                break
+        return tools
+
     async def _probe(self, spec: AgentSpec) -> AgentInfo:
         started = time.perf_counter()
         try:
             token = self._resolve(spec.auth_token)
-            async with asyncio.timeout(spec.timeout_s):
+            async with asyncio.timeout(min(spec.timeout_s, self.discovery_timeout_s)):
                 async with self._connector(spec, token) as client:
-                    listing = await client.list_tools()
+                    listed = await self._list_all_tools(client)
                     server = client.server_info
                     instructions = client.instructions
         except Exception as exc:  # qualquer falha = agente offline, com o motivo
@@ -205,7 +240,7 @@ class AgentCatalog:
                 latency_ms=(time.perf_counter() - started) * 1000,
             )
         tools = []
-        for tool in listing.tools:
+        for tool in listed:
             data = _dump(tool)
             name = data.get("name", "")
             if spec.allowed_tools and name not in spec.allowed_tools:

@@ -184,7 +184,7 @@ class KnowledgeService:
         chunk_size, overlap, existing = await anyio.to_thread.run_sync(prepare)
         if existing is not None:
             return int(existing), False
-        pieces = split_text(content, chunk_size, overlap)
+        pieces = await anyio.to_thread.run_sync(split_text, content, chunk_size, overlap)
         embedder, label = await anyio.to_thread.run_sync(self.embedder_for, kb_id)
         vectors = (
             await embedder.embed([index_text(title, p.section, p.content) for p in pieces])
@@ -247,7 +247,7 @@ class KnowledgeService:
         embedder, label = await anyio.to_thread.run_sync(self.embedder_for, kb_id)
         total = 0
         for doc_id, title, content in docs:
-            pieces = split_text(content, chunk_size, overlap)
+            pieces = await anyio.to_thread.run_sync(split_text, content, chunk_size, overlap)
             vectors = (
                 await embedder.embed([index_text(title, p.section, p.content) for p in pieces])
                 if pieces

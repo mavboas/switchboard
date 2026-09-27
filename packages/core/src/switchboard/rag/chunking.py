@@ -4,7 +4,8 @@ Estratégia: parágrafos são agrupados até ``chunk_size`` caracteres; parágra
 grandes são divididos por frases e, em último caso, por palavras. Cada trecho
 novo recebe o final do anterior (``overlap``) para não perder contexto na
 fronteira. Títulos Markdown viram a "seção" do trecho, que também entra no
-texto indexado e melhora a busca.
+texto indexado e melhora a busca; o primeiro ``# Título`` do arquivo é o
+título do documento, não uma seção.
 """
 
 from __future__ import annotations
@@ -83,11 +84,17 @@ def split_text(text: str, chunk_size: int = 800, overlap: int = 120) -> list[Tex
                 blocks.append((section_name(), body))
             paragraph.clear()
 
+    first_heading = True
     for line in text.split("\n"):
         match = _HEADING_RE.match(line)
         if match:
             flush()
             level, title = len(match.group(1)), match.group(2).strip()
+            if first_heading and level == 1:
+                # o primeiro "# Título" é o título do documento, não uma seção
+                first_heading = False
+                continue
+            first_heading = False
             headings[:] = [h for h in headings if h[0] < level] + [(level, title)]
         elif not line.strip():
             flush()

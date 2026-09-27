@@ -27,8 +27,9 @@ from pydantic import BaseModel, Field
 
 from switchboard import __version__
 from switchboard.app import Switchboard
+from switchboard.net import host_allowed
 from switchboard.routing import RouterResult
-from switchboard.secrets import SecretBox
+from switchboard.secrets import SecretBox, load_master_key
 from switchboard.storage import Database
 
 from .runtime import DbRuntime, FileRuntime, ProfileNotFound, Runtime
@@ -69,7 +70,10 @@ def build_runtime(settings: Settings) -> Runtime:
     db.init()
     return DbRuntime(
         db,
-        SecretBox(settings.secret_key),
+        SecretBox(
+            load_master_key(settings.secret_key, settings.secret_key_file),
+            settings.allowed_env_secrets,
+        ),
         config_ttl_s=settings.config_ttl_s,
         agents_ttl_s=settings.agents_ttl_s,
     )
@@ -110,6 +114,23 @@ def create_app(settings: Settings | None = None, runtime: Runtime | None = None)
     )
 
     keys = settings.api_key_list
+    allowed_hosts = settings.allowed_host_list
+
+    @app.middleware("http")
+    async def host_guard(request: Request, call_next):
+        # API aberta (sem chaves) = uso local: só atende hosts conhecidos (contra DNS rebinding)
+        if (
+            not keys
+            and request.url.path not in ("/healthz", "/readyz")
+            and not host_allowed(request.url.hostname, allowed_hosts)
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "detail": "host não permitido (defina SWITCHBOARD_API_KEYS ou SWITCHBOARD_ALLOWED_HOSTS)"
+                },
+            )
+        return await call_next(request)
 
     def require_key(request: Request) -> None:
         if not keys:
@@ -120,7 +141,8 @@ def create_app(settings: Settings | None = None, runtime: Runtime | None = None)
             if header.lower().startswith("bearer ")
             else request.headers.get("x-api-key", "")
         )
-        if not any(hmac.compare_digest(token, k) for k in keys):
+        given = token.encode("utf-8")
+        if not any(hmac.compare_digest(given, k.encode("utf-8")) for k in keys):
             raise HTTPException(status_code=401, detail="chave de API inválida ou ausente")
 
     def rt(request: Request) -> Runtime:
@@ -159,7 +181,7 @@ def create_app(settings: Settings | None = None, runtime: Runtime | None = None)
 
     @app.get("/readyz")
     async def readyz(runtime: Runtime = Depends(rt)) -> JSONResponse:
-        ok = runtime.ready()
+        ok = await runtime.ready()
         return JSONResponse(
             status_code=200 if ok else 503, content={"status": "ok" if ok else "banco indisponível"}
         )

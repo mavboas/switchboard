@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import anyio.to_thread
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -109,7 +110,7 @@ class ModelIn(BaseModel):
     api_key_header: str = "Authorization"
     extra_headers: dict[str, str] = Field(default_factory=dict)
     temperature: float | None = 0.2
-    max_tokens: int | None = 1024
+    max_tokens: int | None = 4096
     timeout_s: float = 60.0
     json_mode: bool = True
 
@@ -334,9 +335,14 @@ async def add_document(kb_id: int, body: DocumentIn, console: Console = Depends(
 async def upload_file(
     kb_id: int, file: UploadFile = File(...), console: Console = Depends(get_console)
 ):
-    data = await file.read()
+    limit = console.settings.max_upload_mb * 1024 * 1024
+    data = await file.read(limit + 1)
+    if (file.size or 0) > limit or len(data) > limit:
+        raise HTTPException(
+            status_code=413, detail=f"arquivo maior que {console.settings.max_upload_mb} MB"
+        )
     try:
-        text = extract_text(file.filename or "arquivo.txt", data)
+        text = await anyio.to_thread.run_sync(extract_text, file.filename or "arquivo.txt", data)
         doc_id, created = await console.knowledge.add_document(
             kb_id,
             title=guess_title(file.filename or "arquivo", text),

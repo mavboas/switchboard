@@ -39,8 +39,8 @@ async def test_hashing_embedder_is_deterministic_and_normalized():
 def test_split_text_sections_and_sizes():
     doc = "# Manual\n\nIntro curta.\n\n## Horários\n\n" + ("Atendemos de segunda a sexta. " * 40)
     chunks = split_text(doc, chunk_size=300, overlap=60)
-    assert chunks[0].section == "Manual"
-    assert all(c.section == "Manual > Horários" for c in chunks[1:])
+    assert chunks[0].section is None  # "# Manual" é o título do documento
+    assert all(c.section == "Horários" for c in chunks[1:])
     assert all(len(c.content) <= 300 for c in chunks)
     # sobreposição: o fim de um trecho reaparece no começo do seguinte
     assert chunks[2].content[:20] in chunks[1].content
@@ -74,7 +74,7 @@ async def test_memory_retriever_ranks_relevant_chunk_first(tmp_path):
     retriever.register(spec, HashingEmbedder())
     assert await retriever.load_paths("faq") == 2
     hits = await retriever.search("vocês abrem no sábado?", ["faq"], top_k=2, min_score=0.0)
-    assert hits[0].section == "FAQ > Horários"
+    assert hits[0].section == "Horários"
     assert hits[0].document == "FAQ"  # título vem do H1 do Markdown
     assert await retriever.search("abrem no sábado?", ["outra"], top_k=2, min_score=0.0) == []
 

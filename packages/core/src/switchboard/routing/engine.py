@@ -35,6 +35,7 @@ from .deciders import (
     TemplateComposer,
     user_turns,
 )
+from .decision import DecisionError
 from .types import Decision, ResolvedProfile, RouterResult, SourceRef, TraceStep
 
 
@@ -81,8 +82,10 @@ class RouterEngine:
         retriever: Retriever | None = None,
         decider: Decider | None = None,
         composer: Composer | None = None,
+        warnings: Sequence[str] = (),
     ):
         self.profile = profile
+        self.static_warnings = list(warnings)
         self.chat = chat
         self.catalog = catalog
         self.retriever = retriever
@@ -105,18 +108,29 @@ class RouterEngine:
             route="error",
             model=self.chat.label,
         )
+        result.warnings.extend(self.static_warnings)
         if not question:
             result.answer = "Envie uma mensagem de usuário para eu poder ajudar."
             result.error = "nenhuma mensagem de usuário no pedido"
             result.latency_ms = clock.ms()
             return result
+        try:
+            await self._run(msgs, question, result)
+        except Exception as exc:  # nunca derruba o pedido: vira uma resposta de erro com trace
+            result.route = "error"
+            result.error = f"{exc.__class__.__name__}: {exc}"[:500]
+            result.answer = (
+                "Desculpe, não consegui processar seu pedido agora. Tente novamente em instantes."
+            )
+        result.latency_ms = clock.ms()
+        return result
 
+    async def _run(self, msgs: list[Message], question: str, result: RouterResult) -> None:
         hits = await self._rag(msgs, result)
         agents = await self._discover(result)
         decision = await self._decide(msgs, agents, hits, result)
         if decision is None:
-            result.latency_ms = clock.ms()
-            return result
+            return
 
         result.reason = decision.reason
         if decision.action == "answer":
@@ -132,8 +146,6 @@ class RouterEngine:
             result.arguments = decision.arguments or None
         else:
             await self._delegate(decision, question, result)
-        result.latency_ms = clock.ms()
-        return result
 
     # -- etapas ---------------------------------------------------------------
 
@@ -191,8 +203,13 @@ class RouterEngine:
             decision, calls = await self.decider.decide(
                 profile=spec, messages=msgs, agents=agents, hits=hits
             )
-        except LLMError as exc:
-            result.warnings.append(f"modelo indisponível, usei o decisor offline: {exc}")
+        except (LLMError, DecisionError) as exc:
+            if isinstance(exc, LLMError):
+                result.warnings.append(f"modelo indisponível, usei o decisor offline: {exc}")
+            else:
+                result.warnings.append(
+                    f"resposta do modelo fora do formato mesmo após reparo, usei o decisor offline: {exc}"
+                )
             decision, calls = await self._fallback_decider.decide(
                 profile=spec, messages=msgs, agents=agents, hits=hits
             )
@@ -267,7 +284,7 @@ class RouterEngine:
                 result_text=outcome.text,
                 is_error=outcome.is_error,
             )
-        except LLMError as exc:
+        except Exception as exc:  # síntese é enfeite: sem ela, devolve o resultado do agente
             result.warnings.append(
                 f"síntese pelo modelo falhou, devolvi o resultado do agente: {exc}"
             )

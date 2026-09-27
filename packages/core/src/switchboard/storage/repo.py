@@ -24,7 +24,7 @@ from ..config import (
 )
 from ..errors import ConfigError
 from ..routing.types import ResolvedProfile, RouterResult
-from ..secrets import SecretBox
+from ..secrets import ENC_PREFIX, ENV_PREFIX, MASK, SecretBox
 from .orm import Agent, Chunk, Document, KnowledgeBase, LlmModel, RouterProfile, Trace
 
 # --------------------------------------------------------------------------
@@ -156,6 +156,22 @@ def _secret(box: SecretBox, new_value: str | None, current: str | None, clear: b
     return box.seal(str(new_value))
 
 
+def _headers(box: SecretBox, new: dict[str, str], current: dict[str, str]) -> dict[str, str]:
+    """Cabeçalhos extras: ``env:`` validado; texto cifrado quando há chave mestra."""
+    out: dict[str, str] = {}
+    for name, value in new.items():
+        value = (value or "").strip()
+        if value == MASK and name in current:
+            out[name] = current[name]  # a UI mostrou a máscara: mantém o valor gravado
+        elif not value:
+            out[name] = ""
+        elif value.startswith((ENV_PREFIX, ENC_PREFIX)) or box.enabled:
+            out[name] = box.seal(value) or ""
+        else:
+            out[name] = value  # sem chave mestra, cabeçalhos comuns ficam em texto
+    return out
+
+
 def save_model(
     session: Session, data: dict[str, Any], *, box: SecretBox, model_id: int | None = None
 ) -> LlmModel:
@@ -170,7 +186,7 @@ def save_model(
         "base_url": (str(data.get("base_url") or "").strip() or None),
         "api_key": api_key,
         "api_key_header": str(data.get("api_key_header") or "Authorization").strip(),
-        "extra_headers": data.get("extra_headers") or {},
+        "extra_headers": _headers(box, data.get("extra_headers") or {}, row.extra_headers or {}),
         "temperature": data.get("temperature"),
         "max_tokens": data.get("max_tokens"),
         "timeout_s": data.get("timeout_s") or 60.0,

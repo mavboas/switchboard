@@ -48,7 +48,7 @@ class AnthropicChat:
         api_key: str | None = None,
         extra_headers: dict[str, str] | None = None,
         temperature: float | None = 0.2,
-        max_tokens: int | None = 1024,
+        max_tokens: int | None = 4096,
         timeout_s: float = 60.0,
         label: str | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
@@ -56,7 +56,7 @@ class AnthropicChat:
         self.model = model
         self.base_url = _normalize_base(base_url)
         self.temperature = temperature
-        self.max_tokens = max_tokens or 1024
+        self.max_tokens = max_tokens or 4096
         self.label = label or f"anthropic:{model}"
         self._dropped: set[str] = set()
         headers = {
@@ -102,7 +102,7 @@ class AnthropicChat:
         for _attempt in range(3):
             try:
                 resp = await self._client.post("/v1/messages", json=payload)
-            except httpx.HTTPError as exc:
+            except (httpx.HTTPError, RuntimeError) as exc:  # RuntimeError: cliente já fechado
                 raise LLMError(
                     f"{self.label}: falha de rede ao chamar {self.base_url} ({exc.__class__.__name__}: {exc})",
                     provider=self.label,
@@ -132,6 +132,11 @@ class AnthropicChat:
         text = "".join(
             b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"
         )
+        if not text.strip() and data.get("stop_reason") == "max_tokens":
+            raise LLMError(
+                f"{self.label}: a resposta veio vazia porque bateu no limite de tokens (aumente max_tokens)",
+                provider=self.label,
+            )
         usage = data.get("usage") or {}
         return ChatResult(
             text=text,

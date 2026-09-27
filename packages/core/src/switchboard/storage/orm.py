@@ -110,7 +110,7 @@ class LlmModel(Timestamped, Base):
     api_key_header: Mapped[str] = mapped_column(String(100), default="Authorization")
     extra_headers: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
     temperature: Mapped[float | None] = mapped_column(Float, default=0.2)
-    max_tokens: Mapped[int | None] = mapped_column(Integer, default=1024)
+    max_tokens: Mapped[int | None] = mapped_column(Integer, default=4096)
     timeout_s: Mapped[float] = mapped_column(Float, default=60.0)
     json_mode: Mapped[bool] = mapped_column(Boolean, default=True)
 

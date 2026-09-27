@@ -50,7 +50,7 @@ class OpenAICompatibleChat:
         api_key_header: str = "Authorization",
         extra_headers: dict[str, str] | None = None,
         temperature: float | None = 0.2,
-        max_tokens: int | None = 1024,
+        max_tokens: int | None = 4096,
         timeout_s: float = 60.0,
         json_mode: bool = True,
         label: str | None = None,
@@ -106,7 +106,11 @@ class OpenAICompatibleChat:
             self._dropped.add("temperature")
             return True
         key = self._max_tokens_key
-        if key in payload and key in msg:
+        context_error = any(
+            t in msg for t in ("context length", "context window", "maximum context")
+        )
+        if key in payload and (key in msg or context_error):
+            # limite maior que o contexto do servidor (ex.: vLLM com max-model-len pequeno)
             payload.pop(key)
             self._dropped.add("max_tokens")
             return True
@@ -124,7 +128,7 @@ class OpenAICompatibleChat:
         for _attempt in range(5):
             try:
                 resp = await self._client.post("/chat/completions", json=payload)
-            except httpx.HTTPError as exc:
+            except (httpx.HTTPError, RuntimeError) as exc:  # RuntimeError: cliente já fechado
                 raise LLMError(
                     f"{self.label}: falha de rede ao chamar {self.base_url} ({exc.__class__.__name__}: {exc})",
                     provider=self.label,
@@ -148,6 +152,13 @@ class OpenAICompatibleChat:
         content = message.get("content")
         if isinstance(content, list):  # alguns servidores devolvem partes
             content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+        finish = data["choices"][0].get("finish_reason")
+        if not (content or "").strip() and finish == "length":
+            raise LLMError(
+                f"{self.label}: a resposta veio vazia porque bateu no limite de tokens "
+                "(modelos com raciocínio gastam tokens antes de responder; aumente max_tokens)",
+                provider=self.label,
+            )
         usage = data.get("usage") or {}
         return ChatResult(
             text=content or "",

@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from switchboard.agents import AgentCatalog
 from switchboard.secrets import SecretBox
 from switchboard.storage import Database, repo, seed_demo
-from switchboard.storage.orm import RouterProfile
+from switchboard.storage.orm import LlmModel, RouterProfile
 from switchboard.testing import inproc_connector
 from switchboard_agents import chamados, credito
 from switchboard_router.app import create_app
@@ -37,6 +37,7 @@ def database(tmp_path):
 
 
 def make_client(db: Database, **settings_kwargs) -> TestClient:
+    settings_kwargs.setdefault("allowed_hosts", "testserver")
     settings = Settings(database_url=db.url, config_ttl_s=0, **settings_kwargs)
     runtime = DbRuntime(
         db,
@@ -200,7 +201,45 @@ profiles: [{{name: default, model: offline, knowledge_bases: [manual], min_score
 """,
         encoding="utf-8",
     )
-    with TestClient(create_app(Settings(config_file=str(config)))) as client:
+    with TestClient(
+        create_app(Settings(config_file=str(config), allowed_hosts="testserver"))
+    ) as client:
         body = client.post("/v1/chat", json={"message": "Qual o e-mail da ouvidoria?"}).json()
         assert body["route"] == "direct" and "ouvidoria@acme.example" in body["answer"]
         assert client.get("/v1/models").json()["data"][0]["id"] == "default"
+
+
+def test_unreadable_model_secret_falls_back_to_offline(database):
+    """Chave cifrada com outra chave mestra: o router atende em modo offline e avisa."""
+    with database.session() as s:
+        model = s.query(LlmModel).one()
+        model.provider, model.model = "openai", "gpt-x"
+        model.api_key = SecretBox("outra-chave-mestra").seal("sk-123")
+    with make_client(database) as client:
+        body = client.post(
+            "/v1/chat", json={"message": "Qual o horário de atendimento aos sábados?"}
+        ).json()
+    assert body["route"] == "direct" and "9h às 14h" in body["answer"]
+    assert any("modo offline" in w for w in body["warnings"])
+
+
+def test_open_api_only_answers_known_hosts(database):
+    """Sem chaves de API, o router só atende hosts conhecidos (contra DNS rebinding)."""
+    with make_client(database, allowed_hosts="localhost,router") as client:
+        evil = client.post("/v1/chat", json={"message": "oi"}, headers={"Host": "evil.example"})
+        assert evil.status_code == 400
+        assert (
+            client.post(
+                "/v1/chat", json={"message": "oi"}, headers={"Host": "localhost:8080"}
+            ).status_code
+            == 200
+        )
+        assert client.get("/healthz", headers={"Host": "10.0.0.7:8080"}).status_code == 200
+    with make_client(database, allowed_hosts="localhost", api_keys="k1") as client:
+        # com chave, qualquer host serve (a chave é a proteção)
+        ok = client.post(
+            "/v1/chat",
+            json={"message": "oi"},
+            headers={"Host": "api.empresa.com", "Authorization": "Bearer k1"},
+        )
+        assert ok.status_code == 200

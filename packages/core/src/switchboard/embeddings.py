@@ -14,6 +14,7 @@ import math
 from collections.abc import Callable, Sequence
 from typing import Protocol, runtime_checkable
 
+import anyio.to_thread
 import httpx
 
 from .config import EmbedderSpec, ModelSpec
@@ -44,7 +45,10 @@ class HashingEmbedder:
         return None
 
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
-        return [self.embed_one(t) for t in texts]
+        if len(texts) <= 8:
+            return [self.embed_one(t) for t in texts]
+        # lotes grandes (indexação) são CPU puro: fora do event loop
+        return await anyio.to_thread.run_sync(lambda: [self.embed_one(t) for t in texts])
 
     def _slot(self, feature: str) -> tuple[int, float]:
         digest = hashlib.blake2b(feature.encode("utf-8"), digest_size=8).digest()
@@ -106,7 +110,7 @@ class OpenAICompatibleEmbedder:
                 resp = await self._client.post(
                     "/embeddings", json={"model": self.model, "input": batch}
                 )
-            except httpx.HTTPError as exc:
+            except (httpx.HTTPError, RuntimeError) as exc:
                 raise LLMError(f"{self.label}: falha de rede ({exc})", provider=self.label) from exc
             if resp.status_code >= 400:
                 raise LLMError(

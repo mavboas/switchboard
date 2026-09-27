@@ -198,9 +198,9 @@ def test_secret_box_roundtrip_and_env(monkeypatch):
     sealed = box.seal("sk-secreta")
     assert sealed.startswith("enc:") and "sk-secreta" not in sealed
     assert box.open(sealed) == "sk-secreta"
-    assert box.seal("env:MINHA_CHAVE") == "env:MINHA_CHAVE"
-    monkeypatch.setenv("MINHA_CHAVE", "valor")
-    assert box.open("env:MINHA_CHAVE") == "valor"
+    assert box.seal("env:MINHA_API_KEY") == "env:MINHA_API_KEY"
+    monkeypatch.setenv("MINHA_API_KEY", "valor")
+    assert box.open("env:MINHA_API_KEY") == "valor"
     assert SecretBox.describe(sealed) == "•••••• (cifrada)"
     assert box.seal("  ") is None
     with pytest.raises(SecretError):
@@ -208,6 +208,46 @@ def test_secret_box_roundtrip_and_env(monkeypatch):
     with pytest.raises(SecretError):
         SecretBox("outra-chave").open(sealed)
     assert resolve_env("env:NAO_EXISTE_X") is None
+
+
+def test_env_references_are_restricted(monkeypatch):
+    """Quem edita a configuração não pode ler variáveis arbitrárias do processo."""
+    monkeypatch.setenv("SWITCHBOARD_SECRET_KEY", "mestra")
+    monkeypatch.setenv("DATABASE_PASSWORD", "segredo")
+    box = SecretBox("k")
+    for name in (
+        "SWITCHBOARD_SECRET_KEY",
+        "SWITCHBOARD_DATABASE_URL",
+        "DATABASE_PASSWORD",
+        "AWS_SESSION_TOKEN",
+        "GITHUB_TOKEN",
+        "PATH",
+        "X-Y",
+    ):
+        with pytest.raises(SecretError, match="não está liberada"):
+            box.seal(f"env:{name}")
+        with pytest.raises(SecretError):
+            box.open(f"env:{name}")  # mesmo que alguém grave direto no banco
+    assert box.seal("env:MCP_CRM_TOKEN") == "env:MCP_CRM_TOKEN"
+    assert box.seal("env:OPENAI_API_KEY") == "env:OPENAI_API_KEY"
+    custom = SecretBox("k", "MEU_SEGREDO,ACME_*")
+    assert custom.seal("env:ACME_CHAVE") == "env:ACME_CHAVE"
+    with pytest.raises(SecretError):
+        custom.seal("env:OPENAI_API_KEY")  # a lista customizada substitui a padrão
+    # modo YAML (arquivo do operador) continua sem restrição
+    assert resolve_env("env:DATABASE_PASSWORD") == "segredo"
+
+
+def test_master_key_file_is_created_once(tmp_path):
+    from switchboard.secrets import load_master_key
+
+    path = tmp_path / "sub" / "secret.key"
+    first = load_master_key(None, str(path))
+    assert first and len(first) >= 40 and path.read_text() == first
+    assert load_master_key("", str(path)) == first  # segundo processo lê a mesma chave
+    assert load_master_key("explicita", str(path)) == "explicita"
+    assert load_master_key(None, None) is None
+    assert oct(path.stat().st_mode)[-3:] == "600"
 
 
 def test_load_yaml_with_env_interpolation_and_reference_errors(tmp_path, monkeypatch):
@@ -243,3 +283,50 @@ profiles:
     )
     with pytest.raises(ConfigError, match="letras minúsculas"):
         load_yaml(invalid_name)
+
+
+def test_load_yaml_ignores_placeholders_in_comments(tmp_path):
+    config = tmp_path / "c.yaml"
+    config.write_text(
+        "# ${NAO_DEFINIDA} só aparece em comentário\nmodels: [{name: m, provider: offline}]\nprofiles: [{model: m}]\n",
+        encoding="utf-8",
+    )
+    assert load_yaml(config).profiles[0].model == "m"
+
+
+async def test_openai_compat_empty_answer_at_token_limit_is_an_error():
+    reply = {
+        "model": "m",
+        "choices": [{"message": {"content": ""}, "finish_reason": "length"}],
+        "usage": {},
+    }
+    chat = OpenAICompatibleChat(
+        model="m", transport=httpx.MockTransport(lambda r: httpx.Response(200, json=reply))
+    )
+    with pytest.raises(LLMError, match="limite de tokens"):
+        await chat.chat([Message("user", "u")])
+
+
+async def test_closed_client_becomes_llm_error():
+    chat = OpenAICompatibleChat(
+        model="m", transport=httpx.MockTransport(lambda r: httpx.Response(200, json={}))
+    )
+    await chat.aclose()
+    with pytest.raises(LLMError):
+        await chat.chat([Message("user", "u")])
+
+
+async def test_openai_compat_drops_max_tokens_on_context_errors():
+    bodies = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        bodies.append(body)
+        if "max_tokens" in body:
+            msg = "This model's maximum context length is 4096 tokens. However, you requested 4500 tokens."
+            return httpx.Response(400, json={"error": {"message": msg}})
+        return httpx.Response(200, json=_openai_reply("ok"))
+
+    chat = OpenAICompatibleChat(model="m", transport=httpx.MockTransport(handler))
+    assert (await chat.chat([Message("user", "u")])).text == "ok"
+    assert "max_tokens" not in bodies[-1]

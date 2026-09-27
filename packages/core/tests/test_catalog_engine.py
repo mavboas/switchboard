@@ -234,3 +234,104 @@ async def test_engine_requires_user_message(catalog):
     engine = RouterEngine(_profile(LLM, kbs=()), chat=FakeChat([]), catalog=catalog)
     result = await engine.handle([{"role": "system", "content": "x"}])
     assert result.route == "error" and result.error
+
+
+# --------------------------------------------------------------------------
+# robustez (itens da revisão)
+
+
+async def test_hung_agent_does_not_block_requests_after_first_discovery(servers):
+    import asyncio
+    import time
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def hung(spec, token):
+        await asyncio.sleep(3600)  # agente que aceita a conexão e nunca responde
+        yield None
+
+    catalog = AgentCatalog(connector=hung, discovery_timeout_s=0.2, offline_ttl_s=0.01)
+    started = time.perf_counter()
+    [info] = await catalog.discover([GHOST])
+    assert info.status == "offline" and time.perf_counter() - started < 1.5
+    await asyncio.sleep(0.05)  # cache vencido: a próxima resposta sai do cache na hora
+    started = time.perf_counter()
+    [again] = await catalog.discover([GHOST])
+    assert again.status == "offline" and time.perf_counter() - started < 0.1
+
+
+async def test_tools_list_pagination_is_followed():
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    class Paginated:
+        server_info = SimpleNamespace(name="p")
+        instructions = "paginado"
+
+        async def list_tools(self, cursor=None):
+            tool = {"name": "t2" if cursor else "t1", "inputSchema": {"type": "object"}}
+            return SimpleNamespace(
+                tools=[SimpleNamespace(model_dump=lambda **_k: tool)],
+                next_cursor=None if cursor else "p2",
+            )
+
+    @asynccontextmanager
+    async def connect(spec, token):
+        yield Paginated()
+
+    [info] = await AgentCatalog(connector=connect).discover([CALC])
+    assert [t.name for t in info.tools] == ["t1", "t2"]
+
+
+def test_prompt_keeps_nested_schemas():
+    from switchboard.routing.prompts import compact_schema
+
+    schema = {
+        "title": "pedidoArguments",
+        "type": "object",
+        "$defs": {
+            "Item": {"title": "Item", "type": "object", "properties": {"sku": {"type": "string"}}}
+        },
+        "properties": {
+            "title": {"title": "Title", "type": "string"},
+            "itens": {"type": "array", "items": {"$ref": "#/$defs/Item"}, "minItems": 1},
+        },
+    }
+    out = compact_schema(schema)
+    assert "title" not in out and out["$defs"]["Item"]["properties"]["sku"] == {"type": "string"}
+    assert out["properties"]["title"] == {"type": "string"}  # propriedade chamada "title" fica
+    assert out["properties"]["itens"]["items"] == {"$ref": "#/$defs/Item"}
+
+
+async def test_unusable_llm_output_falls_back_to_offline(catalog):
+    chat = FakeChat(["", ""])  # vazio duas vezes (ex.: modelo de raciocínio sem tokens)
+    engine = RouterEngine(_profile(LLM), chat=chat, catalog=catalog, retriever=await _retriever())
+    result = await engine.handle("vocês abrem no sábado?")
+    assert result.route == "direct" and "sábados" in result.answer
+    assert any("fora do formato" in w for w in result.warnings)
+
+
+async def test_synthesis_crash_returns_agent_text(catalog):
+    chat = FakeChat(
+        [
+            '{"action": "delegate", "agent": "calc", "tool": "somar", "arguments": {"a": 1, "b": 2}}',
+            RuntimeError("cliente fechado"),
+        ]
+    )
+    engine = RouterEngine(_profile(LLM, kbs=()), chat=chat, catalog=catalog)
+    result = await engine.handle("1+2")
+    assert result.route == "delegated" and result.answer == "resultado: 3"
+    assert any("síntese" in w for w in result.warnings)
+
+
+async def test_handle_never_raises(catalog, monkeypatch):
+    async def boom(*_a, **_k):
+        raise RuntimeError("bug inesperado")
+
+    monkeypatch.setattr(catalog, "discover", boom)
+    engine = RouterEngine(
+        _profile(LLM, kbs=()), chat=FakeChat([]), catalog=catalog, warnings=["aviso fixo"]
+    )
+    result = await engine.handle("oi")
+    assert result.route == "error" and "bug inesperado" in result.error
+    assert result.warnings == ["aviso fixo"]
