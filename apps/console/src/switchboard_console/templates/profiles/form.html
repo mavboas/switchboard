@@ -6,7 +6,7 @@
   <div>
     <div class="crumbs"><a href="/profiles">Roteadores</a> /</div>
     <h1>{{ values.name if values.id else 'Novo roteador' }}</h1>
-    <p>O roteador decide, a cada pedido: <strong>responder</strong> (com as bases), <strong>delegar</strong> a uma tool de agente via MCP ou <strong>esclarecer</strong> quando falta informação.</p>
+    <p>O roteador decide, a cada pedido: <strong>responder</strong> (com as bases), chamar uma <strong>tool MCP</strong> na hora, <strong>delegar</strong> a um ou mais agentes A2A sob contrato ou <strong>esclarecer</strong> quando falta informação.</p>
   </div>
   {% if values.id %}<div class="actions"><a class="btn" href="/playground?profile={{ values.name }}">Testar no playground</a></div>{% endif %}
 </div>
@@ -17,17 +17,36 @@
   <div class="form-grid">
     {{ field("name", "Nome", values.name, placeholder="ex.: default", required=true, help="Vai no campo <code>model</code> da API compatível com OpenAI.") }}
     <div class="field">
-      <label for="f-model_id">Modelo</label>
+      <label for="f-model_id">Modelo (LLM)</label>
       <select id="f-model_id" name="model_id" required>
         <option value="">—</option>
         {% for m in models %}<option value="{{ m.id }}" {% if values.model_id == m.id %}selected{% endif %}>{{ m.name }} · {{ m.label }}</option>{% endfor %}
       </select>
-      <div class="help">Não achou? <a href="/models/new">Cadastre um modelo</a>.</div>
+      <div class="help">Redige respostas, extrai argumentos e consolida resultados. Não achou? <a href="/models/new">Cadastre um modelo</a>.</div>
     </div>
     {{ field("description", "Descrição", values.description, cls="full") }}
     {{ textarea("system_prompt", "Instruções (system prompt)", values.system_prompt, help="Tom, persona e regras do negócio. As regras de roteamento o Switchboard acrescenta sozinho.", cls="full", rows=4) }}
 
-    <div class="section-title">Agentes que pode acionar</div>
+    <div class="section-title">Decisão</div>
+    <div class="field">
+      <label for="f-decision_model_id">Modelo de decisão (opcional)</label>
+      <select id="f-decision_model_id" name="decision_model_id">
+        <option value="">— o LLM decide —</option>
+        {% for m in deciders %}<option value="{{ m.id }}" {% if values.decision_model_id == m.id %}selected{% endif %}>{{ m.name }} · {{ m.label }}</option>{% endfor %}
+      </select>
+      <div class="help">TypeSafe Jev (System One): escolhe a rota e confere os parâmetros com probabilidades; o LLM continua redigindo. {% if not deciders %}<a href="/models/new?preset=typesafe">Cadastrar um Jev</a>.{% endif %}</div>
+    </div>
+    {{ field("decision_threshold", "Confiança mínima do modelo de decisão", values.decision_threshold, type="number", attrs='step="0.05" min="0" max="1"', help="Abaixo disso (ou se o Jev falhar) a decisão sobe para o LLM. 0,6 é um bom começo; calibre olhando as execuções.") }}
+
+    <div class="section-title">Conectores MCP (tools rápidas)</div>
+    <div class="choices full">
+      {% for c in connectors %}
+      <label class="check"><input type="checkbox" name="connector_ids" value="{{ c.id }}" {% if c.id in values.connector_ids %}checked{% endif %}>
+        <div><strong>{{ c.name }}{% if not c.enabled %} (desabilitado){% endif %}</strong><span>{{ c.description or 'sem descrição' }}</span></div></label>
+      {% else %}<p class="muted">Nenhum conector registrado. <a href="/connectors/new">Registrar</a></p>{% endfor %}
+    </div>
+
+    <div class="section-title">Agentes A2A (tarefas delegadas sob contrato)</div>
     <div class="choices full">
       {% for a in agents %}
       <label class="check"><input type="checkbox" name="agent_ids" value="{{ a.id }}" {% if a.id in values.agent_ids %}checked{% endif %}>
@@ -46,8 +65,13 @@
     <div class="section-title">Comportamento</div>
     {{ field("top_k", "Trechos por pergunta (top-k)", values.top_k, type="number", attrs='min="1" max="20"') }}
     {{ field("min_score", "Similaridade mínima", values.min_score, type="number", attrs='step="0.01" min="0" max="1"', help="Trechos abaixo disso não entram no prompt. Com o embedder hashing, 0,15 a 0,25 costuma ir bem.") }}
-    {{ checkbox("synthesize", "Sintetizar a resposta do agente", values.synthesize, "O modelo reescreve o resultado da tool para o usuário. Desligado, devolve o texto do agente como veio.") }}
-    {{ checkbox("allow_clarify", "Fazer perguntas de esclarecimento", values.allow_clarify, "Quando falta um dado obrigatório para acionar a tool, pergunta em vez de chutar.") }}
+    {{ checkbox("synthesize", "Sintetizar os resultados", values.synthesize, "O LLM reescreve o resultado da tool ou consolida os dos agentes para o usuário. Desligado, devolve o texto como veio.") }}
+    {{ checkbox("allow_clarify", "Fazer perguntas de esclarecimento", values.allow_clarify, "Quando falta um dado obrigatório para acionar uma tool ou skill, pergunta em vez de chutar.") }}
+
+    <div class="section-title">Delegação a agentes</div>
+    {{ field("wait_s", "Espera antes de responder (segundos)", values.wait_s, type="number", attrs='step="1" min="0" max="120"', help="Quanto o pedido espera os agentes. Passou disso, responde “em andamento” com o <code>run_id</code> e consolida em segundo plano.") }}
+    {{ field("max_parallel", "Agentes em paralelo por pedido", values.max_parallel, type="number", attrs='min="1" max="10"', help="Um pedido pode abrir vários contratos ao mesmo tempo (fan-out) e juntar as respostas.") }}
+    {{ field("deadline_s", "Prazo padrão dos contratos (segundos)", values.deadline_s, type="number", attrs='step="1" min="5"', help="Limite para cada contrato; vale o menor entre este e o da skill. O prazo do cadastro do agente, se houver, tem precedência.") }}
     {{ checkbox("enabled", "Ativo", values.enabled, "Roteadores desativados respondem 404 na API.") }}
   </div>
   <div class="form-actions">
@@ -59,9 +83,14 @@
 {% if values.id %}
 <div class="card">
   <h2>Como chamar</h2>
-  <p class="muted small">API nativa (devolve rota, agente, fontes e trace):</p>
+  <p class="muted small">API nativa (devolve rota, decisão, fontes, contratos e spans):</p>
   <pre class="block">curl -s {{ settings.public_router_url }}/v1/chat -H 'Content-Type: application/json' \
   -d '{"profile": "{{ values.name }}", "message": "sua pergunta"}'</pre>
+  <p class="muted small" style="margin-top:14px">Delegações que passam da espera voltam com <strong>HTTP 202</strong>, <code>status: "pending"</code> e um <code>run_id</code>. Acompanhe, ou responda quando um agente pedir informação (<code>status: "needs_input"</code>):</p>
+  <pre class="block">curl -s {{ settings.public_router_url }}/v1/runs/RUN_ID            # estado, resposta consolidada, contratos e spans
+curl -N {{ settings.public_router_url }}/v1/runs/RUN_ID/events     # o mesmo em tempo real (SSE)
+curl -s {{ settings.public_router_url }}/v1/chat -H 'Content-Type: application/json' \
+  -d '{"profile": "{{ values.name }}", "run_id": "RUN_ID", "message": "sim, com imóvel em garantia"}'</pre>
   <p class="muted small" style="margin-top:14px">Qualquer SDK da OpenAI (o roteador aparece como um "modelo"):</p>
   <pre class="block">from openai import OpenAI
 

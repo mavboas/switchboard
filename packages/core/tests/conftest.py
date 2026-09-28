@@ -10,12 +10,12 @@ from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
 from sqlalchemy import create_engine, text
 
-from switchboard.agents import AgentCatalog
+from switchboard.connectors import ConnectorCatalog
 from switchboard.storage import Database
-from switchboard.testing import inproc_connector
+from switchboard.testing import FakeA2AAgent, FakeNetwork, inproc_connector
 
 # --------------------------------------------------------------------------
-# agentes MCP em processo (sem rede)
+# conectores MCP em processo (sem rede)
 
 
 def make_calc_server() -> MCPServer:
@@ -63,8 +63,18 @@ def servers() -> dict[str, MCPServer]:
 
 
 @pytest.fixture
-def catalog(servers) -> AgentCatalog:
-    return AgentCatalog(connector=inproc_connector(servers))
+def catalog(servers) -> ConnectorCatalog:
+    return ConnectorCatalog(connector=inproc_connector(servers))
+
+
+@pytest.fixture
+def risk_agent() -> FakeA2AAgent:
+    return FakeA2AAgent()
+
+
+@pytest.fixture
+def network(risk_agent) -> FakeNetwork:
+    return FakeNetwork(risk_agent)
 
 
 # --------------------------------------------------------------------------
@@ -99,6 +109,26 @@ def db(request, tmp_path):
         yield database
     finally:
         database.dispose()
+        with admin.begin() as conn:
+            conn.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+        admin.dispose()
+
+
+@pytest.fixture(params=["sqlite", "postgres"])
+def empty_db_url(request, tmp_path):
+    """URL de um banco vazio (sem init), para testar migrações."""
+    if request.param == "sqlite":
+        yield f"sqlite:///{tmp_path / 'legado.db'}"
+        return
+    if not PG_URL:
+        pytest.skip("defina SWITCHBOARD_TEST_DATABASE_URL para testar no PostgreSQL")
+    schema, url = _pg_schema_url(PG_URL)
+    admin = create_engine(Database(PG_URL).url)
+    with admin.begin() as conn:
+        conn.execute(text(f'CREATE SCHEMA "{schema}"'))
+    try:
+        yield url
+    finally:
         with admin.begin() as conn:
             conn.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
         admin.dispose()

@@ -16,11 +16,13 @@ from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from switchboard import __version__
-from switchboard.agents import AgentCatalog
+from switchboard.a2a import AgentDirectory
+from switchboard.connectors import ConnectorCatalog
 from switchboard.net import host_allowed
 from switchboard.storage import seed_demo
 
 from .api import api
+from .ops import router as ops_router
 from .settings import Settings
 from .state import STATIC_DIR, Console
 from .ui import router as ui_router
@@ -48,23 +50,31 @@ def _basic_ok(header: str | None, user: str, password: str) -> bool:
 def create_app(
     settings: Settings | None = None,
     *,
-    catalog: AgentCatalog | None = None,
+    connectors: ConnectorCatalog | None = None,
+    agents: AgentDirectory | None = None,
     http: httpx.AsyncClient | None = None,
+    jev_transport: httpx.AsyncBaseTransport | None = None,
 ) -> FastAPI:
     settings = settings or Settings()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        console = Console.create(settings, catalog=catalog, http=http)
+        console = Console.create(
+            settings, connectors=connectors, agents=agents, http=http, jev_transport=jev_transport
+        )
         app.state.console = console
         if settings.seed_demo:
             try:
                 seeded = await seed_demo(
                     console.db,
                     knowledge_dir=Path(settings.demo_knowledge_dir),
-                    agent_urls={
+                    connector_urls={
                         "credito": settings.demo_credito_url,
                         "chamados": settings.demo_chamados_url,
+                    },
+                    agent_urls={
+                        "analise-credito": settings.demo_analise_url,
+                        "risco": settings.demo_risco_url,
                     },
                     box=console.box,
                 )
@@ -90,7 +100,10 @@ def create_app(
     app = FastAPI(
         title="Switchboard Console",
         version=__version__,
-        description="Configuração de modelos, agentes MCP, bases de conhecimento e roteadores.",
+        description=(
+            "Configuração de modelos, conectores MCP, agentes A2A, bases de conhecimento e "
+            "roteadores; execuções, spans e contratos."
+        ),
         lifespan=lifespan,
     )
 
@@ -128,4 +141,5 @@ def create_app(
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     app.include_router(api)
     app.include_router(ui_router)
+    app.include_router(ops_router)
     return app

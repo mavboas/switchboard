@@ -1,0 +1,72 @@
+"""Contratos fechados entre o Switchboard e agentes A2A (termos, estados e ciclo de vida)."""
+
+from . import states
+from .manager import (
+    Consolidation,
+    Consolidator,
+    ContractManager,
+    OpenRequest,
+    PushRejected,
+    contract_terms,
+    default_consolidation,
+    input_question,
+)
+from .models import (
+    RUN_COMPLETED,
+    RUN_CONSOLIDATING,
+    RUN_FAILED,
+    RUN_FINAL,
+    RUN_NEEDS_INPUT,
+    RUN_PENDING,
+    ContractEvent,
+    ContractRecord,
+    RunRecord,
+    token_hash,
+    token_matches,
+)
+from .store import ContractStore, MemoryContractStore
+from .terms import (
+    CONTRACT_EXTENSION_URI,
+    CONTRACT_VERSION,
+    SkillTerms,
+    canonical_json,
+    coerce_to_schema,
+    normalize_numbers,
+    schema_hash,
+    skills_from_extension,
+    validate,
+)
+
+__all__ = [
+    "CONTRACT_EXTENSION_URI",
+    "CONTRACT_VERSION",
+    "RUN_COMPLETED",
+    "RUN_CONSOLIDATING",
+    "RUN_FAILED",
+    "RUN_FINAL",
+    "RUN_NEEDS_INPUT",
+    "RUN_PENDING",
+    "Consolidation",
+    "Consolidator",
+    "ContractEvent",
+    "ContractManager",
+    "ContractRecord",
+    "ContractStore",
+    "MemoryContractStore",
+    "OpenRequest",
+    "PushRejected",
+    "RunRecord",
+    "SkillTerms",
+    "canonical_json",
+    "coerce_to_schema",
+    "contract_terms",
+    "default_consolidation",
+    "input_question",
+    "normalize_numbers",
+    "schema_hash",
+    "skills_from_extension",
+    "states",
+    "token_hash",
+    "token_matches",
+    "validate",
+]

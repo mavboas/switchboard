@@ -2,41 +2,73 @@
 
 Fluxo de :meth:`RouterEngine.handle`:
 
-1. **RAG** — busca trechos relevantes nas bases do perfil;
-2. **descoberta** — pergunta via MCP quais agentes estão no ar e que tools têm;
-3. **decisão** — o LLM (ou o decisor offline) escolhe ``answer``, ``delegate``
+1. **RAG** e **descoberta** em paralelo — trechos relevantes das bases do
+   perfil; tools dos conectores MCP e skills dos agentes A2A que estão no ar;
+2. **decisão** — o Jev (System One), se o perfil tiver modelo de decisão, ou o
+   LLM, ou o decisor heurístico (offline): ``answer``, ``tool``, ``delegate``
    ou ``clarify``;
-4. **execução** — responde direto, pergunta, ou aciona a tool do agente via
-   MCP e sintetiza a resposta final.
+3. **execução**:
 
-Cada etapa vira um :class:`TraceStep` com duração e detalhes, devolvido no
-resultado (e gravado pelo serviço, se houver persistência). Falha no provedor
-de LLM não derruba o atendimento: o motor cai para o decisor offline e
-registra o aviso.
+   * ``answer``/``clarify``: devolve o texto;
+   * ``tool``: chama a tool MCP e sintetiza a resposta (síncrono);
+   * ``delegate``: abre um contrato por tarefa com os agentes A2A, espera até
+     ``wait_s`` e devolve a resposta consolidada — ou ``pending`` com o
+     ``run_id``; a consolidação continua em segundo plano quando o último
+     contrato termina.
+
+Cada etapa vira um span (:mod:`switchboard.tracing`). Falhas de provedor não
+derrubam o atendimento: Jev fora → decide o LLM; LLM fora → decide o
+heurístico; síntese falhou → devolve o resultado da tool como veio.
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
-import uuid
 from collections.abc import Sequence
+from typing import Any
 
-from ..agents.catalog import AgentCatalog, ToolCallResult
-from ..errors import AgentError, LLMError
+from ..a2a.directory import AgentDirectory, AgentInfo
+from ..connectors.catalog import ConnectorCatalog, ConnectorInfo, ToolCallResult
+from ..contracts import (
+    RUN_COMPLETED,
+    RUN_FAILED,
+    RUN_NEEDS_INPUT,
+    RUN_PENDING,
+    Consolidation,
+    ContractManager,
+    ContractRecord,
+    OpenRequest,
+    RunRecord,
+    default_consolidation,
+    states,
+)
+from ..errors import ConnectorError, ContractError, DecisionModelError, LLMError
+from ..jev import JevClient
 from ..llm.base import ChatModel, Message, Usage
 from ..rag.retriever import Hit, Retriever
 from ..text import content_tokens, truncate
+from ..tracing import Span, SpanRecorder, new_span_id, new_trace_id, utcnow
+from .capabilities import Capability, capabilities
 from .deciders import (
     Composer,
     Decider,
+    ExtractiveAnswerer,
+    HeuristicArgumentFiller,
     HeuristicDecider,
+    LLMAnswerer,
+    LLMArgumentFiller,
     LLMComposer,
     LLMDecider,
     TemplateComposer,
     user_turns,
 )
 from .decision import DecisionError
-from .types import Decision, ResolvedProfile, RouterResult, SourceRef, TraceStep
+from .jev_decider import DecisionContext, JevDecider
+from .prompts import consolidation_messages
+from .types import Decision, ResolvedProfile, RouterResult, SourceRef
+
+CONTEXT_LIMIT = 12
 
 
 def normalize_messages(messages: str | Sequence[Message] | Sequence[dict]) -> list[Message]:
@@ -72,14 +104,20 @@ class _Clock:
         return (time.perf_counter() - self.start) * 1000
 
 
+SORRY = "Desculpe, não consegui processar seu pedido agora. Tente novamente em instantes."
+
+
 class RouterEngine:
     def __init__(
         self,
         profile: ResolvedProfile,
         *,
         chat: ChatModel,
-        catalog: AgentCatalog,
+        connectors: ConnectorCatalog,
+        agents: AgentDirectory | None = None,
+        contracts: ContractManager | None = None,
         retriever: Retriever | None = None,
+        jev: JevClient | None = None,
         decider: Decider | None = None,
         composer: Composer | None = None,
         warnings: Sequence[str] = (),
@@ -87,21 +125,51 @@ class RouterEngine:
         self.profile = profile
         self.static_warnings = list(warnings)
         self.chat = chat
-        self.catalog = catalog
+        self.connectors = connectors
+        self.agents = agents
+        self.contracts = contracts
         self.retriever = retriever
-        self.decider = decider or (HeuristicDecider() if chat.offline else LLMDecider(chat))
+        self.jev = jev
+        fallback: Decider = HeuristicDecider() if chat.offline else LLMDecider(chat)
+        if decider is not None:
+            self.decider = decider
+        elif jev is not None:
+            self.decider = JevDecider(
+                jev,
+                answerer=ExtractiveAnswerer() if chat.offline else LLMAnswerer(chat),
+                filler=HeuristicArgumentFiller() if chat.offline else LLMArgumentFiller(chat),
+                escalate=fallback,
+            )
+        else:
+            self.decider = fallback
         self.composer = composer or (TemplateComposer() if chat.offline else LLMComposer(chat))
         self._fallback_decider = HeuristicDecider()
         self._fallback_composer = TemplateComposer()
 
-    async def handle(self, messages: str | Sequence[Message] | Sequence[dict]) -> RouterResult:
+    @property
+    def decision_label(self) -> str:
+        if isinstance(self.decider, JevDecider):
+            return f"{self.decider.jev.label} → {self.chat.label}"
+        return self.chat.label
+
+    # ------------------------------------------------------------------ entrada
+
+    async def handle(
+        self,
+        messages: str | Sequence[Message] | Sequence[dict],
+        *,
+        wait_s: float | None = None,
+        callback_url: str | None = None,
+    ) -> RouterResult:
         clock = _Clock()
         spec = self.profile.spec
         msgs = normalize_messages(messages)
         turns = user_turns(msgs)
         question = turns[-1] if turns else ""
+        trace_id = new_trace_id()
+        recorder = SpanRecorder(trace_id, roteador=spec.name)
         result = RouterResult(
-            trace_id=uuid.uuid4().hex,
+            trace_id=trace_id,
             profile=spec.name,
             question=question,
             answer="",
@@ -112,27 +180,41 @@ class RouterEngine:
         if not question:
             result.answer = "Envie uma mensagem de usuário para eu poder ajudar."
             result.error = "nenhuma mensagem de usuário no pedido"
-            result.latency_ms = clock.ms()
-            return result
-        try:
-            await self._run(msgs, question, result)
-        except Exception as exc:  # nunca derruba o pedido: vira uma resposta de erro com trace
-            result.route = "error"
-            result.error = f"{exc.__class__.__name__}: {exc}"[:500]
-            result.answer = (
-                "Desculpe, não consegui processar seu pedido agora. Tente novamente em instantes."
-            )
+        else:
+            try:
+                await self._run(msgs, question, result, recorder, wait_s, callback_url)
+            except Exception as exc:  # nunca derruba o pedido: vira uma resposta de erro com trace
+                result.route = "error"
+                result.status = "failed"
+                result.error = f"{exc.__class__.__name__}: {exc}"[:500]
+                result.answer = SORRY
+        recorder.close(
+            "error" if result.route == "error" else "ok", rota=result.route, execucao=result.status
+        )
+        result.spans = recorder.to_list()
         result.latency_ms = clock.ms()
         return result
 
-    async def _run(self, msgs: list[Message], question: str, result: RouterResult) -> None:
-        hits = await self._rag(msgs, result)
-        agents = await self._discover(result)
-        decision = await self._decide(msgs, agents, hits, result)
+    async def _run(
+        self,
+        msgs: list[Message],
+        question: str,
+        result: RouterResult,
+        recorder: SpanRecorder,
+        wait_s: float | None,
+        callback_url: str | None,
+    ) -> None:
+        hits, (connectors, agents) = await asyncio.gather(
+            self._rag(msgs, result, recorder), self._discover(result, recorder)
+        )
+        caps = capabilities(connectors, agents)
+        decision = await self._decide(msgs, caps, hits, result, recorder)
         if decision is None:
             return
-
         result.reason = decision.reason
+        result.decided_by = decision.decided_by
+        result.confidence = decision.confidence
+        result.tasks = [t.to_dict() for t in decision.tasks]
         if decision.action == "answer":
             result.route = "direct"
             result.answer = decision.answer or ""
@@ -142,163 +224,419 @@ class RouterEngine:
         elif decision.action == "clarify":
             result.route = "clarify"
             result.answer = decision.question or ""
-            result.agent, result.tool = decision.agent, decision.tool
-            result.arguments = decision.arguments or None
+            if decision.task:
+                result.agent, result.tool = decision.task.owner, decision.task.name
+                result.arguments = decision.task.arguments or None
+        elif decision.action == "tool":
+            await self._call_tool(decision, question, result, recorder)
         else:
-            await self._delegate(decision, question, result)
+            await self._delegate(
+                decision, msgs, question, agents, result, recorder, wait_s, callback_url
+            )
 
-    # -- etapas ---------------------------------------------------------------
+    # -------------------------------------------------------------------- etapas
 
-    async def _rag(self, msgs: list[Message], result: RouterResult) -> list[Hit]:
+    async def _rag(
+        self, msgs: list[Message], result: RouterResult, recorder: SpanRecorder
+    ) -> list[Hit]:
         spec = self.profile.spec
         if self.retriever is None or not spec.knowledge_bases:
             return []
-        clock = _Clock()
-        try:
-            hits = await self.retriever.search(
-                search_query(msgs), spec.knowledge_bases, top_k=spec.top_k, min_score=spec.min_score
-            )
-        except Exception as exc:  # RAG fora do ar não derruba o atendimento
-            result.warnings.append(f"busca na base de conhecimento falhou: {exc}")
-            result.steps.append(TraceStep("rag", clock.ms(), {"erro": str(exc)[:300]}))
-            return []
-        result.steps.append(
-            TraceStep(
-                "rag",
-                clock.ms(),
-                {
-                    "bases": spec.knowledge_bases,
-                    "trechos": len(hits),
-                    "scores": [round(h.score, 3) for h in hits],
-                },
-            )
-        )
-        return hits
-
-    async def _discover(self, result: RouterResult):
-        if not self.profile.agents:
-            return []
-        clock = _Clock()
-        infos = await self.catalog.discover(self.profile.agents)
-        online = [a for a in infos if a.status == "online" and a.tools]
-        result.steps.append(
-            TraceStep(
-                "descoberta_mcp",
-                clock.ms(),
-                {
-                    "online": {a.name: [t.name for t in a.tools] for a in online},
-                    "offline": {a.name: a.error for a in infos if a.status != "online"},
-                },
-            )
-        )
-        for info in infos:
-            if info.status != "online":
-                result.warnings.append(f"agente {info.name} indisponível: {info.error}")
-        return online
-
-    async def _decide(self, msgs, agents, hits, result: RouterResult) -> Decision | None:
-        spec = self.profile.spec
-        clock = _Clock()
-        try:
-            decision, calls = await self.decider.decide(
-                profile=spec, messages=msgs, agents=agents, hits=hits
-            )
-        except (LLMError, DecisionError) as exc:
-            if isinstance(exc, LLMError):
-                result.warnings.append(f"modelo indisponível, usei o decisor offline: {exc}")
-            else:
-                result.warnings.append(
-                    f"resposta do modelo fora do formato mesmo após reparo, usei o decisor offline: {exc}"
+        with recorder.span("rag", "rag", bases=spec.knowledge_bases) as span:
+            try:
+                hits = await self.retriever.search(
+                    search_query(msgs),
+                    spec.knowledge_bases,
+                    top_k=spec.top_k,
+                    min_score=spec.min_score,
                 )
-            decision, calls = await self._fallback_decider.decide(
-                profile=spec, messages=msgs, agents=agents, hits=hits
+            except Exception as exc:  # RAG fora do ar não derruba o atendimento
+                result.warnings.append(f"busca na base de conhecimento falhou: {exc}")
+                span.finish("warn", erro=str(exc)[:300])
+                return []
+            span.attributes.update(trechos=len(hits), scores=[round(h.score, 3) for h in hits])
+            return hits
+
+    async def _discover(
+        self, result: RouterResult, recorder: SpanRecorder
+    ) -> tuple[list[ConnectorInfo], list[AgentInfo]]:
+        profile = self.profile
+        if not profile.connectors and not (profile.agents and self.agents is not None):
+            return [], []
+        with recorder.span("descoberta", "descoberta") as span:
+            connectors, agents = await asyncio.gather(
+                self.connectors.discover(profile.connectors),
+                self.agents.discover(profile.agents)
+                if self.agents is not None
+                else asyncio.sleep(0, result=[]),
             )
-            result.steps.append(TraceStep("fallback_offline", 0.0, {"erro": str(exc)[:300]}))
-        except Exception as exc:
-            result.error = f"falha ao decidir a rota: {exc}"
-            result.answer = (
-                "Desculpe, não consegui processar seu pedido agora. Tente novamente em instantes."
+            span.attributes.update(
+                conectores={
+                    c.name: [t.name for t in c.tools] for c in connectors if c.status == "online"
+                },
+                agentes={
+                    a.name: [f"{s.id} ({s.contract})" for s in a.skills]
+                    for a in agents
+                    if a.status == "online"
+                },
+                offline={
+                    **{c.name: c.error for c in connectors if c.status != "online"},
+                    **{a.name: a.error for a in agents if a.status != "online"},
+                },
             )
-            result.steps.append(TraceStep("decisao", clock.ms(), {"erro": str(exc)[:300]}))
-            return None
-        usage = Usage()
-        for call in calls:
-            usage.add(call.usage)
-        result.usage.add(usage)
-        detail = {"acao": decision.action, "motivo": decision.reason, "chamadas_llm": len(calls)}
-        if decision.action == "delegate":
-            detail.update(
-                {"agente": decision.agent, "tool": decision.tool, "argumentos": decision.arguments}
+        for c in connectors:
+            if c.status != "online":
+                result.warnings.append(f"conector {c.name} indisponível: {c.error}")
+        for a in agents:
+            if a.status != "online":
+                result.warnings.append(f"agente {a.name} indisponível: {a.error}")
+            for skill in a.skills:
+                if skill.problems:
+                    result.warnings.append(
+                        f"skill {a.name}/{skill.id} ignorada: contrato inválido ({'; '.join(skill.problems)})"
+                    )
+        return connectors, agents
+
+    async def _decide(
+        self,
+        msgs: list[Message],
+        caps: list[Capability],
+        hits: list[Hit],
+        result: RouterResult,
+        recorder: SpanRecorder,
+    ) -> Decision | None:
+        spec = self.profile.spec
+        with recorder.span("decisao", "decisao", capacidades=len(caps)) as span:
+            ctx = DecisionContext(recorder, parent=span)
+            try:
+                if isinstance(self.decider, JevDecider):
+                    decision, calls = await self.decider.decide(
+                        profile=spec, messages=msgs, caps=caps, hits=hits, ctx=ctx
+                    )
+                else:
+                    decision, calls = await self.decider.decide(
+                        profile=spec, messages=msgs, caps=caps, hits=hits
+                    )
+            except (LLMError, DecisionError, DecisionModelError) as exc:
+                if isinstance(exc, (LLMError, DecisionModelError)):
+                    result.warnings.append(f"modelo indisponível, usei o decisor offline: {exc}")
+                else:
+                    result.warnings.append(
+                        f"resposta do modelo fora do formato mesmo após reparo, usei o decisor offline: {exc}"
+                    )
+                with recorder.span("decisao", "fallback_offline", parent=span, erro=str(exc)[:300]):
+                    decision, calls = await self._fallback_decider.decide(
+                        profile=spec, messages=msgs, caps=caps, hits=hits
+                    )
+            except Exception as exc:
+                result.error = f"falha ao decidir a rota: {exc}"
+                result.answer = SORRY
+                result.status = "failed"
+                span.finish("error", erro=str(exc)[:300])
+                return None
+            result.warnings.extend(ctx.warnings)
+            usage = Usage()
+            for call in calls:
+                usage.add(call.usage)
+            result.usage.add(usage)
+            span.attributes.update(
+                acao=decision.action,
+                decidido_por=decision.decided_by,
+                confianca=round(decision.confidence, 4)
+                if decision.confidence is not None
+                else None,
+                motivo=decision.reason,
+                tarefas=[t.to_dict() for t in decision.tasks],
+                chamadas_llm=len(calls),
             )
-        if calls:
-            detail["tokens"] = usage.to_dict()
-        result.steps.append(TraceStep("decisao", clock.ms(), detail))
+            if calls:
+                span.attributes["tokens"] = usage.to_dict()
         return decision
 
-    async def _delegate(self, decision: Decision, question: str, result: RouterResult) -> None:
+    async def _call_tool(
+        self, decision: Decision, question: str, result: RouterResult, recorder: SpanRecorder
+    ) -> None:
         spec = self.profile.spec
-        agent_spec = self.profile.agent(decision.agent or "")
-        result.route = "delegated"
-        result.agent, result.tool, result.arguments = (
-            decision.agent,
-            decision.tool,
-            decision.arguments,
-        )
-        clock = _Clock()
-        if agent_spec is None:  # só acontece com decisores customizados
-            outcome = ToolCallResult(
-                f"agente {decision.agent} não pertence a este perfil", True, None, 0.0
-            )
-        else:
-            try:
-                outcome = await self.catalog.call(
-                    agent_spec, decision.tool or "", decision.arguments
+        task = decision.task
+        assert task is not None
+        result.route = "tool"
+        result.agent, result.tool, result.arguments = task.owner, task.name, task.arguments
+        connector = self.profile.connector(task.owner)
+        with recorder.span(
+            "tool_mcp",
+            f"tool: {task.key}",
+            conector=task.owner,
+            tool=task.name,
+            argumentos=task.arguments,
+        ) as span:
+            if connector is None:  # só acontece com decisores customizados
+                outcome = ToolCallResult(
+                    f"conector {task.owner} não pertence a este perfil", True, None, 0.0
                 )
-            except AgentError as exc:
-                outcome = ToolCallResult(str(exc), True, None, clock.ms())
-        result.steps.append(
-            TraceStep(
-                "delegacao_mcp",
-                clock.ms(),
-                {
-                    "agente": decision.agent,
-                    "tool": decision.tool,
-                    "erro": outcome.is_error,
-                    "resultado": truncate(outcome.text, 800),
-                },
-            )
-        )
+            else:
+                try:
+                    outcome = await self.connectors.call(connector, task.name, task.arguments)
+                except ConnectorError as exc:
+                    outcome = ToolCallResult(str(exc), True, None, 0.0)
+            span.attributes.update(erro=outcome.is_error, resultado=truncate(outcome.text, 800))
+            if outcome.is_error:
+                span.status = "warn"
         if outcome.is_error:
-            result.warnings.append(f"o agente {decision.agent} retornou erro")
+            result.warnings.append(f"a tool {task.key} retornou erro")
         if not spec.synthesize:
             result.answer = (
-                outcome.text if not outcome.is_error else f"O agente retornou erro: {outcome.text}"
+                outcome.text
+                if not outcome.is_error
+                else f"A ferramenta retornou erro: {outcome.text}"
             )
             return
-        clock = _Clock()
-        try:
-            answer, call = await self.composer.compose(
-                profile=spec,
-                question=question,
-                decision=decision,
-                result_text=outcome.text,
-                is_error=outcome.is_error,
-            )
-        except Exception as exc:  # síntese é enfeite: sem ela, devolve o resultado do agente
-            result.warnings.append(
-                f"síntese pelo modelo falhou, devolvi o resultado do agente: {exc}"
-            )
-            answer, call = await self._fallback_composer.compose(
-                profile=spec,
-                question=question,
-                decision=decision,
-                result_text=outcome.text,
-                is_error=outcome.is_error,
-            )
+        with recorder.span("sintese", "sintese") as span:
+            try:
+                answer, call = await self.composer.compose(
+                    profile=spec,
+                    question=question,
+                    capability=task.key,
+                    arguments=task.arguments,
+                    result_text=outcome.text,
+                    is_error=outcome.is_error,
+                )
+            except Exception as exc:  # síntese é enfeite: sem ela, devolve o resultado
+                result.warnings.append(
+                    f"síntese pelo modelo falhou, devolvi o resultado da tool: {exc}"
+                )
+                answer, call = await self._fallback_composer.compose(
+                    profile=spec,
+                    question=question,
+                    capability=task.key,
+                    arguments=task.arguments,
+                    result_text=outcome.text,
+                    is_error=outcome.is_error,
+                )
+            span.attributes["llm"] = call is not None
         if call is not None:
             result.usage.add(call.usage)
-        result.steps.append(TraceStep("sintese", clock.ms(), {"llm": call is not None}))
         result.answer = answer
+
+    # ---------------------------------------------------------------- delegação
+
+    async def _delegate(
+        self,
+        decision: Decision,
+        msgs: list[Message],
+        question: str,
+        agents: list[AgentInfo],
+        result: RouterResult,
+        recorder: SpanRecorder,
+        wait_s: float | None,
+        callback_url: str | None,
+    ) -> None:
+        spec = self.profile.spec
+        result.route = "delegated"
+        first = decision.task
+        assert first is not None
+        result.agent, result.tool, result.arguments = first.owner, first.name, first.arguments
+        if self.contracts is None:
+            result.status = "failed"
+            result.error = "delegação a agentes indisponível (sem gerenciador de contratos)"
+            result.answer = SORRY
+            return
+        by_name = {a.name: a for a in agents}
+        names = ", ".join(
+            f"{t.owner} ({(by_name[t.owner].skill(t.name).name if by_name.get(t.owner) and by_name[t.owner].skill(t.name) else t.name)})"
+            for t in decision.tasks
+        )
+        interim = (
+            f"Encaminhei seu pedido para {names}. Assim que houver resposta, eu consolido o "
+            "resultado para você."
+        )
+        context = [
+            {"role": m.role, "content": truncate(m.content, 2000)}
+            for m in msgs
+            if m.role in ("user", "assistant")
+        ][-CONTEXT_LIMIT:]
+        run = RunRecord(
+            id=result.trace_id,
+            profile=spec.name,
+            question=question,
+            status=RUN_PENDING,
+            answer=interim,
+            context=context,
+            callback_url=callback_url,
+            extra={
+                "route": "delegated",
+                "model": result.model,
+                "reason": result.reason,
+                "decided_by": result.decided_by,
+                "confidence": result.confidence,
+                "agent": result.agent,
+                "tool": result.tool,
+                "arguments": result.arguments,
+                "tasks": result.tasks,
+            },
+        )
+        await self.contracts.begin_run(run)
+        with recorder.span("delegacao", "delegacao", tarefas=len(decision.tasks)) as span:
+
+            async def open_one(task) -> ContractRecord | str:
+                agent_spec = self.profile.agent(task.owner)
+                info = by_name.get(task.owner)
+                skill = info.skill(task.name) if info else None
+                if agent_spec is None or info is None or skill is None:
+                    return f"{task.key}: agente ou skill fora do perfil"
+                try:
+                    return await self.contracts.open(
+                        OpenRequest(
+                            run_id=result.trace_id,
+                            profile=spec.name,
+                            spec=agent_spec,
+                            agent=info,
+                            skill=skill,
+                            arguments=task.arguments,
+                            instruction=task.instruction or question,
+                            deadline_s=spec.deadline_s,
+                            parent_span_id=span.id,
+                        )
+                    )
+                except ContractError as exc:
+                    return f"{task.key}: {exc}"
+
+            opened = await asyncio.gather(*(open_one(t) for t in decision.tasks))
+            contracts = [c for c in opened if isinstance(c, ContractRecord)]
+            problems = [p for p in opened if isinstance(p, str)]
+            span.attributes["contratos"] = [c.summary() for c in contracts]
+            if problems:
+                span.status = "warn"
+                span.attributes["problemas"] = problems
+                result.warnings.extend(problems)
+        if not contracts:
+            message = "Não consegui encaminhar o pedido aos agentes: " + "; ".join(problems)
+            await self.contracts.store.update_run(
+                result.trace_id,
+                status=RUN_FAILED,
+                answer=message,
+                error=message,
+                finished_at=utcnow(),
+            )
+            result.status = "failed"
+            result.answer = message
+            result.error = message
+            return
+        await self._await_run(result, recorder, wait_s, interim)
+
+    async def _await_run(
+        self, result: RouterResult, recorder: SpanRecorder, wait_s: float | None, interim: str
+    ) -> None:
+        assert self.contracts is not None
+        budget = self.profile.spec.wait_s if wait_s is None else min(max(wait_s, 0.0), 120.0)
+        with recorder.span("espera", "espera", limite_s=budget) as span:
+            run = await self.contracts.wait_run(result.trace_id, budget)
+            span.attributes["status"] = run.status if run else None
+        contracts = await self.contracts.store.run_contracts(result.trace_id)
+        result.contracts = [c.summary() for c in contracts]
+        if run is not None and run.status in (RUN_COMPLETED, RUN_FAILED):
+            result.status = "completed" if run.status == RUN_COMPLETED else "failed"
+            result.answer = run.answer
+            if run.error:
+                result.warnings.append(run.error)
+        elif run is not None and run.status == RUN_NEEDS_INPUT:
+            result.status = "needs_input"
+            result.answer = run.answer
+        else:
+            result.status = "pending"
+            result.answer = run.answer if run and run.answer else interim
+
+    async def resume(
+        self,
+        run_id: str,
+        messages: str | Sequence[Message] | Sequence[dict],
+        *,
+        wait_s: float | None = None,
+    ) -> RouterResult:
+        """Leva a resposta do usuário ao(s) agente(s) de uma execução em ``needs_input``."""
+        clock = _Clock()
+        msgs = normalize_messages(messages)
+        turns = user_turns(msgs)
+        text = turns[-1] if turns else ""
+        recorder = SpanRecorder(run_id, root_name="entrada_do_usuario", roteador=self.profile.name)
+        result = RouterResult(
+            trace_id=run_id,
+            profile=self.profile.name,
+            question=text,
+            answer="",
+            route="delegated",
+            model=self.chat.label,
+        )
+        run = await self.contracts.store.get_run(run_id) if self.contracts else None
+        if run is None or self.contracts is None:
+            result.route, result.status = "error", "failed"
+            result.error = f"execução {run_id} não encontrada"
+            result.answer = "Não encontrei essa conversa com os agentes para continuar."
+        elif not text:
+            result.route, result.status = "error", "failed"
+            result.error = "nenhuma mensagem de usuário no pedido"
+            result.answer = "Envie a informação pedida pelo agente."
+        elif run.status != RUN_NEEDS_INPUT:
+            await self._await_run(result, recorder, 0.0, run.answer)
+            result.warnings.append(f"a execução está '{run.status}', não aguardando entrada")
+        else:
+            with recorder.span("entrada", "entrada", texto=truncate(text, 500)) as span:
+                updated = await self.contracts.provide_input(run_id, text)
+                span.attributes["contratos"] = [c.summary() for c in updated]
+            await self._await_run(result, recorder, wait_s, run.answer)
+        recorder.close("error" if result.route == "error" else "ok", execucao=result.status)
+        result.spans = recorder.to_list()
+        result.latency_ms = clock.ms()
+        return result
+
+    # -------------------------------------------------------------- consolidação
+
+    async def consolidate(self, run: RunRecord, contracts: list[ContractRecord]) -> Consolidation:
+        spec = self.profile.spec
+        parent = next((c.parent_span_id for c in contracts if c.parent_span_id), None)
+        span = Span(
+            id=new_span_id(),
+            trace_id=run.id,
+            parent_id=parent,
+            kind="consolidacao",
+            name="consolidacao",
+            started_at=utcnow(),
+            attributes={"contratos": {c.id: c.state for c in contracts}},
+        )
+        results = [
+            {
+                "agente": c.agent,
+                "skill": c.skill,
+                "estado": states.LABELS.get(c.state, c.state),
+                "resultado": c.output if c.output is not None else (c.output_text or None),
+                "detalhes": c.output_text if c.output is not None and c.output_text else None,
+                "erro": c.error,
+            }
+            for c in contracts
+        ]
+        answer: str | None = None
+        if spec.synthesize and not self.chat.offline:
+            try:
+                reply = await self.chat.chat(
+                    consolidation_messages(spec, run.question, run.context, results)
+                )
+                answer = reply.text.strip() or None
+                span.attributes.update(llm=True, tokens=reply.usage.to_dict())
+            except Exception as exc:
+                span.attributes.update(llm=False, erro=str(exc)[:300])
+                span.status = "warn"
+        if answer is None:
+            if (
+                len(contracts) == 1
+                and contracts[0].state == states.COMPLETED
+                and not spec.synthesize
+            ):
+                c = contracts[0]
+                answer = c.output_text or default_consolidation(run, contracts)
+            else:
+                answer = default_consolidation(run, contracts)
+            span.attributes.setdefault("llm", False)
+        span.finish("ok" if span.status == "open" else span.status)
+        return Consolidation(answer=answer, spans=[span])
 
     @staticmethod
     def _source(index: int, hit: Hit) -> SourceRef:
@@ -311,3 +649,7 @@ class RouterEngine:
             snippet=truncate(hit.content, 280),
             section=hit.section,
         )
+
+
+def contracts_summary(contracts: Sequence[ContractRecord]) -> list[dict[str, Any]]:
+    return [c.summary() for c in contracts]

@@ -1,7 +1,7 @@
 [project]
 name = "switchboard-core"
 version = "0.1.0"
-description = "Framework do Switchboard: roteamento entre responder, delegar via MCP ou esclarecer, com RAG"
+description = "Framework do Switchboard: roteamento entre responder com RAG, tools via MCP, delegação a agentes via A2A sob contrato ou esclarecer"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.11"
@@ -9,6 +9,7 @@ dependencies = [
     "anyio>=4.4",
     "cryptography>=43",
     "httpx>=0.27",
+    "jsonschema>=4.23",
     "mcp>=2.2,<3",
     "psycopg[binary]>=3.2",
     "pydantic>=2.8",

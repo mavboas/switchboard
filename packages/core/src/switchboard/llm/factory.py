@@ -7,6 +7,7 @@ from collections.abc import Callable
 import httpx
 
 from ..config import ModelSpec
+from ..errors import ConfigError
 from ..secrets import resolve_env
 from .anthropic import AnthropicChat
 from .base import ChatModel
@@ -22,6 +23,11 @@ def build_chat_model(
     resolve_secret: SecretResolver = resolve_env,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> ChatModel:
+    if spec.is_decision_model:
+        raise ConfigError(
+            f"'{spec.name}' é um modelo de decisão ({spec.provider}) e não conversa; "
+            "use-o como modelo de decisão do roteador e escolha um LLM como modelo principal"
+        )
     api_key = resolve_secret(spec.api_key)
     extra = {k: (resolve_secret(v) or "") for k, v in spec.extra_headers.items()}
     if spec.provider == "offline":

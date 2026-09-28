@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% from "_macros.html" import status_badge, delete_button, schema_table %}
+{% block title %}{{ connector.name }}{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <div class="crumbs"><a href="/connectors">Conectores MCP</a> /</div>
+    <h1>{{ connector.name }} {% if connector.enabled %}{{ status_badge(info) }}{% else %}<span class="badge">desabilitado</span>{% endif %}</h1>
+    <p>{{ connector.description or info.description or 'Sem descrição.' }}</p>
+  </div>
+  <div class="actions">
+    <a class="btn" href="/connectors/{{ connector.id }}?refresh=1">Descobrir de novo</a>
+    <a class="btn" href="/connectors/{{ connector.id }}/edit">Editar</a>
+    {{ delete_button("/connectors/" ~ connector.id ~ "/delete", confirm="Remover o conector " ~ connector.name ~ "?") }}
+  </div>
+</div>
+
+<div class="grid grid-2">
+  <div class="card">
+    <h2>Conexão</h2>
+    <dl class="kv">
+      <dt>Endpoint</dt><dd class="mono">{{ connector.url }}</dd>
+      <dt>Transporte</dt><dd>{{ connector.transport }}</dd>
+      <dt>Servidor</dt><dd>{{ info.server_name or '—' }}</dd>
+      <dt>Latência</dt><dd>{{ '%.0f'|format(info.latency_ms) }} ms (handshake + tools/list)</dd>
+      <dt>Token</dt><dd>{{ connector.auth_token|secret }}</dd>
+      <dt>Allowlist</dt><dd>{{ connector.allowed_tools or 'todas as tools' }}</dd>
+    </dl>
+    {% if info.error %}<div class="flash error" style="margin-top:14px">{{ info.error }}</div>{% endif %}
+  </div>
+
+  <div class="card">
+    <h2>Testar uma tool</h2>
+    {% if info.tools %}
+    <form method="post" action="/connectors/{{ connector.id }}/call" class="stack">
+      <select name="tool">
+        {% for t in info.tools %}<option value="{{ t.name }}" {% if call and call.tool == t.name %}selected{% endif %}>{{ t.name }}</option>{% endfor %}
+      </select>
+      <textarea name="arguments" class="code" rows="4" placeholder='{"campo": "valor"}'>{{ call.arguments if call else '{}' }}</textarea>
+      <button class="btn primary" type="submit">Chamar via MCP</button>
+    </form>
+    {% if call %}
+      <div style="margin-top:14px">
+        <div class="small muted">{{ call.tool }} · {{ '%.0f'|format(call.ms) }} ms {% if call.is_error %}<span class="badge danger">erro</span>{% else %}<span class="badge ok">ok</span>{% endif %}</div>
+        <pre class="block" style="margin-top:6px">{{ call.result }}</pre>
+      </div>
+    {% endif %}
+    {% else %}
+    <p class="muted">Nenhuma tool disponível{% if info.status != 'online' %} — o conector está offline{% endif %}.</p>
+    {% endif %}
+  </div>
+</div>
+
+<div class="card">
+  <h2>Tools descobertas <span class="muted">({{ info.tools|length }})</span></h2>
+  {% for t in info.tools %}
+    <details {% if loop.first %}open{% endif %} style="padding:10px 0;border-bottom:1px solid var(--border)">
+      <summary><strong class="mono">{{ t.name }}</strong> <span class="muted">— {{ t.description }}</span></summary>
+      <div style="margin-top:8px">{{ schema_table(t.input_schema, "sem argumentos") }}</div>
+    </details>
+  {% else %}
+    <p class="muted">Nada descoberto.</p>
+  {% endfor %}
+</div>
+{% endblock %}

@@ -1,11 +1,11 @@
-"""Segredos (chaves de API de modelos, tokens de agentes MCP).
+"""Segredos (chaves de API de modelos, tokens de conectores MCP e agentes A2A).
 
 Um campo de segredo aceita três formas:
 
 * ``env:NOME`` — referência a uma variável de ambiente, lida em tempo de
   execução no processo que usa o segredo (recomendado: o valor nunca vai para
   o banco). No console/router só valem nomes liberados em
-  ``SWITCHBOARD_ALLOWED_ENV_SECRETS`` (padrão ``*_API_KEY,MCP_*``) — assim
+  ``SWITCHBOARD_ALLOWED_ENV_SECRETS`` (padrão ``*_API_KEY,MCP_*,A2A_*``) — assim
   quem edita a configuração não consegue ler outras variáveis do processo,
   como a própria ``SWITCHBOARD_SECRET_KEY``;
 * ``enc:<token>`` — valor cifrado com Fernet a partir da chave mestra
@@ -32,7 +32,7 @@ from .errors import SecretError
 ENV_PREFIX = "env:"
 ENC_PREFIX = "enc:"
 MASK = "••••••"  # o que a UI mostra no lugar de um valor cifrado; ao salvar, mantém o atual
-DEFAULT_ALLOWED_ENV = ("*_API_KEY", "MCP_*")
+DEFAULT_ALLOWED_ENV = ("*_API_KEY", "MCP_*", "A2A_*")
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _KDF_SALT = b"switchboard/secretbox/v1"
 _KDF_ROUNDS = 200_000

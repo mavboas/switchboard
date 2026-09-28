@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from ..errors import ConfigError
+from .migrate import upgrade
 from .orm import Base
 
 log = logging.getLogger(__name__)
@@ -97,7 +98,9 @@ class Database:
                 raise ConfigError("vector_backend=pgvector exige PostgreSQL")
             self.pgvector = False
             self.engine.dialect._switchboard_pgvector = False  # type: ignore[attr-defined]
-            Base.metadata.create_all(self.engine)
+            with self.engine.begin() as conn:
+                Base.metadata.create_all(conn)
+                upgrade(conn)
 
     def _init_postgres(self) -> None:
         with self.engine.begin() as conn:
@@ -126,6 +129,7 @@ class Database:
             self.pgvector = (existing == "vector") if existing else has_extension
             self.engine.dialect._switchboard_pgvector = self.pgvector  # type: ignore[attr-defined]
             Base.metadata.create_all(conn)
+            upgrade(conn)
 
     @contextmanager
     def session(self) -> Iterator[Session]:

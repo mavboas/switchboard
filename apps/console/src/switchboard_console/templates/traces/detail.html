@@ -1,14 +1,25 @@
 {% extends "base.html" %}
-{% from "_macros.html" import route_badge %}
+{% from "_macros.html" import route_badge, run_badge, state_badge, kind_badge %}
 {% block title %}Execução {{ trace.trace_id[:8] }}{% endblock %}
+{% block head %}{% if running %}<meta http-equiv="refresh" content="3">{% endif %}{% endblock %}
 {% block content %}
 <div class="page-head">
   <div>
     <div class="crumbs"><a href="/traces">Execuções</a> /</div>
-    <h1>Execução <span class="mono">{{ trace.trace_id[:12] }}</span> {{ route_badge(trace.route) }}</h1>
-    <p>{{ trace.created|datetime }} · roteador <strong>{{ trace.profile }}</strong> · {{ '%.0f'|format(trace.latency_ms) }} ms</p>
+    <h1>Execução <span class="mono">{{ trace.trace_id[:12] }}</span> {{ route_badge(trace.route) }} {{ run_badge(trace.status) }}</h1>
+    <p>{{ trace.created_at|datetime }} · roteador <strong>{{ trace.profile }}</strong> · {{ trace.latency_ms|ms }} até a primeira resposta
+      {% if trace.finished_at %}· encerrada em {{ trace.finished_at|datetime }}{% endif %}
+      {% if running %}<span class="badge info live"><span class="dot"></span>atualizando a cada 3 s</span>{% endif %}</p>
   </div>
-  <div class="actions"><a class="btn" href="/playground?profile={{ trace.profile }}">Abrir no playground</a></div>
+  <div class="actions">
+    {% if running and trace.contracts %}
+    <form class="inline" method="post" action="/traces/{{ trace.trace_id }}/cancel" onsubmit="return confirm('Cancelar os contratos em aberto desta execução?')">
+      <button class="btn danger" type="submit">Cancelar contratos</button>
+    </form>
+    {% endif %}
+    <a class="btn" href="/api/traces/{{ trace.trace_id }}" target="_blank" rel="noopener">JSON</a>
+    <a class="btn" href="/playground?profile={{ trace.profile }}">Abrir no playground</a>
+  </div>
 </div>
 
 {% if trace.error %}<div class="flash error">{{ trace.error }}</div>{% endif %}
@@ -18,23 +29,86 @@
   <div class="card">
     <h2>Pedido</h2>
     <pre class="block">{{ trace.question }}</pre>
-    <h2 style="margin-top:16px">Resposta</h2>
+    <h2 style="margin-top:16px">Resposta {% if trace.status in ('pending', 'consolidating') %}<span class="muted">(provisória)</span>{% elif trace.status == 'needs_input' %}<span class="muted">(pergunta do agente)</span>{% endif %}</h2>
     <pre class="block">{{ trace.answer }}</pre>
   </div>
   <div class="card">
     <h2>Decisão</h2>
     <dl class="kv">
       <dt>Rota</dt><dd>{{ route_badge(trace.route) }}</dd>
+      <dt>Decidiu</dt><dd>{{ trace.decided_by or '—' }}{% if trace.confidence is not none %} · confiança {{ '%.0f'|format(trace.confidence * 100) }}%{% endif %}</dd>
       <dt>Motivo</dt><dd>{{ trace.reason or '—' }}</dd>
-      <dt>Modelo</dt><dd class="mono">{{ trace.model }}</dd>
-      <dt>Agente</dt><dd>{% if trace.agent %}<span class="mono">{{ trace.agent }} / {{ trace.tool }}</span>{% else %}—{% endif %}</dd>
-      <dt>Tokens</dt><dd>{{ trace.usage.input_tokens }} entrada · {{ trace.usage.output_tokens }} saída</dd>
+      <dt>LLM</dt><dd class="mono">{{ trace.model }}</dd>
+      <dt>Tokens</dt><dd>{{ trace.usage.input_tokens or 0 }} entrada · {{ trace.usage.output_tokens or 0 }} saída</dd>
     </dl>
-    {% if trace.arguments %}
-    <h2 style="margin-top:16px">Argumentos da tool</h2>
+    {% if trace.tasks %}
+    <h2 style="margin-top:16px">{{ 'Tarefas' if trace.tasks|length > 1 else 'Tarefa' }}</h2>
+    {% for task in trace.tasks %}
+      <div class="small"><span class="badge">{{ 'tool MCP' if task.kind == 'tool' else 'skill A2A' }}</span> <span class="mono">{{ task.owner }}/{{ task.name }}</span></div>
+      {% if task.arguments %}<pre class="block" style="margin:6px 0 10px">{{ task.arguments|tojson(indent=2) }}</pre>{% endif %}
+    {% endfor %}
+    {% elif trace.arguments %}
+    <h2 style="margin-top:16px">Argumentos</h2>
     <pre class="block">{{ trace.arguments|tojson(indent=2) }}</pre>
     {% endif %}
   </div>
+</div>
+
+{% if trace.contracts %}
+<div class="card">
+  <h2>Contratos com agentes <span class="muted">({{ trace.contracts|length }} spawn{{ 's' if trace.contracts|length > 1 }})</span></h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Agente / skill</th><th>Estado</th><th>Termos</th><th>Acompanhamento</th><th>Prazo</th><th class="right">Duração</th></tr></thead>
+    <tbody>
+    {% for c in trace.contracts %}
+      <tr>
+        <td><a href="/contracts/{{ c.id }}"><strong class="mono">{{ c.agent }}/{{ c.skill }}</strong></a><span class="sub mono">{{ c.id }}</span>
+          {% if c.error %}<span class="sub" style="color:var(--danger)">{{ c.error|truncate(140) }}</span>{% elif c.last_message %}<span class="sub">{{ c.last_message|truncate(140) }}</span>{% endif %}</td>
+        <td>{{ state_badge(c.state) }}</td>
+        <td>{{ kind_badge(c.kind) }}</td>
+        <td class="small">{{ 'push + polling' if c.reply_mode == 'push' else 'polling' }}<span class="sub">{{ c.checks }} consulta(s)</span></td>
+        <td class="small nowrap">{{ c.deadline_at|datetime }}</td>
+        <td class="right nowrap">{{ c.duration_ms|ms if c.duration_ms is not none else 'em aberto' }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% for c in trace.contracts %}
+  <details class="events" {% if c.state in open_states %}open{% endif %}>
+    <summary>Eventos de <span class="mono">{{ c.agent }}/{{ c.skill }}</span> <span class="muted">({{ c.events|length }})</span></summary>
+    <ul class="timeline">
+      {% for e in c.events %}
+      <li><span class="step-name">{{ e.kind }}</span> {% if e.state %}{{ state_badge(e.state) }}{% endif %}
+        <span class="step-ms">{{ e.at|datetime }} · {{ e.source }}</span>
+        {% if e.detail %}<pre class="block">{{ e.detail|tojson(indent=2) }}</pre>{% endif %}</li>
+      {% endfor %}
+    </ul>
+  </details>
+  {% endfor %}
+</div>
+{% endif %}
+
+<div class="card">
+  <div class="card-head"><h2>Spans</h2><span class="muted small">{{ spans.rows|length }} span(s) · janela de {{ spans.total_ms|ms }} · clique para ver os atributos</span></div>
+  {% if spans.rows %}
+  <div class="wf">
+    {% for s in spans.rows %}
+    <details class="wf-row status-{{ s.status }} kind-{{ s.kind }}">
+      <summary>
+        <span class="wf-name" style="padding-left: {{ s.depth * 16 }}px" title="{{ s.name }}">{% if not s.name.startswith(s.kind) %}<span class="wf-kind">{{ s.kind }}</span>{% endif %}{{ s.name }}</span>
+        <span class="wf-track"><span class="wf-bar{{ ' open' if s.open }}" style="left: {{ s.left }}%; width: {{ s.width }}%"></span></span>
+        <span class="wf-ms">{{ s.elapsed_ms|ms }}{% if s.open %} …{% endif %}</span>
+      </summary>
+      <div class="wf-detail">
+        <div class="small muted">início +{{ s.offset_ms|ms }} · status {{ s.status }} · <span class="mono">{{ s.id }}</span>{% if s.parent_id %} ← <span class="mono">{{ s.parent_id }}</span>{% endif %}</div>
+        {% if s.attributes %}<pre class="block">{{ s.attributes|tojson(indent=2) }}</pre>{% endif %}
+      </div>
+    </details>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="muted">Sem spans registrados.</p>
+  {% endif %}
 </div>
 
 {% if trace.sources %}
@@ -48,14 +122,4 @@
   {% endfor %}
 </div>
 {% endif %}
-
-<div class="card">
-  <h2>Etapas</h2>
-  <ul class="timeline">
-    {% for step in trace.steps %}
-    <li><span class="step-name">{{ step.name }}</span><span class="step-ms">{{ '%.1f'|format(step.duration_ms) }} ms</span>
-      <pre class="block">{{ step.detail|tojson(indent=2) }}</pre></li>
-    {% endfor %}
-  </ul>
-</div>
 {% endblock %}

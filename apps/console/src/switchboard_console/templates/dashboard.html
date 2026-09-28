@@ -1,11 +1,11 @@
 {% extends "base.html" %}
-{% from "_macros.html" import route_badge, status_badge, empty %}
+{% from "_macros.html" import route_badge, run_badge, status_badge, empty %}
 {% block title %}Painel{% endblock %}
 {% block content %}
 <div class="page-head">
   <div>
     <h1>Painel</h1>
-    <p>O Switchboard atende cada pedido, responde o que sabe com as bases de conhecimento e transfere o resto para o agente certo, descoberto via MCP.</p>
+    <p>O Switchboard atende cada pedido: responde o que sabe com as bases de conhecimento, chama tools MCP na hora e delega tarefas a agentes A2A sob contrato, consolidando as respostas quando eles terminam.</p>
   </div>
   <div class="actions">
     <a class="btn" href="/playground">Abrir playground</a>
@@ -14,13 +14,34 @@
 </div>
 
 <div class="stats">
-  <div class="stat"><div class="label">Roteadores</div><div class="value">{{ data.counts.profiles }}</div><div class="hint">perfis configurados</div></div>
-  <div class="stat"><div class="label">Modelos</div><div class="value">{{ data.counts.models }}</div><div class="hint">conexões de LLM</div></div>
-  <div class="stat"><div class="label">Agentes MCP</div><div class="value">{{ agents|selectattr('status', 'equalto', 'online')|list|length }}/{{ data.counts.agents }}</div><div class="hint">online agora</div></div>
+  <div class="stat"><div class="label">Roteadores</div><div class="value">{{ data.counts.profiles }}</div><div class="hint">{{ data.counts.models }} modelo(s) cadastrado(s)</div></div>
+  <div class="stat"><div class="label">Conectores MCP</div><div class="value">{{ connectors|selectattr('status', 'equalto', 'online')|list|length }}/{{ data.counts.connectors }}</div><div class="hint">online agora</div></div>
+  <div class="stat"><div class="label">Agentes A2A</div><div class="value">{{ agents|selectattr('status', 'equalto', 'online')|list|length }}/{{ data.counts.agents }}</div><div class="hint">online agora</div></div>
+  <div class="stat"><div class="label">Contratos</div><div class="value">{{ data.counts.contracts }}</div><div class="hint">{% if open_contracts %}<a href="/contracts?state=ativo">{{ open_contracts }} em aberto</a>{% else %}nenhum em aberto{% endif %}</div></div>
   <div class="stat"><div class="label">Conhecimento</div><div class="value">{{ data.counts.documents }}</div><div class="hint">{{ data.counts.chunks }} trechos em {{ data.counts.kbs }} base(s)</div></div>
   <div class="stat"><div class="label">Execuções</div><div class="value">{{ data.counts.traces }}</div>
     <div class="hint">{% for r, n in data.routes.items() %}{{ route_labels.get(r, r)|lower }}: {{ n }}{% if not loop.last %} · {% endif %}{% else %}nenhuma ainda{% endfor %}</div></div>
 </div>
+
+{% if data.open_runs %}
+<div class="card">
+  <div class="card-head"><h2>Em andamento</h2><a class="btn small" href="/traces?status=pending">ver todas</a></div>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Quando</th><th>Roteador</th><th>Situação</th><th>Pedido</th><th>Agentes</th></tr></thead>
+    <tbody>
+    {% for t in data.open_runs %}
+      <tr>
+        <td class="nowrap"><a href="/traces/{{ t.trace_id }}">{{ t.created|datetime }}</a></td>
+        <td>{{ t.profile }}</td>
+        <td>{{ run_badge(t.status) }}</td>
+        <td>{{ t.question|truncate(90) }}{% if t.status == 'needs_input' %}<span class="sub">{{ t.answer|truncate(90) }}</span>{% endif %}</td>
+        <td><div class="pill-list">{% for task in t.tasks %}<span class="pill mono">{{ task.owner }}/{{ task.name }}</span>{% endfor %}</div></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+</div>
+{% endif %}
 
 <div class="grid grid-2">
   <div class="card">
@@ -42,9 +63,14 @@
       <dd>{{ db_info.dialect }} <span class="muted small mono">{{ db_info.url }}</span></dd>
       <dt>Vetores</dt>
       <dd>{% if db_info.vector == 'pgvector' %}<span class="badge ok">pgvector</span> busca feita pelo banco{% else %}<span class="badge warn">json</span> similaridade calculada na aplicação{% endif %}</dd>
+      <dt>Conectores</dt>
+      <dd>
+        {% for c in connectors %}<div>{{ status_badge(c) }} <a href="/connectors">{{ c.name }}</a> <span class="muted small">{{ c.tools|length }} tool(s)</span></div>
+        {% else %}<span class="muted">nenhum conector habilitado</span>{% endfor %}
+      </dd>
       <dt>Agentes</dt>
       <dd>
-        {% for a in agents %}<div>{{ status_badge(a) }} <a href="/agents">{{ a.name }}</a> <span class="muted small">{{ a.tools|length }} tool(s)</span></div>
+        {% for a in agents %}<div>{{ status_badge(a) }} <a href="/agents">{{ a.name }}</a> <span class="muted small">{{ a.skills|length }} skill(s){% if a.push %} · push{% endif %}</span></div>
         {% else %}<span class="muted">nenhum agente habilitado</span>{% endfor %}
       </dd>
     </dl>
@@ -55,16 +81,17 @@
   <div class="card-head"><h2>Execuções recentes</h2><a class="btn small" href="/traces">ver todas</a></div>
   {% if data.recent %}
   <div class="table-wrap"><table>
-    <thead><tr><th>Quando</th><th>Roteador</th><th>Rota</th><th>Pedido</th><th>Agente / tool</th><th class="right">Latência</th></tr></thead>
+    <thead><tr><th>Quando</th><th>Roteador</th><th>Rota</th><th>Situação</th><th>Pedido</th><th>Acionou</th><th class="right">Latência</th></tr></thead>
     <tbody>
     {% for t in data.recent %}
       <tr>
         <td class="nowrap"><a href="/traces/{{ t.trace_id }}">{{ t.created|datetime }}</a></td>
         <td>{{ t.profile }}</td>
         <td>{{ route_badge(t.route) }}</td>
+        <td>{{ run_badge(t.status) }}</td>
         <td>{{ t.question|truncate(90) }}</td>
-        <td>{% if t.agent %}<span class="mono small">{{ t.agent }}/{{ t.tool }}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
-        <td class="right nowrap">{{ '%.0f'|format(t.latency_ms) }} ms</td>
+        <td>{% if t.tasks %}<div class="pill-list">{% for task in t.tasks %}<span class="pill mono">{{ task.owner }}/{{ task.name }}</span>{% endfor %}</div>{% elif t.agent %}<span class="mono small">{{ t.agent }}/{{ t.tool }}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
+        <td class="right nowrap">{{ t.latency_ms|ms }}</td>
       </tr>
     {% endfor %}
     </tbody>

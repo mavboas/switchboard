@@ -32,8 +32,11 @@ DEFAULT_SYSTEM_PROMPT = (
     "cordialidade e objetividade. Não invente fatos."
 )
 
-ProviderKind = Literal["openai", "anthropic", "offline"]
+ProviderKind = Literal["openai", "anthropic", "offline", "typesafe"]
 TransportKind = Literal["streamable-http", "sse"]
+
+# provedores que não conversam (não servem como modelo de chat do roteador)
+DECISION_PROVIDERS = frozenset({"typesafe"})
 
 
 def _check_name(value: str) -> str:
@@ -54,7 +57,12 @@ class _Spec(BaseModel):
 
 
 class ModelSpec(_Spec):
-    """Conexão com um provedor de LLM (e, opcionalmente, de embeddings)."""
+    """Conexão com um provedor de modelo.
+
+    ``openai``/``anthropic``/``offline`` são modelos de chat (LLM, System Two);
+    ``typesafe`` é um modelo de decisão (Jev, System One): responde perguntas
+    tipadas com probabilidades e só serve como ``decision_model`` de um perfil.
+    """
 
     name: Name
     provider: ProviderKind = "openai"
@@ -74,9 +82,20 @@ class ModelSpec(_Spec):
             raise ValueError(f"o modelo '{self.name}' precisa do campo 'model'")
         return self
 
+    @property
+    def is_decision_model(self) -> bool:
+        return self.provider in DECISION_PROVIDERS
 
-class AgentSpec(_Spec):
-    """Um agente acionável via MCP (um servidor MCP; suas tools são as capacidades)."""
+
+def _http_url(value: str, what: str) -> str:
+    value = value.strip()
+    if not value.startswith(("http://", "https://")):
+        raise ValueError(f"a URL {what} precisa começar com http:// ou https://")
+    return value
+
+
+class ConnectorSpec(_Spec):
+    """Um conector MCP: um servidor MCP cujas tools são ações rápidas e síncronas."""
 
     name: Name
     description: str = ""
@@ -90,10 +109,49 @@ class AgentSpec(_Spec):
     @field_validator("url")
     @classmethod
     def _url(cls, value: str) -> str:
-        value = value.strip()
-        if not value.startswith(("http://", "https://")):
-            raise ValueError("a URL do agente MCP precisa começar com http:// ou https://")
-        return value
+        return _http_url(value, "do conector MCP")
+
+
+class AgentSpec(_Spec):
+    """Um agente A2A: descoberto pelo Agent Card; cada skill é uma tarefa delegável.
+
+    Toda delegação a um agente é um contrato (ver :mod:`switchboard.contracts`).
+    ``deadline_s`` fixa o prazo dos contratos com este agente; sem ele, vale o
+    menor entre o ``max_duration_s`` que a skill declara e o ``deadline_s`` do perfil.
+    """
+
+    name: Name
+    description: str = ""
+    url: str = Field(
+        description="URL base do agente (onde fica /.well-known/agent-card.json) ou do card"
+    )
+    auth_token: str | None = None
+    allowed_skills: list[str] = Field(default_factory=list)
+    enabled: bool = True
+    timeout_s: float = Field(
+        default=15.0, gt=0, le=300, description="timeout de cada chamada JSON-RPC"
+    )
+    deadline_s: float | None = Field(default=None, gt=0, le=7 * 24 * 3600)
+    push: bool = Field(default=True, description="pede push notifications quando o agente suporta")
+    allow_cross_origin: bool = Field(
+        default=False,
+        description="aceita endpoint JSON-RPC (do card) em outro host que não o da URL cadastrada",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _not_mcp(cls, data):
+        if isinstance(data, dict) and ("transport" in data or "allowed_tools" in data):
+            raise ValueError(
+                "isto parece um servidor MCP: servidores MCP agora ficam em 'connectors' "
+                "(agentes em 'agents' são agentes A2A)"
+            )
+        return data
+
+    @field_validator("url")
+    @classmethod
+    def _url(cls, value: str) -> str:
+        return _http_url(value, "do agente A2A")
 
 
 class EmbedderSpec(_Spec):
@@ -134,24 +192,41 @@ class KnowledgeBaseSpec(_Spec):
 
 
 class ProfileSpec(_Spec):
-    """Um roteador configurado: modelo + agentes + bases + comportamento."""
+    """Um roteador configurado: modelos + conectores + agentes + bases + comportamento.
+
+    * ``model`` é o LLM (System Two): redige respostas, extrai argumentos e
+      consolida resultados;
+    * ``decision_model`` (opcional) é o modelo de decisão (System One, Jev):
+      escolhe a rota e confere parâmetros. Abaixo de ``decision_threshold`` de
+      confiança, a decisão sobe para o LLM;
+    * ``wait_s`` é quanto o pedido espera os agentes antes de responder
+      "em andamento" (o resultado continua em segundo plano);
+    * ``deadline_s`` é o prazo padrão dos contratos com agentes.
+    """
 
     name: Name = "default"
     description: str = ""
     model: str
+    decision_model: str | None = None
+    decision_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
+    connectors: list[str] = Field(default_factory=list)
     agents: list[str] = Field(default_factory=list)
     knowledge_bases: list[str] = Field(default_factory=list)
     top_k: int = Field(default=4, ge=1, le=20)
     min_score: float = Field(default=0.2, ge=0.0, le=1.0)
     synthesize: bool = True
     allow_clarify: bool = True
+    wait_s: float = Field(default=8.0, ge=0.0, le=120.0)
+    max_parallel: int = Field(default=3, ge=1, le=10)
+    deadline_s: float = Field(default=600.0, ge=5.0, le=7 * 24 * 3600)
 
 
 class SwitchboardSpec(_Spec):
     """Configuração completa do modo framework (``switchboard.yaml``)."""
 
     models: list[ModelSpec]
+    connectors: list[ConnectorSpec] = Field(default_factory=list)
     agents: list[AgentSpec] = Field(default_factory=list)
     knowledge_bases: list[KnowledgeBaseSpec] = Field(default_factory=list)
     profiles: list[ProfileSpec]
@@ -160,6 +235,7 @@ class SwitchboardSpec(_Spec):
     def _references(self) -> SwitchboardSpec:
         for kind, items in (
             ("modelo", self.models),
+            ("conector", self.connectors),
             ("agente", self.agents),
             ("base", self.knowledge_bases),
             ("perfil", self.profiles),
@@ -169,7 +245,8 @@ class SwitchboardSpec(_Spec):
                 if item.name in seen:
                     raise ValueError(f"{kind} '{item.name}' declarado mais de uma vez")
                 seen.add(item.name)
-        models = {m.name for m in self.models}
+        models = {m.name: m for m in self.models}
+        connectors = {c.name for c in self.connectors}
         agents = {a.name for a in self.agents}
         kbs = {k.name for k in self.knowledge_bases}
         for kb in self.knowledge_bases:
@@ -179,11 +256,36 @@ class SwitchboardSpec(_Spec):
                     "que não existe em models"
                 )
         for p in self.profiles:
-            if p.model not in models:
+            chat = models.get(p.model)
+            if chat is None:
                 raise ValueError(f"perfil '{p.name}': modelo '{p.model}' não existe em models")
+            if chat.is_decision_model:
+                raise ValueError(
+                    f"perfil '{p.name}': '{p.model}' é um modelo de decisão; use-o em "
+                    "'decision_model' e escolha um LLM em 'model'"
+                )
+            if p.decision_model is not None:
+                decision = models.get(p.decision_model)
+                if decision is None:
+                    raise ValueError(
+                        f"perfil '{p.name}': modelo de decisão '{p.decision_model}' não existe em models"
+                    )
+                if not decision.is_decision_model:
+                    raise ValueError(
+                        f"perfil '{p.name}': 'decision_model' precisa de um modelo de decisão "
+                        f"(provider typesafe); '{p.decision_model}' é {decision.provider}"
+                    )
+            for c in p.connectors:
+                if c not in connectors:
+                    raise ValueError(f"perfil '{p.name}': conector '{c}' não existe em connectors")
             for a in p.agents:
                 if a not in agents:
-                    raise ValueError(f"perfil '{p.name}': agente '{a}' não existe em agents")
+                    hint = (
+                        " (ele está em connectors: use 'connectors' no perfil)"
+                        if a in connectors
+                        else ""
+                    )
+                    raise ValueError(f"perfil '{p.name}': agente '{a}' não existe em agents{hint}")
             for k in p.knowledge_bases:
                 if k not in kbs:
                     raise ValueError(f"perfil '{p.name}': base '{k}' não existe em knowledge_bases")

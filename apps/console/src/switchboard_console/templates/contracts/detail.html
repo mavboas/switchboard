@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% from "_macros.html" import state_badge, kind_badge, schema_table %}
+{% block title %}Contrato {{ contract.id[:10] }}{% endblock %}
+{% block head %}{% if running %}<meta http-equiv="refresh" content="3">{% endif %}{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <div class="crumbs"><a href="/contracts">Contratos</a> /</div>
+    <h1><span class="mono">{{ contract.agent }}/{{ contract.skill }}</span> {{ state_badge(contract.state) }} {{ kind_badge(contract.kind) }}</h1>
+    <p>Contrato <span class="mono">{{ contract.id }}</span> · execução <a class="mono" href="/traces/{{ contract.run_id }}">{{ contract.run_id[:12] }}</a> · roteador <strong>{{ contract.profile }}</strong>
+      {% if running %}<span class="badge info live"><span class="dot"></span>atualizando a cada 3 s</span>{% endif %}</p>
+  </div>
+  <div class="actions">
+    <a class="btn" href="/api/contracts/{{ contract.id }}" target="_blank" rel="noopener">JSON</a>
+    <a class="btn" href="/traces/{{ contract.run_id }}">Ver a execução</a>
+  </div>
+</div>
+
+{% if contract.error %}<div class="flash error">{{ contract.error }}</div>{% endif %}
+
+<div class="grid grid-2">
+  <div class="card">
+    <h2>Termos</h2>
+    <dl class="kv">
+      <dt>Tipo</dt><dd>{{ kind_badge(contract.kind) }}</dd>
+      <dt>Prazo</dt><dd>{{ contract.deadline_at|datetime }}</dd>
+      <dt>Resposta</dt><dd>{{ 'push notifications + polling de segurança' if contract.reply_mode == 'push' else 'polling (GetTask)' }}</dd>
+      <dt>Entrada</dt><dd class="mono small">{{ contract.input_hash or '—' }}</dd>
+      <dt>Saída</dt><dd class="mono small">{{ contract.output_hash or '—' }}</dd>
+    </dl>
+    <p class="muted small" style="margin-top:12px">Os hashes (sha256 do schema canônico) vão na mensagem enviada ao agente: se o agente mudar os schemas depois de aceitar, a resposta não vale.</p>
+  </div>
+  <div class="card">
+    <h2>Execução do contrato</h2>
+    <dl class="kv">
+      <dt>Aberto</dt><dd>{{ contract.created_at|datetime }}</dd>
+      <dt>Aceito</dt><dd>{{ contract.accepted_at|datetime }}</dd>
+      <dt>Encerrado</dt><dd>{{ contract.finished_at|datetime }}</dd>
+      <dt>Duração</dt><dd>{{ contract.duration_ms|ms if contract.duration_ms is not none else 'em aberto' }}</dd>
+      <dt>Consultas</dt><dd>{{ contract.checks }} (GetTask)</dd>
+      <dt>Tarefa</dt><dd class="mono small">{{ contract.remote_task_id or '—' }}</dd>
+      <dt>Contexto</dt><dd class="mono small">{{ contract.remote_context_id or '—' }}</dd>
+      <dt>Endpoint</dt><dd class="mono small">{{ contract.rpc_url or '—' }}</dd>
+      <dt>Span</dt><dd class="mono small">{{ contract.span_id or '—' }}{% if contract.parent_span_id %} ← {{ contract.parent_span_id }}{% endif %}</dd>
+    </dl>
+  </div>
+</div>
+
+<div class="grid grid-2">
+  <div class="card">
+    <h2>Entrada enviada</h2>
+    {% if contract.input %}<pre class="block">{{ contract.input|tojson(indent=2) }}</pre>{% endif %}
+    {% if contract.input_text %}<pre class="block" style="margin-top:8px">{{ contract.input_text }}</pre>{% endif %}
+    {% if contract.input_schema %}<details style="margin-top:12px"><summary class="small muted">input schema</summary>{{ schema_table(contract.input_schema) }}</details>{% endif %}
+  </div>
+  <div class="card">
+    <h2>Saída {% if contract.state in open_states %}<span class="muted">(ainda não entregue)</span>{% endif %}</h2>
+    {% if contract.output is not none %}<pre class="block">{{ contract.output|tojson(indent=2) }}</pre>{% endif %}
+    {% if contract.output_text %}<pre class="block" style="margin-top:8px">{{ contract.output_text }}</pre>{% endif %}
+    {% if contract.output is none and not contract.output_text %}<p class="muted">—</p>{% endif %}
+    {% if contract.output_schema %}<details style="margin-top:12px"><summary class="small muted">output schema</summary>{{ schema_table(contract.output_schema) }}</details>{% endif %}
+  </div>
+</div>
+
+<div class="card">
+  <h2>Linha do tempo <span class="muted">({{ contract.events|length }} evento(s))</span></h2>
+  <ul class="timeline">
+    {% for e in contract.events %}
+    <li><span class="step-name">{{ e.kind }}</span> {% if e.state %}{{ state_badge(e.state) }}{% endif %}
+      <span class="step-ms">{{ e.at|datetime }} · {{ e.source }}</span>
+      {% if e.detail %}<pre class="block">{{ e.detail|tojson(indent=2) }}</pre>{% endif %}</li>
+    {% endfor %}
+  </ul>
+</div>
+{% endblock %}

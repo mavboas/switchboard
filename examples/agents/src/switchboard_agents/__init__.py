@@ -1,1 +1,1 @@
-"""Agentes MCP de exemplo."""
+"""Conectores MCP e agentes A2A de exemplo."""

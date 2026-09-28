@@ -1,11 +1,11 @@
 {% extends "base.html" %}
-{% from "_macros.html" import status_badge, delete_button, empty %}
-{% block title %}Agentes MCP{% endblock %}
+{% from "_macros.html" import status_badge, kind_badge, delete_button, empty %}
+{% block title %}Agentes A2A{% endblock %}
 {% block content %}
 <div class="page-head">
   <div>
-    <h1>Agentes MCP</h1>
-    <p>Cada agente é um servidor MCP. O roteador pergunta a cada um quais tools ele oferece (<code>tools/list</code>) e aciona a tool certa (<code>tools/call</code>) quando o pedido pede uma ação ou cálculo.</p>
+    <h1>Agentes A2A</h1>
+    <p>Agentes que recebem <strong>tarefas delegadas</strong> pelo protocolo A2A v1.0. O roteador lê o Agent Card de cada um e cada skill vira uma tarefa que ele pode delegar. Toda delegação é um <strong>contrato fechado</strong>: entrada e saída validadas pelos schemas da skill, prazo e estados acompanhados até o fim. Se o agente demorar, o pedido segue em segundo plano e a resposta é consolidada quando ele terminar.</p>
   </div>
   <div class="actions"><a class="btn primary" href="/agents/new">Registrar agente</a></div>
 </div>
@@ -13,22 +13,36 @@
 <div class="card">
   {% if agents %}
   <div class="table-wrap"><table>
-    <thead><tr><th>Agente</th><th>Status</th><th>Tools descobertas</th><th>Endpoint MCP</th><th class="right">Ações</th></tr></thead>
+    <thead><tr><th>Agente</th><th>Status</th><th>Skills (termos do contrato)</th><th>Recursos</th><th>Contratos</th><th class="right">Ações</th></tr></thead>
     <tbody>
     {% for a in agents %}
+      {% set total = a.contracts.values()|sum %}
+      {% set open = namespace(n=0) %}{% for st, n in a.contracts.items() %}{% if st in open_states %}{% set open.n = open.n + n %}{% endif %}{% endfor %}
       <tr>
-        <td><a href="/agents/{{ a.id }}"><strong>{{ a.name }}</strong></a><span class="sub">{{ a.description or (a.info.description if a.info else '') }}</span></td>
+        <td><a href="/agents/{{ a.id }}"><strong>{{ a.name }}</strong></a>
+          <span class="sub">{{ a.description or (a.info.description if a.info else '') }}</span>
+          <span class="sub mono">{{ a.url }}</span></td>
         <td>{% if a.enabled %}{{ status_badge(a.info) }}{% else %}<span class="badge">desabilitado</span>{% endif %}
-          {% if a.info and a.info.status == 'online' %}<span class="sub">{{ '%.0f'|format(a.info.latency_ms) }} ms</span>{% endif %}</td>
+          {% if a.info and a.info.status == 'online' %}<span class="sub">{{ '%.0f'|format(a.info.latency_ms) }} ms · A2A {{ a.info.protocol_version or '?' }}</span>{% endif %}</td>
         <td>
-          {% if a.info and a.info.tools %}<div class="pill-list">{% for t in a.info.tools %}<span class="pill mono">{{ t.name }}</span>{% endfor %}</div>
-          {% elif a.info and a.info.error %}<span class="small muted">{{ a.info.error|truncate(90) }}</span>
+          {% if a.info and a.info.skills %}
+            {% for sk in a.info.skills %}
+            <div class="skill-line"><span class="pill mono">{{ sk.id }}</span> {% if sk.usable %}{{ kind_badge(sk.contract) }}{% else %}<span class="badge danger" title="{{ sk.problems|join('; ') }}">inválida</span>{% endif %}
+              {% if sk.terms and sk.terms.max_duration_s %}<span class="muted small">até {{ (sk.terms.max_duration_s * 1000)|ms }}</span>{% endif %}</div>
+            {% endfor %}
+          {% elif a.info and a.info.error %}<span class="small muted">{{ a.info.error|truncate(110) }}</span>
           {% else %}<span class="muted">—</span>{% endif %}
-          {% if a.allowed_tools %}<span class="sub">allowlist: {{ a.allowed_tools }}</span>{% endif %}
+          {% if a.allowed_skills %}<span class="sub">allowlist: {{ a.allowed_skills }}</span>{% endif %}
         </td>
-        <td class="mono small">{{ a.url }}<span class="sub">{{ a.transport }}</span></td>
+        <td class="small">
+          {% if a.info and a.info.status == 'online' %}
+            <div>{{ '✓' if a.info.push else '—' }} push{% if a.info.push and not a.push %} <span class="muted">(desligado aqui)</span>{% endif %}</div>
+            <div>{{ '✓' if a.info.contract_extension else '—' }} extensão de contrato</div>
+          {% else %}<span class="muted">—</span>{% endif %}
+        </td>
+        <td class="small nowrap">{% if total %}<a href="/contracts?agent={{ a.name }}">{{ total }} no total</a>{% if open.n %}<span class="sub"><span class="badge info">{{ open.n }} em aberto</span></span>{% endif %}{% else %}<span class="muted">nenhum</span>{% endif %}</td>
         <td class="right nowrap">
-          <a class="btn small" href="/agents/{{ a.id }}?refresh=1">Descobrir</a>
+          <a class="btn small" href="/agents/{{ a.id }}?refresh=1">Ler card</a>
           <a class="btn small" href="/agents/{{ a.id }}/edit">Editar</a>
           {{ delete_button("/agents/" ~ a.id ~ "/delete", confirm="Remover o agente " ~ a.name ~ "?") }}
         </td>
@@ -37,7 +51,15 @@
     </tbody>
   </table></div>
   {% else %}
-  {{ empty("Nenhum agente registrado", "Registre a URL de um servidor MCP (Streamable HTTP ou SSE).", "/agents/new", "Registrar agente") }}
+  {{ empty("Nenhum agente A2A registrado", "Registre a URL base de um agente A2A v1.0 (onde fica /.well-known/agent-card.json).", "/agents/new", "Registrar agente") }}
   {% endif %}
+</div>
+
+<div class="card">
+  <h2>MCP ou A2A?</h2>
+  <div class="grid grid-2">
+    <div><strong>Conector MCP</strong><p class="muted small">Ferramenta rápida e síncrona: o roteador chama e responde no mesmo pedido (simular um financiamento, consultar um saldo, abrir um chamado). <a href="/connectors">Conectores MCP</a></p></div>
+    <div><strong>Agente A2A</strong><p class="muted small">Outro agente que executa uma tarefa, às vezes demorada, e pode pedir informação no meio do caminho (analisar uma proposta de crédito, avaliar risco). Sempre sob contrato, com prazo, estados e resultado validado.</p></div>
+  </div>
 </div>
 {% endblock %}
