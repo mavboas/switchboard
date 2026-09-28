@@ -1,6 +1,8 @@
 # Stack completa do Switchboard:
 #   postgres (pgvector) · console (UI + API admin) · router (API de chat)
-#   · dois agentes MCP de exemplo (crédito e chamados).
+#   · dois conectores MCP de exemplo (crédito e chamados)
+#   · dois agentes A2A de exemplo (análise de crédito e risco), que recebem tarefas
+#     sob contrato e avisam o router por push notification.
 #
 #   cp .env.example .env      # ou: make env (gera uma SWITCHBOARD_SECRET_KEY aleatória)
 #   docker compose up -d --build
@@ -17,7 +19,7 @@ x-app-env: &app-env
   # primeira subida e guardada no volume "secrets" (compartilhado com o router)
   SWITCHBOARD_SECRET_KEY: ${SWITCHBOARD_SECRET_KEY:-}
   SWITCHBOARD_SECRET_KEY_FILE: /var/lib/switchboard/secret.key
-  SWITCHBOARD_ALLOWED_ENV_SECRETS: ${SWITCHBOARD_ALLOWED_ENV_SECRETS:-*_API_KEY,MCP_*}
+  SWITCHBOARD_ALLOWED_ENV_SECRETS: ${SWITCHBOARD_ALLOWED_ENV_SECRETS:-*_API_KEY,MCP_*,A2A_*}
   SWITCHBOARD_LOG_LEVEL: ${SWITCHBOARD_LOG_LEVEL:-info}
   # chaves de provedores: no console, use env:OPENAI_API_KEY (etc.) no campo da chave
   OPENAI_API_KEY: ${OPENAI_API_KEY:-}
@@ -26,6 +28,8 @@ x-app-env: &app-env
   GEMINI_API_KEY: ${GEMINI_API_KEY:-}
   OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
   GROQ_API_KEY: ${GROQ_API_KEY:-}
+  # modelo de decisão (TypeSafe Jev): no console, use env:TYPESAFE_API_KEY
+  TYPESAFE_API_KEY: ${TYPESAFE_API_KEY:-}
 
 x-python-healthcheck: &python-healthcheck
   interval: 10s
@@ -67,6 +71,8 @@ services:
       SWITCHBOARD_SEED_DEMO: ${SWITCHBOARD_SEED_DEMO:-true}
       SWITCHBOARD_DEMO_CREDITO_URL: http://agent-credito:8101/mcp
       SWITCHBOARD_DEMO_CHAMADOS_URL: http://agent-chamados:8102/mcp
+      SWITCHBOARD_DEMO_ANALISE_URL: http://agent-analise:8201
+      SWITCHBOARD_DEMO_RISCO_URL: http://agent-risco:8202
     ports:
       - "${CONSOLE_BIND:-127.0.0.1}:${CONSOLE_PORT:-8000}:8000"
     volumes:
@@ -91,6 +97,10 @@ services:
       SWITCHBOARD_API_KEYS: ${SWITCHBOARD_API_KEYS:-}
       SWITCHBOARD_ALLOWED_HOSTS: ${SWITCHBOARD_ALLOWED_HOSTS:-localhost,127.0.0.1,[::1],router}
       SWITCHBOARD_DEFAULT_PROFILE: ${SWITCHBOARD_DEFAULT_PROFILE:-default}
+      # URL pela qual os agentes A2A alcançam o router (push notifications em /a2a/push/...)
+      SWITCHBOARD_PUBLIC_URL: ${SWITCHBOARD_PUBLIC_URL:-http://router:8080}
+      # hosts aceitos em callback_url (webhook do cliente quando uma execução termina)
+      SWITCHBOARD_CALLBACK_HOSTS: ${SWITCHBOARD_CALLBACK_HOSTS:-}
     ports:
       - "${ROUTER_BIND:-127.0.0.1}:${ROUTER_PORT:-8080}:8080"
     volumes:
@@ -124,6 +134,40 @@ services:
       - "${AGENTS_BIND:-127.0.0.1}:8102:8102"
     depends_on:
       - agent-credito
+
+  agent-analise:
+    image: switchboard-agents:dev
+    pull_policy: never
+    command: ["switchboard-agent", "analise-credito", "--host", "0.0.0.0", "--port", "8201"]
+    restart: unless-stopped
+    environment:
+      AGENT_PUBLIC_URL: http://agent-analise:8201  # vai no Agent Card
+      AGENT_PUSH_HOSTS: router  # só aceita push notifications para o router
+      ANALISE_DELAY_S: ${ANALISE_DELAY_S:-12}  # duração simulada da análise
+    ports:
+      - "${AGENTS_BIND:-127.0.0.1}:8201:8201"
+    depends_on:
+      - agent-credito
+    healthcheck:
+      <<: *python-healthcheck
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8201/.well-known/agent-card.json', timeout=3)"]
+
+  agent-risco:
+    image: switchboard-agents:dev
+    pull_policy: never
+    command: ["switchboard-agent", "risco", "--host", "0.0.0.0", "--port", "8202"]
+    restart: unless-stopped
+    environment:
+      AGENT_PUBLIC_URL: http://agent-risco:8202
+      AGENT_PUSH_HOSTS: router
+      RISCO_DELAY_S: ${RISCO_DELAY_S:-2}
+    ports:
+      - "${AGENTS_BIND:-127.0.0.1}:8202:8202"
+    depends_on:
+      - agent-credito
+    healthcheck:
+      <<: *python-healthcheck
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8202/.well-known/agent-card.json', timeout=3)"]
 
 volumes:
   pgdata:

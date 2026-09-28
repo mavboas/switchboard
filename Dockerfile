@@ -1,8 +1,8 @@
 # Imagem única para os serviços Python do monorepo. Escolha o serviço com
 #   --build-arg PACKAGE=switchboard-console | switchboard-router | switchboard-example-agents
 # e o comando no `docker run`/compose (switchboard-console, switchboard-router,
-# switchboard-agent credito ...). Só o pacote escolhido e suas dependências
-# entram no venv final.
+# switchboard-agent credito | chamados | analise-credito | risco). Só o pacote
+# escolhido e suas dependências entram no venv final.
 
 ARG PYTHON_IMAGE=python:3.12-slim
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.8.17
@@ -21,6 +21,7 @@ WORKDIR /src
 # 1) só as dependências de terceiros (camada reaproveitada entre builds)
 COPY pyproject.toml uv.lock .python-version ./
 COPY packages/core/pyproject.toml packages/core/README.md packages/core/
+COPY packages/agentkit/pyproject.toml packages/agentkit/README.md packages/agentkit/
 COPY apps/router/pyproject.toml apps/router/
 COPY apps/console/pyproject.toml apps/console/
 COPY examples/agents/pyproject.toml examples/agents/
