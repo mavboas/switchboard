@@ -48,22 +48,16 @@ jobs:
       - run: uv run pytest -q
 
   compose-smoke:
-    # sobe a stack inteira como o usuário faria e testa um pedido de ponta a ponta
+    # sobe a stack inteira como o usuário faria e testa cada rota de ponta a ponta:
+    # RAG, tool MCP, agente A2A rápido, agente A2A demorado (pending → consolidação
+    # por push notification) e contrato que pede entrada no meio (needs_input)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - run: cp .env.example .env
       - run: docker compose up -d --build --wait --wait-timeout 300
-      - name: Resposta direta (RAG) e delegação via MCP
-        run: |
-          set -euo pipefail
-          ask() {
-            curl -sf http://localhost:8080/v1/chat -H 'Content-Type: application/json' \
-              -d "{\"message\": \"$1\"}" | python3 -c "import sys, json; d = json.load(sys.stdin); print(d['route'], d.get('tool')); assert d['route'] == '$2', d"
-          }
-          ask "Qual o horário de atendimento aos sábados?" direct
-          ask "Simule um empréstimo de R\$ 50 mil em 24 meses a 1,5% ao mês" delegated
-          curl -sf http://localhost:8000/ > /dev/null
+      - name: Smoke ponta a ponta
+        run: python3 scripts/smoke.py --router http://localhost:8080 --console http://localhost:8000
       - if: failure()
         run: docker compose logs --no-color
       - if: always()

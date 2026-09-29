@@ -1,27 +1,35 @@
 {% extends "base.html" %}
-{% from "_macros.html" import route_badge, empty %}
+{% from "_macros.html" import route_badge, run_badge, empty %}
 {% block title %}Execuções{% endblock %}
 {% block content %}
 <div class="page-head">
   <div>
     <h1>Execuções</h1>
-    <p>Todo pedido atendido pelo router vira um trace: a decisão tomada, as fontes consultadas, o agente acionado e o tempo de cada etapa.</p>
+    <p>Todo pedido atendido pelo router vira uma execução: a decisão (e quem decidiu), as fontes consultadas, as tools chamadas, os contratos abertos com agentes A2A e os spans de cada etapa. Delegações longas aparecem <em>em andamento</em> até a consolidação.</p>
   </div>
 </div>
 
-<form class="card" method="get" action="/traces" style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
-  <div class="field" style="min-width:200px">
+<form class="card filters" method="get" action="/traces">
+  <div class="field">
     <label for="f-profile">Roteador</label>
     <select id="f-profile" name="profile">
       <option value="">todos</option>
       {% for p in profiles %}<option value="{{ p }}" {% if filters.profile == p %}selected{% endif %}>{{ p }}</option>{% endfor %}
     </select>
   </div>
-  <div class="field" style="min-width:200px">
+  <div class="field">
     <label for="f-route">Rota</label>
     <select id="f-route" name="route">
       <option value="">todas</option>
       {% for key, label in route_labels.items() %}<option value="{{ key }}" {% if filters.route == key %}selected{% endif %}>{{ label }}</option>{% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label for="f-status">Situação</label>
+    <select id="f-status" name="status">
+      <option value="">todas</option>
+      <option value="abertas" {% if filters.status == 'abertas' %}selected{% endif %}>em andamento (todas)</option>
+      {% for key, label in statuses.items() %}<option value="{{ key }}" {% if filters.status == key %}selected{% endif %}>{{ label }}</option>{% endfor %}
     </select>
   </div>
   <button class="btn" type="submit">Filtrar</button>
@@ -30,24 +38,27 @@
 <div class="card">
   {% if traces %}
   <div class="table-wrap"><table>
-    <thead><tr><th>Quando</th><th>Roteador</th><th>Rota</th><th>Pedido</th><th>Resposta</th><th>Agente / tool</th><th class="right">Latência</th></tr></thead>
+    <thead><tr><th>Quando</th><th>Roteador</th><th>Rota</th><th>Situação</th><th>Pedido</th><th>Acionou</th><th>Decidiu</th><th class="right">Latência</th></tr></thead>
     <tbody>
     {% for t in traces %}
       <tr>
         <td class="nowrap"><a href="/traces/{{ t.trace_id }}">{{ t.created|datetime }}</a></td>
         <td>{{ t.profile }}</td>
         <td>{{ route_badge(t.route) }}{% if t.warnings %}<span class="sub"><span class="badge warn">{{ t.warnings|length }} aviso(s)</span></span>{% endif %}</td>
-        <td>{{ t.question|truncate(80) }}</td>
-        <td class="muted">{{ t.answer|truncate(80) }}</td>
-        <td>{% if t.agent %}<span class="mono small">{{ t.agent }}/{{ t.tool }}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
-        <td class="right nowrap">{{ '%.0f'|format(t.latency_ms) }} ms</td>
+        <td>{{ run_badge(t.status) }}</td>
+        <td>{{ t.question|truncate(70) }}<span class="sub">{{ t.answer|truncate(70) }}</span></td>
+        <td>{% if t.tasks %}<div class="pill-list">{% for task in t.tasks %}<span class="pill mono">{{ task.owner }}/{{ task.name }}</span>{% endfor %}</div>
+          {% elif t.agent %}<span class="mono small">{{ t.agent }}/{{ t.tool }}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
+        <td class="small">{{ t.decided_by or '—' }}{% if t.confidence is not none %}<span class="sub">{{ '%.0f'|format(t.confidence * 100) }}%</span>{% endif %}</td>
+        <td class="right nowrap">{{ t.latency_ms|ms }}</td>
       </tr>
     {% endfor %}
     </tbody>
   </table></div>
   <div class="form-actions">
-    {% if page > 1 %}<a class="btn small" href="?profile={{ filters.profile }}&route={{ filters.route }}&page={{ page - 1 }}">← anteriores</a>{% endif %}
-    {% if has_next %}<a class="btn small" href="?profile={{ filters.profile }}&route={{ filters.route }}&page={{ page + 1 }}">próximas →</a>{% endif %}
+    {% set qs = "profile=" ~ filters.profile ~ "&route=" ~ filters.route ~ "&status=" ~ filters.status %}
+    {% if page > 1 %}<a class="btn small" href="?{{ qs }}&page={{ page - 1 }}">← anteriores</a>{% endif %}
+    {% if has_next %}<a class="btn small" href="?{{ qs }}&page={{ page + 1 }}">próximas →</a>{% endif %}
   </div>
   {% else %}
   {{ empty("Nenhuma execução", "Os pedidos atendidos pelo router aparecem aqui.", "/playground", "Abrir playground") }}

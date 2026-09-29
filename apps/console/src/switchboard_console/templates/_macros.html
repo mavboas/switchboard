@@ -6,6 +6,10 @@
 <rect x="6" y="6" width="12" height="12" rx="2"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/><path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3"/>
 {%- elif name == "agents" -%}
 <circle cx="12" cy="12" r="3"/><circle cx="5" cy="5" r="2"/><circle cx="19" cy="5" r="2"/><circle cx="12" cy="20" r="2"/><path d="M6.5 6.5l3.3 3.3M17.5 6.5l-3.3 3.3M12 15v3"/>
+{%- elif name == "connectors" -%}
+<path d="M9 3.5v4M15 3.5v4"/><path d="M6.5 7.5h11v3a5.5 5.5 0 0 1-11 0z"/><path d="M12 16v4.5"/>
+{%- elif name == "contracts" -%}
+<path d="M6 3.5h8.5l3.5 3.5v13.5H6z"/><path d="M14.5 3.5V7H18"/><path d="M9 11h6M9 14.5h6M9 18h3.5"/>
 {%- elif name == "knowledge" -%}
 <path d="M5 4.5h9.5a3 3 0 0 1 3 3V20H8a3 3 0 0 1-3-3z"/><path d="M5 17a3 3 0 0 1 3-3h9.5"/><path d="M9 8.5h5"/>
 {%- elif name == "profiles" -%}
@@ -31,6 +35,19 @@
 
 {% macro route_badge(route) -%}
 <span class="badge route-{{ route }}"><span class="dot"></span>{{ route_labels.get(route, route) }}</span>
+{%- endmacro %}
+
+{% macro run_badge(status) -%}
+<span class="badge {{ tones.get(status, '') }}"><span class="dot"></span>{{ run_labels.get(status, status) }}</span>
+{%- endmacro %}
+
+{% macro state_badge(state) -%}
+<span class="badge {{ tones.get(state, '') }}"><span class="dot"></span>{{ contract_labels.get(state, state) }}</span>
+{%- endmacro %}
+
+{% macro kind_badge(kind) -%}
+{% if kind == "completo" %}<span class="badge ok" title="o agente declarou input e output schema: entrada e saída são validadas">contrato completo</span>
+{% else %}<span class="badge warn" title="sem schemas: instrução em texto e saída livre (só prazo e estados)">contrato básico</span>{% endif %}
 {%- endmacro %}
 
 {% macro status_badge(info) -%}
@@ -74,4 +91,26 @@
   <div>{{ text }}</div>
   {% if href %}<p><a class="btn primary" href="{{ href }}">{{ cta }}</a></p>{% endif %}
 </div>
+{%- endmacro %}
+
+{% macro schema_table(schema, empty_text="sem campos") -%}
+{% set props = (schema or {}).get("properties") or {} %}
+{% set required = (schema or {}).get("required") or [] %}
+<div class="table-wrap"><table class="schema">
+  <thead><tr><th>Campo</th><th>Tipo</th><th>Obrigatório</th><th>Descrição</th></tr></thead>
+  <tbody>
+  {% for name, prop in props.items() %}
+    <tr>
+      <td class="mono">{{ name|replace("_", "_<wbr>"|safe) }}</td>
+      <td class="small">{{ prop.type if prop.type is string else (prop.type|join(' | ') if prop.type else ('enum' if prop.enum else '—')) }}{% if prop.enum %}: {{ prop.enum|join(', ') }}{% endif %}
+        {%- if prop.minimum is defined or prop.exclusiveMinimum is defined or prop.maximum is defined %}<span class="sub">
+          {%- if prop.minimum is defined %}≥ {{ prop.minimum }} {% endif %}{% if prop.exclusiveMinimum is defined %}&gt; {{ prop.exclusiveMinimum }} {% endif %}{% if prop.maximum is defined %}≤ {{ prop.maximum }}{% endif %}</span>{% endif %}</td>
+      <td>{{ 'sim' if name in required else 'não' }}</td>
+      <td class="small">{{ prop.description or '' }}{% if prop.default is defined %} <span class="muted">(padrão: {{ prop.default }})</span>{% endif %}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="4" class="muted">{{ empty_text }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table></div>
 {%- endmacro %}

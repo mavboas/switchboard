@@ -1,4 +1,4 @@
-"""CLI do modo framework: ``switchboard ask | agents | check``."""
+"""CLI do modo framework: ``switchboard ask | connectors | agents | check``."""
 
 from __future__ import annotations
 
@@ -15,7 +15,8 @@ from .errors import SwitchboardError
 
 ROUTE_LABELS = {
     "direct": "resposta direta",
-    "delegated": "delegado a agente",
+    "tool": "tool MCP",
+    "delegated": "delegado a agente (A2A)",
     "clarify": "pergunta de esclarecimento",
     "error": "erro",
 }
@@ -28,16 +29,43 @@ def _config_path(value: str | None) -> Path:
 async def _ask(args: argparse.Namespace) -> int:
     async with Switchboard.from_yaml(_config_path(args.config)) as sb:
         result = await sb.ask(args.message, profile=args.profile)
+        final_answer = None
+        contracts = []
+        if result.status == "pending" and args.wait > 0:
+            if not args.json:
+                print(
+                    f"em andamento (execução {result.run_id}); aguardando até {args.wait:g} s…",
+                    file=sys.stderr,
+                )
+            run = await sb.wait(result.run_id, args.wait)
+            if run is not None:
+                result.status = {"completed": "completed", "needs_input": "needs_input"}.get(
+                    run.status, result.status
+                )
+                final_answer = run.answer
+        if result.route == "delegated":
+            contracts = [c.to_dict() for c in await sb.run_contracts(result.run_id)]
+    if final_answer is not None:
+        result.answer = final_answer
     if args.json:
-        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        data = result.to_dict()
+        if contracts:
+            data["contracts"] = contracts
+        print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
         return 0 if result.route != "error" else 1
+    decided = f" · decidido por {result.decided_by}" if result.decided_by else ""
+    if result.confidence is not None:
+        decided += f" ({result.confidence:.2f})"
     print(
-        f"rota: {ROUTE_LABELS.get(result.route, result.route)}  ·  modelo: {result.model}  ·  {result.latency_ms:.0f} ms"
+        f"rota: {ROUTE_LABELS.get(result.route, result.route)} · status: {result.status}{decided} · "
+        f"{result.latency_ms:.0f} ms"
     )
-    if result.agent:
+    if result.route == "tool" and result.agent:
         print(
-            f"agente: {result.agent} / {result.tool}  argumentos: {json.dumps(result.arguments, ensure_ascii=False)}"
+            f"tool: {result.agent}/{result.tool}  argumentos: {json.dumps(result.arguments, ensure_ascii=False)}"
         )
+    for c in contracts:
+        print(f"contrato {c['id']}: {c['agent']}/{c['skill']} ({c['kind']}) → {c['state']}")
     if result.reason:
         print(f"motivo: {result.reason}")
     print()
@@ -52,11 +80,11 @@ async def _ask(args: argparse.Namespace) -> int:
     return 0 if result.route != "error" else 1
 
 
-async def _agents(args: argparse.Namespace) -> int:
+async def _connectors(args: argparse.Namespace) -> int:
     async with Switchboard.from_yaml(_config_path(args.config)) as sb:
-        infos = await sb.agents(args.profile, refresh=True)
+        infos = await sb.connectors_status(args.profile, refresh=True)
     if not infos:
-        print("nenhum agente configurado neste perfil")
+        print("nenhum conector MCP configurado neste perfil")
         return 0
     for info in infos:
         status = "ONLINE " if info.status == "online" else "OFFLINE"
@@ -69,14 +97,43 @@ async def _agents(args: argparse.Namespace) -> int:
     return 0 if all(i.status == "online" for i in infos) else 1
 
 
+async def _agents(args: argparse.Namespace) -> int:
+    async with Switchboard.from_yaml(_config_path(args.config)) as sb:
+        infos = await sb.agents_status(args.profile, refresh=True)
+    if not infos:
+        print("nenhum agente A2A configurado neste perfil")
+        return 0
+    for info in infos:
+        status = "ONLINE " if info.status == "online" else "OFFLINE"
+        extra = (
+            f"A2A {info.protocol_version} · push={'sim' if info.push else 'não'}"
+            if info.status == "online"
+            else ""
+        )
+        print(f"{status} {info.name}  {info.url}  ({info.latency_ms:.0f} ms) {extra}")
+        if info.error:
+            print(f"        erro: {info.error}")
+        for skill in info.skills:
+            flag = "contrato completo" if skill.contract == "completo" else "contrato básico"
+            print(f"        - {skill.id} [{flag}]: {skill.description}")
+            for problem in skill.problems:
+                print(f"          problema: {problem}")
+    return 0 if all(i.status == "online" for i in infos) else 1
+
+
 def _check(args: argparse.Namespace) -> int:
     spec = load_yaml(_config_path(args.config))
     print(
-        f"ok: {len(spec.models)} modelo(s), {len(spec.agents)} agente(s), "
-        f"{len(spec.knowledge_bases)} base(s), {len(spec.profiles)} perfil(is)"
+        f"ok: {len(spec.models)} modelo(s), {len(spec.connectors)} conector(es) MCP, "
+        f"{len(spec.agents)} agente(s) A2A, {len(spec.knowledge_bases)} base(s), "
+        f"{len(spec.profiles)} perfil(is)"
     )
     for p in spec.profiles:
-        print(f"  - {p.name}: modelo={p.model} agentes={p.agents} bases={p.knowledge_bases}")
+        decision = f" decisão={p.decision_model}" if p.decision_model else ""
+        print(
+            f"  - {p.name}: modelo={p.model}{decision} conectores={p.connectors} "
+            f"agentes={p.agents} bases={p.knowledge_bases}"
+        )
     return 0
 
 
@@ -93,8 +150,17 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("message")
     ask.add_argument("-p", "--profile", help="perfil (padrão: o primeiro do YAML)")
     ask.add_argument("--json", action="store_true", help="saída completa em JSON (inclui o trace)")
+    ask.add_argument(
+        "--wait",
+        type=float,
+        default=120.0,
+        help="segundos para esperar agentes A2A depois da espera do perfil (0 = não esperar)",
+    )
 
-    agents = sub.add_parser("agents", help="descobre os agentes via MCP e lista as tools")
+    connectors = sub.add_parser("connectors", help="descobre os conectores MCP e lista as tools")
+    connectors.add_argument("-p", "--profile")
+
+    agents = sub.add_parser("agents", help="descobre os agentes A2A (Agent Card) e lista as skills")
     agents.add_argument("-p", "--profile")
 
     sub.add_parser("check", help="valida o YAML")
@@ -106,6 +172,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "ask":
             return asyncio.run(_ask(args))
+        if args.command == "connectors":
+            return asyncio.run(_connectors(args))
         if args.command == "agents":
             return asyncio.run(_agents(args))
         return _check(args)

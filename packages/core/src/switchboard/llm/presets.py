@@ -100,5 +100,20 @@ PRESETS: dict[str, Preset] = {
             "",
             notes="Decide por palavras-chave e responde de forma extrativa. Bom para demo e testes.",
         ),
+        Preset(
+            "typesafe",
+            "TypeSafe Jev (modelo de decisão)",
+            "typesafe",
+            "https://api.typesafe.ai",
+            model_hint="jev-1.13.0",
+            key_hint="env:TYPESAFE_API_KEY",
+            notes=(
+                "Modelo de decisão (System One): escolhe rotas e confere parâmetros com "
+                "probabilidades; não gera texto. Use como 'modelo de decisão' de um roteador. "
+                "Fixe a versão (ex.: jev-1.13.0) se calibrar limiares de confiança."
+            ),
+        ),
     ]
 }
+
+DECISION_PRESETS = frozenset(k for k, p in PRESETS.items() if p.provider == "typesafe")

@@ -2,7 +2,7 @@
 # comandos equivalentes do README.
 
 .DEFAULT_GOAL := help
-.PHONY: help env up down reset logs dev test test-pg lint fmt
+.PHONY: help env up down reset logs dev smoke test test-pg lint fmt
 
 help: ## lista os comandos
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  %-9s %s\n", $$1, $$2}'
@@ -28,6 +28,9 @@ logs: ## acompanha os logs
 
 dev: ## roda tudo local sem Docker (SQLite em ./data)
 	./scripts/dev.sh
+
+smoke: ## testa a stack no ar de ponta a ponta (RAG, tool MCP, agentes A2A, needs_input)
+	python3 scripts/smoke.py
 
 test: ## testes (SQLite)
 	uv run pytest -q

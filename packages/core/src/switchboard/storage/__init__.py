@@ -1,14 +1,31 @@
 """Persistência plugável: PostgreSQL (pgvector) por padrão, SQLite opcional."""
 
+from .contracts import SqlContractStore
 from .db import Database, normalize_url, redact_url
 from .knowledge import EmbedderCache, KnowledgeService
-from .orm import Agent, Base, Chunk, Document, KnowledgeBase, LlmModel, RouterProfile, Trace
+from .orm import (
+    Agent,
+    Base,
+    Chunk,
+    Connector,
+    Contract,
+    ContractEventRow,
+    Document,
+    KnowledgeBase,
+    LlmModel,
+    RouterProfile,
+    SpanRow,
+    Trace,
+)
 from .seed import seed_demo
 
 __all__ = [
     "Agent",
     "Base",
     "Chunk",
+    "Connector",
+    "Contract",
+    "ContractEventRow",
     "Database",
     "Document",
     "EmbedderCache",
@@ -16,6 +33,8 @@ __all__ = [
     "KnowledgeService",
     "LlmModel",
     "RouterProfile",
+    "SpanRow",
+    "SqlContractStore",
     "Trace",
     "normalize_url",
     "redact_url",

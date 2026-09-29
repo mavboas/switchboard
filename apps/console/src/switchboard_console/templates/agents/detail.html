@@ -1,79 +1,104 @@
 {% extends "base.html" %}
-{% from "_macros.html" import status_badge, delete_button %}
+{% from "_macros.html" import status_badge, kind_badge, state_badge, delete_button, schema_table %}
 {% block title %}{{ agent.name }}{% endblock %}
 {% block content %}
 <div class="page-head">
   <div>
-    <div class="crumbs"><a href="/agents">Agentes MCP</a> /</div>
+    <div class="crumbs"><a href="/agents">Agentes A2A</a> /</div>
     <h1>{{ agent.name }} {% if agent.enabled %}{{ status_badge(info) }}{% else %}<span class="badge">desabilitado</span>{% endif %}</h1>
     <p>{{ agent.description or info.description or 'Sem descrição.' }}</p>
   </div>
   <div class="actions">
-    <a class="btn" href="/agents/{{ agent.id }}?refresh=1">Descobrir de novo</a>
+    <a class="btn" href="/agents/{{ agent.id }}?refresh=1">Ler o card de novo</a>
+    <a class="btn" href="/contracts?agent={{ agent.name }}">Contratos</a>
     <a class="btn" href="/agents/{{ agent.id }}/edit">Editar</a>
     {{ delete_button("/agents/" ~ agent.id ~ "/delete", confirm="Remover o agente " ~ agent.name ~ "?") }}
   </div>
 </div>
 
+{% if info.error %}<div class="flash error">{{ info.error }}</div>{% endif %}
+
 <div class="grid grid-2">
   <div class="card">
     <h2>Conexão</h2>
     <dl class="kv">
-      <dt>Endpoint</dt><dd class="mono">{{ agent.url }}</dd>
-      <dt>Transporte</dt><dd>{{ agent.transport }}</dd>
-      <dt>Servidor</dt><dd>{{ info.server_name or '—' }}</dd>
-      <dt>Latência</dt><dd>{{ '%.0f'|format(info.latency_ms) }} ms (handshake + tools/list)</dd>
+      <dt>URL</dt><dd class="mono">{{ agent.url }}</dd>
+      <dt>Endpoint</dt><dd class="mono">{{ info.rpc_url or '—' }}{% if info.rpc_url %} <span class="muted small">(JSON-RPC)</span>{% endif %}</dd>
+      <dt>Protocolo</dt><dd>{% if info.protocol_version %}A2A {{ info.protocol_version }}{% else %}—{% endif %}</dd>
+      <dt>Card</dt><dd>{{ info.card_name or '—' }}{% if info.card_version %} <span class="muted">v{{ info.card_version }}</span>{% endif %}</dd>
+      <dt>Latência</dt><dd>{{ '%.0f'|format(info.latency_ms) }} ms <span class="muted small">(leitura do card)</span></dd>
       <dt>Token</dt><dd>{{ agent.auth_token|secret }}</dd>
-      <dt>Allowlist</dt><dd>{{ agent.allowed_tools or 'todas as tools' }}</dd>
+      <dt>Allowlist</dt><dd>{{ agent.allowed_skills or 'todas as skills' }}</dd>
     </dl>
-    {% if info.error %}<div class="flash error" style="margin-top:14px">{{ info.error }}</div>{% endif %}
   </div>
-
   <div class="card">
-    <h2>Testar uma tool</h2>
-    {% if info.tools %}
-    <form method="post" action="/agents/{{ agent.id }}/call" class="stack">
-      <select name="tool">
-        {% for t in info.tools %}<option value="{{ t.name }}" {% if call and call.tool == t.name %}selected{% endif %}>{{ t.name }}</option>{% endfor %}
-      </select>
-      <textarea name="arguments" class="code" rows="4" placeholder='{"campo": "valor"}'>{{ call.arguments if call else '{}' }}</textarea>
-      <button class="btn primary" type="submit">Chamar via MCP</button>
-    </form>
-    {% if call %}
-      <div style="margin-top:14px">
-        <div class="small muted">{{ call.tool }} · {{ '%.0f'|format(call.ms) }} ms {% if call.is_error %}<span class="badge danger">erro</span>{% else %}<span class="badge ok">ok</span>{% endif %}</div>
-        <pre class="block" style="margin-top:6px">{{ call.result }}</pre>
-      </div>
-    {% endif %}
-    {% else %}
-    <p class="muted">Nenhuma tool disponível{% if info.status != 'online' %} — o agente está offline{% endif %}.</p>
-    {% endif %}
+    <h2>Contrato e comunicação</h2>
+    <dl class="kv">
+      <dt>Extensão</dt><dd>{% if info.contract_extension %}<span class="badge ok">contrato declarado</span> <span class="muted small mono">urn:switchboard:a2a:contract:v1</span>{% else %}<span class="badge warn">sem extensão</span> <span class="muted small">skills com contrato básico</span>{% endif %}</dd>
+      <dt>Push</dt><dd>{% if info.push %}{% if agent.push %}<span class="badge ok">ativo</span> o agente avisa o router a cada mudança{% else %}suportado, mas <strong>desligado</strong> neste cadastro{% endif %}{% else %}<span class="badge">não suportado</span> acompanhamento por polling{% endif %}</dd>
+      <dt>Streaming</dt><dd>{{ 'suportado' if info.streaming else 'não' }}</dd>
+      <dt>Prazo</dt><dd>{% if agent.deadline_s %}{{ (agent.deadline_s * 1000)|ms }} para todas as skills{% else %}o da skill (limitado pelo do roteador){% endif %}</dd>
+      <dt>Timeout</dt><dd>{{ agent.timeout_s|int }} s por chamada JSON-RPC</dd>
+      <dt>Origem</dt><dd>{{ 'endpoint pode estar em outro host' if agent.allow_cross_origin else 'endpoint precisa estar no mesmo host' }}</dd>
+    </dl>
   </div>
 </div>
 
 <div class="card">
-  <h2>Tools descobertas <span class="muted">({{ info.tools|length }})</span></h2>
-  {% for t in info.tools %}
-    <details {% if loop.first %}open{% endif %} style="padding:10px 0;border-bottom:1px solid var(--border)">
-      <summary><strong class="mono">{{ t.name }}</strong> <span class="muted">— {{ t.description }}</span></summary>
-      <table style="margin-top:8px">
-        <thead><tr><th>Argumento</th><th>Tipo</th><th>Obrigatório</th><th>Descrição</th></tr></thead>
-        <tbody>
-        {% for name, prop in (t.input_schema.properties or {}).items() %}
-          <tr>
-            <td class="mono">{{ name }}</td>
-            <td class="small">{{ prop.type or ('enum' if prop.enum else '—') }}{% if prop.enum %}: {{ prop.enum|join(', ') }}{% endif %}</td>
-            <td>{{ 'sim' if name in (t.input_schema.required or []) else 'não' }}</td>
-            <td class="small">{{ prop.description or '' }}{% if prop.default is defined %} <span class="muted">(padrão: {{ prop.default }})</span>{% endif %}</td>
-          </tr>
-        {% else %}
-          <tr><td colspan="4" class="muted">sem argumentos</td></tr>
-        {% endfor %}
-        </tbody>
-      </table>
+  <h2>Skills <span class="muted">({{ info.skills|length }})</span></h2>
+  {% for sk in info.skills %}
+    <details {% if loop.first %}open{% endif %} class="skill">
+      <summary><strong class="mono">{{ sk.id }}</strong> <span class="muted">— {{ sk.name }}</span>
+        {% if sk.usable %}{{ kind_badge(sk.contract) }}{% else %}<span class="badge danger">inválida</span>{% endif %}
+        {% if sk.terms and sk.terms.max_duration_s %}<span class="badge">prazo máximo {{ (sk.terms.max_duration_s * 1000)|ms }}</span>{% endif %}</summary>
+      <p>{{ sk.description }}</p>
+      {% if sk.problems %}<div class="flash error">{{ sk.problems|join('\n') }}</div>{% endif %}
+      {% if sk.examples %}
+        <div class="small muted">Exemplos</div>
+        <ul class="small">{% for ex in sk.examples %}<li>{{ ex }}</li>{% endfor %}</ul>
+      {% endif %}
+      {% if sk.terms %}
+        <div class="grid grid-2">
+          <div>
+            <div class="small muted">Entrada (input schema)</div>
+            {{ schema_table(sk.terms.input_schema) }}
+            <div class="small muted mono hash">{{ sk.terms.input_hash }}</div>
+          </div>
+          <div>
+            <div class="small muted">Saída (output schema)</div>
+            {{ schema_table(sk.terms.output_schema) }}
+            <div class="small muted mono hash">{{ sk.terms.output_hash }}</div>
+          </div>
+        </div>
+      {% else %}
+        <p class="muted small">Contrato básico: o agente não declarou schemas para esta skill. O roteador envia uma instrução em texto e aceita a resposta em texto; o contrato cobre prazo, estados e cancelamento.</p>
+      {% endif %}
+      {% if sk.tags %}<div class="pill-list">{% for t in sk.tags %}<span class="pill">{{ t }}</span>{% endfor %}</div>{% endif %}
     </details>
   {% else %}
-    <p class="muted">Nada descoberto.</p>
+    <p class="muted">Nenhuma skill descoberta{% if info.status != 'online' %} — o agente está offline{% endif %}.</p>
   {% endfor %}
+</div>
+
+<div class="card">
+  <div class="card-head"><h2>Contratos recentes</h2><a class="btn small" href="/contracts?agent={{ agent.name }}">ver todos</a></div>
+  {% if contracts %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Contrato</th><th>Skill</th><th>Estado</th><th>Última mensagem</th><th>Prazo</th></tr></thead>
+    <tbody>
+    {% for c in contracts %}
+      <tr>
+        <td><a class="mono small" href="/contracts/{{ c.id }}">{{ c.id[:16] }}…</a><span class="sub">{{ c.created_at|datetime }}</span></td>
+        <td class="mono small">{{ c.skill }}</td>
+        <td>{{ state_badge(c.state) }}</td>
+        <td class="small">{{ (c.error or c.last_message or '—')|truncate(90) }}</td>
+        <td class="small nowrap">{{ c.deadline_at|datetime }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}
+  <p class="muted">Nenhum contrato com este agente ainda.</p>
+  {% endif %}
 </div>
 {% endblock %}

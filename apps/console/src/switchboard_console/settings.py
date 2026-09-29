@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     secret_key: str | None = None
     # sem SWITCHBOARD_SECRET_KEY, a chave mestra é gerada neste arquivo na primeira subida
     secret_key_file: str | None = None
-    allowed_env_secrets: str = "*_API_KEY,MCP_*"  # variáveis aceitas em env:NOME
+    allowed_env_secrets: str = "*_API_KEY,MCP_*,A2A_*"  # variáveis aceitas em env:NOME
 
     # onde está o router (usado pelo playground e pelo painel)
     router_url: str = "http://localhost:8080"
@@ -34,8 +34,10 @@ class Settings(BaseSettings):
     # dados de demonstração na primeira subida (banco vazio)
     seed_demo: bool = True
     demo_knowledge_dir: str = str(_DEFAULT_KNOWLEDGE)
-    demo_credito_url: str = "http://localhost:8101/mcp"
-    demo_chamados_url: str = "http://localhost:8102/mcp"
+    demo_credito_url: str = "http://localhost:8101/mcp"  # conector MCP
+    demo_chamados_url: str = "http://localhost:8102/mcp"  # conector MCP
+    demo_analise_url: str = "http://localhost:8201"  # agente A2A
+    demo_risco_url: str = "http://localhost:8202"  # agente A2A
 
     host: str = "127.0.0.1"  # a imagem Docker usa 0.0.0.0 (SWITCHBOARD_HOST)
     port: int = 8000

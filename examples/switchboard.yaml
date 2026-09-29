@@ -1,8 +1,17 @@
 # Modo framework: o roteador sem banco nem console, configurado só por este arquivo.
 #
 #   uv run switchboard -c examples/switchboard.yaml check
-#   uv run switchboard -c examples/switchboard.yaml agents
+#   uv run switchboard -c examples/switchboard.yaml connectors     # tools dos servidores MCP
+#   uv run switchboard -c examples/switchboard.yaml agents         # skills dos agentes A2A
 #   uv run switchboard -c examples/switchboard.yaml ask "Qual o horário de atendimento aos sábados?"
+#   uv run switchboard -c examples/switchboard.yaml ask "Simule um empréstimo de R$ 30 mil em 12 meses a 2% ao mês"
+#   uv run switchboard -c examples/switchboard.yaml ask "Analise a proposta de crédito de Maria Souza: renda de 8 mil, pede 40 mil em 24 meses"
+#
+# Os exemplos precisam dos servidores de demonstração no ar (ver scripts/dev.sh):
+#   uv run switchboard-agent credito --port 8101           # conector MCP
+#   uv run switchboard-agent chamados --port 8102          # conector MCP
+#   uv run switchboard-agent analise-credito --port 8201   # agente A2A (tarefa longa)
+#   uv run switchboard-agent risco --port 8202             # agente A2A
 #
 # Também serve de configuração para o router sem banco:
 #   SWITCHBOARD_CONFIG_FILE=examples/switchboard.yaml uv run switchboard-router
@@ -10,6 +19,7 @@
 # ${VAR} e ${VAR:-padrão} são lidos do ambiente; "env:NOME" em chaves é resolvido na hora da chamada.
 
 models:
+  # LLMs (System Two): redigem respostas, extraem argumentos e consolidam resultados.
   - name: offline
     provider: offline
 
@@ -29,13 +39,36 @@ models:
     base_url: http://localhost:11434/v1
     model: ${OLLAMA_MODEL:-qwen3:8b}
 
-agents:
+  # Modelo de decisão (System One): escolhe a rota e confere parâmetros com
+  # probabilidades. Só entra como 'decision_model' de um perfil.
+  - name: jev
+    provider: typesafe
+    model: ${TYPESAFE_MODEL:-jev-1.13.0}   # fixe a versão se calibrar decision_threshold
+    api_key: env:TYPESAFE_API_KEY
+
+# Conectores MCP: tools rápidas e síncronas (chamou, respondeu).
+connectors:
   - name: credito
     url: http://localhost:8101/mcp
     description: Simulações de financiamento e empréstimo (tabela Price e SAC).
   - name: chamados
     url: http://localhost:8102/mcp
     description: Abertura e consulta de chamados de suporte.
+
+# Agentes A2A: tarefas delegadas que podem demorar. Cada delegação abre um
+# contrato fechado com os termos que o agente publicou no Agent Card
+# (schemas de entrada e saída, prazo). Na CLI e na biblioteca o acompanhamento é
+# por polling (GetTask); o router (com banco ou lendo este YAML) usa push
+# notifications quando SWITCHBOARD_PUBLIC_URL está definida.
+agents:
+  - name: analise-credito
+    url: http://localhost:8201
+    description: Análise de propostas de crédito (política, capacidade de pagamento e limite).
+    deadline_s: 300           # prazo dos contratos com este agente (vale sobre skill e perfil)
+  - name: risco
+    url: http://localhost:8202
+    description: "Prevenção a fraude: avalia o risco de uma operação ou cliente."
+    allowed_skills: [avaliar_risco]
 
 knowledge_bases:
   - name: manual
@@ -47,6 +80,19 @@ knowledge_bases:
 profiles:
   - name: default
     model: offline              # troque por openai, claude ou ollama
-    agents: [credito, chamados]
+    connectors: [credito, chamados]
+    agents: [analise-credito, risco]
     knowledge_bases: [manual]
     min_score: 0.15
+    wait_s: 8                   # espera os agentes até 8 s; depois responde "em andamento"
+    deadline_s: 600             # prazo padrão dos contratos
+
+  # Decisão pelo Jev e texto por um LLM. Precisa de TYPESAFE_API_KEY e OPENAI_API_KEY:
+  #   uv run switchboard -c examples/switchboard.yaml ask -p hibrido "..."
+  - name: hibrido
+    model: openai
+    decision_model: jev
+    decision_threshold: 0.6     # abaixo disso a decisão sobe para o LLM
+    connectors: [credito, chamados]
+    agents: [analise-credito, risco]
+    knowledge_bases: [manual]

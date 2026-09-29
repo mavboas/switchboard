@@ -7,6 +7,7 @@
   <title>{% block title %}Switchboard{% endblock %} · Switchboard Console</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230f9d8a'/%3E%3Cpath d='M8 8 C 8 18, 24 14, 24 24' fill='none' stroke='white' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}?v={{ version }}">
+  {% block head %}{% endblock %}
 </head>
 <body>
   <aside class="sidebar">
@@ -15,12 +16,14 @@
       <a href="/" class="{{ 'active' if nav == 'dashboard' }}">{{ icon('dashboard') }} Painel</a>
       <div class="nav-label">Configuração</div>
       <a href="/models" class="{{ 'active' if nav == 'models' }}">{{ icon('models') }} Modelos</a>
-      <a href="/agents" class="{{ 'active' if nav == 'agents' }}">{{ icon('agents') }} Agentes MCP</a>
+      <a href="/connectors" class="{{ 'active' if nav == 'connectors' }}">{{ icon('connectors') }} Conectores MCP</a>
+      <a href="/agents" class="{{ 'active' if nav == 'agents' }}">{{ icon('agents') }} Agentes A2A</a>
       <a href="/knowledge" class="{{ 'active' if nav == 'knowledge' }}">{{ icon('knowledge') }} Conhecimento</a>
       <a href="/profiles" class="{{ 'active' if nav == 'profiles' }}">{{ icon('profiles') }} Roteadores</a>
       <div class="nav-label">Operação</div>
       <a href="/playground" class="{{ 'active' if nav == 'playground' }}">{{ icon('playground') }} Playground</a>
       <a href="/traces" class="{{ 'active' if nav == 'traces' }}">{{ icon('traces') }} Execuções</a>
+      <a href="/contracts" class="{{ 'active' if nav == 'contracts' }}">{{ icon('contracts') }} Contratos</a>
       <a href="/docs" target="_blank" rel="noopener">{{ icon('api') }} API admin</a>
     </nav>
     <div class="sidebar-foot">v{{ version }}</div>

@@ -2,6 +2,10 @@
 
 Os segredos (chave de API, token) são só de escrita: as respostas mostram
 apenas se há valor e de que tipo (``env:NOME`` ou cifrado).
+
+Recursos: ``/api/models``, ``/api/connectors`` (servidores MCP),
+``/api/agents`` (agentes A2A), ``/api/knowledge-bases``, ``/api/profiles``,
+``/api/traces`` (execuções, com spans e contratos) e ``/api/contracts``.
 """
 
 from __future__ import annotations
@@ -18,7 +22,14 @@ from switchboard.llm import PRESETS
 from switchboard.rag import extract_text, guess_title
 from switchboard.secrets import SecretBox
 from switchboard.storage import repo
-from switchboard.storage.orm import Agent, Document, KnowledgeBase, LlmModel, RouterProfile, Trace
+from switchboard.storage.orm import (
+    Agent,
+    Connector,
+    Document,
+    KnowledgeBase,
+    LlmModel,
+    RouterProfile,
+)
 
 from .state import Console, get_console
 
@@ -47,17 +58,33 @@ def _model_out(m: LlmModel) -> dict[str, Any]:
     }
 
 
+def _connector_out(c: Connector) -> dict[str, Any]:
+    return {
+        "id": c.id,
+        "name": c.name,
+        "description": c.description,
+        "url": c.url,
+        "transport": c.transport,
+        "auth_token": SecretBox.describe(c.auth_token) if c.auth_token else None,
+        "allowed_tools": c.allowed_tools or [],
+        "enabled": c.enabled,
+        "timeout_s": c.timeout_s,
+    }
+
+
 def _agent_out(a: Agent) -> dict[str, Any]:
     return {
         "id": a.id,
         "name": a.name,
         "description": a.description,
         "url": a.url,
-        "transport": a.transport,
         "auth_token": SecretBox.describe(a.auth_token) if a.auth_token else None,
-        "allowed_tools": a.allowed_tools or [],
+        "allowed_skills": a.allowed_skills or [],
         "enabled": a.enabled,
         "timeout_s": a.timeout_s,
+        "deadline_s": a.deadline_s,
+        "push": True if a.push is None else a.push,
+        "allow_cross_origin": bool(a.allow_cross_origin),
     }
 
 
@@ -78,18 +105,25 @@ def _kb_out(k: KnowledgeBase, stats: dict[str, int] | None = None) -> dict[str, 
 
 
 def _profile_out(p: RouterProfile) -> dict[str, Any]:
+    spec = repo.profile_to_spec(p, only_enabled=False)
     return {
         "id": p.id,
         "name": p.name,
         "description": p.description,
         "model": p.model.name,
+        "decision_model": p.decision_model.name if p.decision_model else None,
+        "decision_threshold": spec.decision_threshold,
         "system_prompt": p.system_prompt,
+        "connectors": [c.name for c in p.connectors],
         "agents": [a.name for a in p.agents],
         "knowledge_bases": [k.name for k in p.knowledge_bases],
         "top_k": p.top_k,
         "min_score": p.min_score,
         "synthesize": p.synthesize,
         "allow_clarify": p.allow_clarify,
+        "wait_s": spec.wait_s,
+        "max_parallel": spec.max_parallel,
+        "deadline_s": spec.deadline_s,
         "enabled": p.enabled,
     }
 
@@ -157,10 +191,10 @@ async def delete_model(model_id: int, console: Console = Depends(get_console)):
         raise _fail(exc, 409) from exc
 
 
-# -- agentes ------------------------------------------------------------------
+# -- conectores MCP -------------------------------------------------------------
 
 
-class AgentIn(BaseModel):
+class ConnectorIn(BaseModel):
     name: str
     description: str = ""
     url: str
@@ -170,6 +204,122 @@ class AgentIn(BaseModel):
     allowed_tools: list[str] = Field(default_factory=list)
     enabled: bool = True
     timeout_s: float = 30.0
+
+
+class ToolCallIn(BaseModel):
+    tool: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+def _connector_spec(s, connector_id: int):
+    row = s.get(Connector, connector_id)
+    return repo.connector_to_spec(row) if row is not None else None
+
+
+@api.get("/connectors")
+async def list_connectors(console: Console = Depends(get_console)):
+    return await console.run_db(
+        lambda s: [_connector_out(c) for c in s.scalars(select(Connector).order_by(Connector.name))]
+    )
+
+
+@api.post("/connectors", status_code=201)
+async def create_connector(body: ConnectorIn, console: Console = Depends(get_console)):
+    try:
+        return await console.run_db(
+            lambda s: _connector_out(repo.save_connector(s, body.model_dump(), box=console.box))
+        )
+    except SwitchboardError as exc:
+        raise _fail(exc) from exc
+
+
+@api.put("/connectors/{connector_id}")
+async def update_connector(
+    connector_id: int, body: ConnectorIn, console: Console = Depends(get_console)
+):
+    try:
+        out = await console.run_db(
+            lambda s: _connector_out(
+                repo.save_connector(
+                    s, body.model_dump(), box=console.box, connector_id=connector_id
+                )
+            )
+        )
+    except SwitchboardError as exc:
+        raise _fail(exc) from exc
+    console.connectors.invalidate(out["name"])
+    return out
+
+
+@api.delete("/connectors/{connector_id}", status_code=204)
+async def delete_connector(connector_id: int, console: Console = Depends(get_console)):
+    try:
+        await console.run_db(lambda s: repo.delete_connector(s, connector_id))
+    except SwitchboardError as exc:
+        raise _fail(exc, 404) from exc
+
+
+@api.get("/connectors/{connector_id}/discover")
+async def discover_connector(
+    connector_id: int, refresh: bool = True, console: Console = Depends(get_console)
+):
+    spec = await console.run_db(_connector_spec, connector_id)
+    if spec is None:
+        raise HTTPException(status_code=404, detail="conector não encontrado")
+    return (await console.connectors.describe(spec, refresh=refresh)).to_dict()
+
+
+@api.post("/connectors/{connector_id}/call")
+async def call_tool(connector_id: int, body: ToolCallIn, console: Console = Depends(get_console)):
+    spec = await console.run_db(_connector_spec, connector_id)
+    if spec is None:
+        raise HTTPException(status_code=404, detail="conector não encontrado")
+    try:
+        result = await console.connectors.call(spec, body.tool, body.arguments)
+    except SwitchboardError as exc:
+        raise _fail(exc, 502) from exc
+    return {
+        "text": result.text,
+        "is_error": result.is_error,
+        "structured": result.structured,
+        "latency_ms": round(result.latency_ms, 1),
+    }
+
+
+# -- agentes A2A -------------------------------------------------------------------
+
+
+class AgentIn(BaseModel):
+    model_config = {"extra": "allow"}
+
+    name: str
+    description: str = ""
+    url: str = Field(description="URL base do agente (onde fica /.well-known/agent-card.json)")
+    auth_token: str | None = None
+    clear_auth_token: bool = False
+    allowed_skills: list[str] = Field(default_factory=list)
+    enabled: bool = True
+    timeout_s: float = 15.0
+    deadline_s: float | None = Field(
+        default=None, description="prazo padrão dos contratos, em segundos"
+    )
+    push: bool = True
+    allow_cross_origin: bool = False
+
+    def payload(self) -> dict[str, Any]:
+        extra = set(self.model_extra or {})
+        if extra & {"transport", "allowed_tools"}:
+            # cliente da API antiga: agentes MCP viraram conectores
+            raise SwitchboardError(
+                "isto parece um servidor MCP: cadastre-o em /api/connectors "
+                "(/api/agents agora é para agentes A2A)"
+            )
+        return self.model_dump(exclude=extra)
+
+
+def _agent_spec(s, agent_id: int):
+    row = s.get(Agent, agent_id)
+    return repo.agent_to_spec(row) if row is not None else None
 
 
 @api.get("/agents")
@@ -182,9 +332,8 @@ async def list_agents(console: Console = Depends(get_console)):
 @api.post("/agents", status_code=201)
 async def create_agent(body: AgentIn, console: Console = Depends(get_console)):
     try:
-        return await console.run_db(
-            lambda s: _agent_out(repo.save_agent(s, body.model_dump(), box=console.box))
-        )
+        data = body.payload()
+        return await console.run_db(lambda s: _agent_out(repo.save_agent(s, data, box=console.box)))
     except SwitchboardError as exc:
         raise _fail(exc) from exc
 
@@ -192,14 +341,13 @@ async def create_agent(body: AgentIn, console: Console = Depends(get_console)):
 @api.put("/agents/{agent_id}")
 async def update_agent(agent_id: int, body: AgentIn, console: Console = Depends(get_console)):
     try:
+        data = body.payload()
         out = await console.run_db(
-            lambda s: _agent_out(
-                repo.save_agent(s, body.model_dump(), box=console.box, agent_id=agent_id)
-            )
+            lambda s: _agent_out(repo.save_agent(s, data, box=console.box, agent_id=agent_id))
         )
     except SwitchboardError as exc:
         raise _fail(exc) from exc
-    console.catalog.invalidate(out["name"])
+    console.agents.invalidate(out["name"])
     return out
 
 
@@ -215,10 +363,11 @@ async def delete_agent(agent_id: int, console: Console = Depends(get_console)):
 async def discover_agent(
     agent_id: int, refresh: bool = True, console: Console = Depends(get_console)
 ):
-    spec = await console.run_db(lambda s: (a := s.get(Agent, agent_id)) and repo.agent_to_spec(a))
+    """Busca o Agent Card e mostra skills, contrato (completo/básico) e problemas."""
+    spec = await console.run_db(_agent_spec, agent_id)
     if spec is None:
         raise HTTPException(status_code=404, detail="agente não encontrado")
-    return (await console.catalog.describe(spec, refresh=refresh)).to_dict()
+    return (await console.agents.describe(spec, refresh=refresh)).to_dict()
 
 
 # -- bases de conhecimento ------------------------------------------------------
@@ -395,14 +544,22 @@ async def reindex(kb_id: int, console: Console = Depends(get_console)):
 class ProfileIn(BaseModel):
     name: str
     description: str = ""
-    model: str = Field(description="nome do modelo")
+    model: str = Field(description="nome do modelo (LLM)")
+    decision_model: str | None = Field(
+        default=None, description="nome do modelo de decisão (TypeSafe Jev); vazio = o LLM decide"
+    )
+    decision_threshold: float = 0.6
     system_prompt: str = ""
-    agents: list[str] = Field(default_factory=list)
+    connectors: list[str] = Field(default_factory=list, description="conectores MCP")
+    agents: list[str] = Field(default_factory=list, description="agentes A2A")
     knowledge_bases: list[str] = Field(default_factory=list)
     top_k: int = 4
     min_score: float = 0.2
     synthesize: bool = True
     allow_clarify: bool = True
+    wait_s: float = 8.0
+    max_parallel: int = 3
+    deadline_s: float = 600.0
     enabled: bool = True
 
 
@@ -419,9 +576,16 @@ def _profile_payload(s, body: ProfileIn) -> dict[str, Any]:
         return [rows[n] for n in names]
 
     [model_id] = ids(LlmModel, [body.model], "modelo")
-    data = body.model_dump(exclude={"model", "agents", "knowledge_bases"})
+    decision_ids = (
+        ids(LlmModel, [body.decision_model], "modelo de decisão") if body.decision_model else []
+    )
+    data = body.model_dump(
+        exclude={"model", "decision_model", "connectors", "agents", "knowledge_bases"}
+    )
     data.update(
         model_id=model_id,
+        decision_model_id=decision_ids[0] if decision_ids else None,
+        connector_ids=ids(Connector, body.connectors, "conector"),
         agent_ids=ids(Agent, body.agents, "agente"),
         kb_ids=ids(KnowledgeBase, body.knowledge_bases, "base"),
     )
@@ -463,13 +627,14 @@ async def delete_profile(profile_id: int, console: Console = Depends(get_console
         raise _fail(exc, 404) from exc
 
 
-# -- execuções ----------------------------------------------------------------
+# -- execuções e contratos ------------------------------------------------------------
 
 
 @api.get("/traces")
 async def list_traces(
     profile: str | None = None,
     route: str | None = None,
+    status: str | None = None,
     limit: int = 50,
     offset: int = 0,
     console: Console = Depends(get_console),
@@ -478,14 +643,43 @@ async def list_traces(
     return await console.run_db(
         lambda s: [
             repo.trace_to_dict(t)
-            for t in repo.query_traces(s, profile=profile, route=route, limit=limit, offset=offset)
+            for t in repo.query_traces(
+                s, profile=profile, route=route, status=status, limit=limit, offset=offset
+            )
         ]
     )
 
 
 @api.get("/traces/{trace_id}")
 async def get_trace(trace_id: str, console: Console = Depends(get_console)):
-    row = await console.run_db(lambda s: (t := s.get(Trace, trace_id)) and repo.trace_to_dict(t))
+    """A execução completa: decisão, spans (inclusive um por contrato) e contratos com eventos."""
+    row = await console.run_db(repo.run_details, trace_id)
     if row is None:
         raise HTTPException(status_code=404, detail="execução não encontrada")
+    return row
+
+
+@api.get("/contracts")
+async def list_contracts(
+    state: str | None = None,
+    agent: str | None = None,
+    profile: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    console: Console = Depends(get_console),
+):
+    limit = max(1, min(limit, 500))
+    return await console.run_db(
+        lambda s: repo.query_contracts(
+            s, state=state, agent=agent, profile=profile, limit=limit, offset=offset
+        )
+    )
+
+
+@api.get("/contracts/{contract_id}")
+async def get_contract(contract_id: str, console: Console = Depends(get_console)):
+    """Termos (schemas e hashes), entrada, saída e a linha do tempo de eventos do contrato."""
+    row = await console.run_db(repo.contract_details, contract_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="contrato não encontrado")
     return row

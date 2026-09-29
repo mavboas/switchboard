@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% from "_macros.html" import state_badge, kind_badge, empty %}
+{% block title %}Contratos{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Contratos</h1>
+    <p>Cada delegação a um agente A2A abre um contrato: quem pediu, qual skill, com que entrada, em quanto tempo e com que formato de saída. O contrato acompanha a tarefa até um estado final — concluído, falhou, rejeitado, cancelado, expirado ou violado (o agente quebrou os termos).</p>
+  </div>
+</div>
+
+<div class="stats contract-stats">
+  {% for st in contract_states %}
+  <a class="stat {{ 'active' if filters.state == st }}" href="/contracts?state={{ st }}">
+    <div class="label">{{ contract_labels[st] }}</div>
+    <div class="value">{{ counts.get(st, 0) }}</div>
+  </a>
+  {% endfor %}
+</div>
+
+<form class="card filters" method="get" action="/contracts">
+  <div class="field">
+    <label for="f-state">Estado</label>
+    <select id="f-state" name="state">
+      <option value="">todos</option>
+      <option value="abertos" {% if filters.state == 'abertos' %}selected{% endif %}>em aberto (todos)</option>
+      {% for st in contract_states %}<option value="{{ st }}" {% if filters.state == st %}selected{% endif %}>{{ contract_labels[st] }}</option>{% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label for="f-agent">Agente</label>
+    <select id="f-agent" name="agent">
+      <option value="">todos</option>
+      {% for a in agents %}<option value="{{ a }}" {% if filters.agent == a %}selected{% endif %}>{{ a }}</option>{% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label for="f-profile">Roteador</label>
+    <input type="text" id="f-profile" name="profile" value="{{ filters.profile }}" placeholder="todos">
+  </div>
+  <button class="btn" type="submit">Filtrar</button>
+  {% if filters.state or filters.agent or filters.profile %}<a class="btn ghost" href="/contracts">limpar</a>{% endif %}
+</form>
+
+<div class="card">
+  {% if contracts %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Aberto em</th><th>Agente / skill</th><th>Estado</th><th>Termos</th><th>Execução</th><th>Última mensagem</th><th class="right">Duração</th></tr></thead>
+    <tbody>
+    {% for c in contracts %}
+      <tr>
+        <td class="nowrap"><a href="/contracts/{{ c.id }}">{{ c.created_at|datetime }}</a><span class="sub">prazo {{ c.deadline_at|datetime }}</span></td>
+        <td><strong class="mono small">{{ c.agent }}/{{ c.skill }}</strong><span class="sub">{{ c.profile }}</span></td>
+        <td>{{ state_badge(c.state) }}</td>
+        <td>{{ kind_badge(c.kind) }}</td>
+        <td><a class="mono small" href="/traces/{{ c.run_id }}">{{ c.run_id[:12] }}</a></td>
+        <td class="small">{{ (c.error or c.last_message or '—')|truncate(90) }}</td>
+        <td class="right nowrap">{{ c.duration_ms|ms if c.duration_ms is not none else 'em aberto' }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  <div class="form-actions">
+    {% set qs = "state=" ~ filters.state ~ "&agent=" ~ filters.agent ~ "&profile=" ~ filters.profile %}
+    {% if page > 1 %}<a class="btn small" href="?{{ qs }}&page={{ page - 1 }}">← anteriores</a>{% endif %}
+    {% if has_next %}<a class="btn small" href="?{{ qs }}&page={{ page + 1 }}">próximos →</a>{% endif %}
+  </div>
+  {% else %}
+  {{ empty("Nenhum contrato", "Os contratos aparecem quando um roteador delega uma tarefa a um agente A2A.", "/playground", "Abrir playground") }}
+  {% endif %}
+</div>
+{% endblock %}

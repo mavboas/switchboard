@@ -67,7 +67,7 @@ def model_data(form: FormData) -> dict[str, Any]:
     }
 
 
-def agent_data(form: FormData) -> dict[str, Any]:
+def connector_data(form: FormData) -> dict[str, Any]:
     return {
         "name": text(form, "name"),
         "description": text(form, "description"),
@@ -78,6 +78,22 @@ def agent_data(form: FormData) -> dict[str, Any]:
         "allowed_tools": text(form, "allowed_tools"),
         "enabled": checkbox(form, "enabled"),
         "timeout_s": number(form, "timeout_s") or 30.0,
+    }
+
+
+def agent_data(form: FormData) -> dict[str, Any]:
+    return {
+        "name": text(form, "name"),
+        "description": text(form, "description"),
+        "url": text(form, "url"),
+        "auth_token": optional_text(form, "auth_token"),
+        "clear_auth_token": checkbox(form, "clear_auth_token"),
+        "allowed_skills": text(form, "allowed_skills"),
+        "enabled": checkbox(form, "enabled"),
+        "timeout_s": number(form, "timeout_s") or 15.0,
+        "deadline_s": number(form, "deadline_s"),
+        "push": checkbox(form, "push"),
+        "allow_cross_origin": checkbox(form, "allow_cross_origin"),
     }
 
 
@@ -99,12 +115,18 @@ def profile_data(form: FormData) -> dict[str, Any]:
         "name": text(form, "name"),
         "description": text(form, "description"),
         "model_id": number(form, "model_id", int),
+        "decision_model_id": number(form, "decision_model_id", int),
+        "decision_threshold": number(form, "decision_threshold"),
         "system_prompt": text(form, "system_prompt"),
+        "connector_ids": id_list(form, "connector_ids"),
         "agent_ids": id_list(form, "agent_ids"),
         "kb_ids": id_list(form, "kb_ids"),
         "top_k": number(form, "top_k", int) or 4,
         "min_score": number(form, "min_score"),
         "synthesize": checkbox(form, "synthesize"),
         "allow_clarify": checkbox(form, "allow_clarify"),
+        "wait_s": number(form, "wait_s"),
+        "max_parallel": number(form, "max_parallel", int),
+        "deadline_s": number(form, "deadline_s"),
         "enabled": checkbox(form, "enabled"),
     }

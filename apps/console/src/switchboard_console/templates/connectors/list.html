@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% from "_macros.html" import status_badge, delete_button, empty %}
+{% block title %}Conectores MCP{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Conectores MCP</h1>
+    <p>Cada conector é um servidor MCP com <strong>tools rápidas e síncronas</strong> (cálculos, consultas, abrir um chamado). O roteador lista as tools (<code>tools/list</code>) e chama a certa (<code>tools/call</code>) na hora, dentro do próprio pedido. Tarefas longas ou que precisam de outro agente pensar ficam com os <a href="/agents">agentes A2A</a>.</p>
+  </div>
+  <div class="actions"><a class="btn primary" href="/connectors/new">Registrar conector</a></div>
+</div>
+
+<div class="card">
+  {% if connectors %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Conector</th><th>Status</th><th>Tools descobertas</th><th>Endpoint MCP</th><th class="right">Ações</th></tr></thead>
+    <tbody>
+    {% for a in connectors %}
+      <tr>
+        <td><a href="/connectors/{{ a.id }}"><strong>{{ a.name }}</strong></a><span class="sub">{{ a.description or (a.info.description if a.info else '') }}</span></td>
+        <td>{% if a.enabled %}{{ status_badge(a.info) }}{% else %}<span class="badge">desabilitado</span>{% endif %}
+          {% if a.info and a.info.status == 'online' %}<span class="sub">{{ '%.0f'|format(a.info.latency_ms) }} ms</span>{% endif %}</td>
+        <td>
+          {% if a.info and a.info.tools %}<div class="pill-list">{% for t in a.info.tools %}<span class="pill mono">{{ t.name }}</span>{% endfor %}</div>
+          {% elif a.info and a.info.error %}<span class="small muted">{{ a.info.error|truncate(90) }}</span>
+          {% else %}<span class="muted">—</span>{% endif %}
+          {% if a.allowed_tools %}<span class="sub">allowlist: {{ a.allowed_tools }}</span>{% endif %}
+        </td>
+        <td class="mono small">{{ a.url }}<span class="sub">{{ a.transport }}</span></td>
+        <td class="right nowrap">
+          <a class="btn small" href="/connectors/{{ a.id }}?refresh=1">Descobrir</a>
+          <a class="btn small" href="/connectors/{{ a.id }}/edit">Editar</a>
+          {{ delete_button("/connectors/" ~ a.id ~ "/delete", confirm="Remover o conector " ~ a.name ~ "?") }}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}
+  {{ empty("Nenhum conector registrado", "Registre a URL de um servidor MCP (Streamable HTTP ou SSE).", "/connectors/new", "Registrar conector") }}
+  {% endif %}
+</div>
+{% endblock %}

@@ -112,6 +112,7 @@ main { padding: 28px 36px 60px; min-width: 0; }
 
 .page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
 .page-head h1 { margin: 0; font-size: 22px; letter-spacing: -.01em; }
+.page-head h1 .mono { font-size: .8em; }
 .page-head p { margin: 4px 0 0; color: var(--muted); max-width: 720px; }
 .crumbs { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; }
@@ -132,7 +133,7 @@ main { padding: 28px 36px 60px; min-width: 0; }
 .grid { display: grid; gap: 18px; }
 .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-.stats { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 14px; margin-bottom: 18px; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin-bottom: 18px; }
 .stat { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; box-shadow: var(--shadow); }
 .stat .label { color: var(--muted); font-size: 12px; }
 .stat .value { font-size: 24px; font-weight: 700; margin-top: 2px; }
@@ -165,6 +166,7 @@ td .sub { display: block; color: var(--muted); font-size: 12px; margin-top: 2px;
 .badge.danger, .badge.route-error { background: var(--danger-soft); color: var(--danger); border-color: transparent; }
 .badge.warn, .badge.route-clarify { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
 .badge.info, .badge.route-delegated { background: var(--info-soft); color: var(--info); border-color: transparent; }
+.badge.route-tool { background: var(--accent-soft); color: var(--accent-strong); border-color: transparent; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; display: inline-block; }
 
 .pill-list { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -279,7 +281,6 @@ pre.block {
 /* --- responsivo -------------------------------------------------------------------- */
 
 @media (max-width: 1100px) {
-  .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .playground { grid-template-columns: 1fr; }
   .trace-panel { position: static; max-height: none; }
 }
@@ -291,8 +292,57 @@ pre.block {
   .nav-label, .sidebar-foot { display: none; }
   main { padding: 20px 16px 40px; }
   .grid-2, .grid-3, .form-grid, .choices { grid-template-columns: 1fr; }
-  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .chat { height: 70vh; }
+  .wf-row summary { grid-template-columns: minmax(0, 1fr) 70px; }
+  .wf-track { display: none; }
 }
 
 .hidden { display: none !important; }
+
+/* --- filtros, skills e contratos ------------------------------------------------------ */
+
+.filters { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
+.filters .field { min-width: 190px; }
+.contract-stats { grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); }
+a.stat { color: inherit; }
+a.stat:hover { text-decoration: none; border-color: var(--accent); }
+.stat.active { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.skill-line { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-bottom: 4px; }
+details.skill { padding: 12px 0; border-bottom: 1px solid var(--border); }
+details.skill:last-child { border-bottom: none; }
+details.skill summary { cursor: pointer; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+details.skill p { margin: 10px 0; }
+.hash { margin: 4px 0 12px; word-break: break-all; }
+table.schema { margin-top: 6px; }
+table.schema th, table.schema td { padding: 6px 8px; }
+/* nomes longos (comprometimento_renda_percentual) quebram depois de "_" (<wbr>) */
+table.schema td.mono { min-width: 10ch; }
+details.events { margin-top: 12px; }
+details.events summary { cursor: pointer; font-weight: 600; margin-bottom: 8px; }
+.badge.live .dot { animation: pulse 1.4s ease-in-out infinite; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+.msg.asks { border-color: var(--warn); background: var(--warn-soft); }
+
+/* --- waterfall de spans ---------------------------------------------------------------- */
+
+.wf { display: flex; flex-direction: column; gap: 2px; }
+.wf-row summary {
+  display: grid; grid-template-columns: minmax(160px, 34%) minmax(0, 1fr) 76px; gap: 10px; align-items: center;
+  cursor: pointer; list-style: none; padding: 3px 4px; border-radius: 6px;
+}
+.wf-row summary::-webkit-details-marker { display: none; }
+.wf-row summary:hover { background: var(--surface-2); }
+.wf-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13px; }
+.wf-kind { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-right: 6px; }
+.wf-track { position: relative; height: 14px; background: var(--surface-2); border-radius: 4px; border: 1px solid var(--border); }
+.wf-bar { position: absolute; top: 2px; bottom: 2px; min-width: 2px; border-radius: 3px; background: var(--accent); }
+.wf-row.kind-contrato .wf-bar { background: var(--info); }
+.wf-row.kind-pedido .wf-bar, .wf-row.kind-entrada_do_usuario .wf-bar { background: var(--muted); opacity: .45; }
+.wf-row.status-warn .wf-bar { background: var(--warn); }
+.wf-row.status-error .wf-bar { background: var(--danger); }
+.wf-bar.open { background: repeating-linear-gradient(45deg, var(--info), var(--info) 5px, var(--info-soft) 5px, var(--info-soft) 10px) !important; }
+.wf-ms { font-size: 12px; color: var(--muted); text-align: right; white-space: nowrap; }
+.wf-detail { padding: 4px 4px 10px; }
+.wf-detail pre, .wf-row > pre { margin-top: 6px; font-size: 11.5px; }
+.wf.compact .wf-row summary { grid-template-columns: minmax(0, 44%) minmax(0, 1fr) 58px; gap: 6px; }
+.wf.compact .wf-name { font-size: 12px; }
