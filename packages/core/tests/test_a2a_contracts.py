@@ -543,3 +543,215 @@ async def test_engine_offline_delegation_and_unknown_resume():
     assert "Risco médio." in result.answer
     missing = await engine.resume("0" * 32, "oi")
     assert missing.route == "error" and "não encontrada" in missing.error
+
+
+# --------------------------------------------------------------------------
+# regressões da revisão: ordem de eventos, pedidos de entrada e consolidação
+
+
+def _status_push(task_id: str, state: str, *, text: str = "", message_id: str | None = None):
+    status: dict = {"state": state}
+    if text:
+        status["message"] = {
+            "messageId": message_id or new_trace_id(),
+            "role": "ROLE_AGENT",
+            "parts": [{"text": text}],
+        }
+    return {"statusUpdate": {"taskId": task_id, "status": status}}
+
+
+async def _prepared(h: Harness):
+    info = await h.directory.describe(h.spec, refresh=True)
+    run_id = new_trace_id()
+    await h.manager.begin_run(RunRecord(id=run_id, profile="p", question="q"))
+    prepared = await h.manager.prepare(
+        OpenRequest(
+            run_id,
+            "p",
+            h.spec,
+            info,
+            info.skill("avaliar_risco"),
+            {"cliente": "Ana Lima", "valor": 1000},
+            "avalie",
+            60,
+        )
+    )
+    return run_id, prepared
+
+
+async def test_completed_push_before_the_response_fetches_the_whole_task():
+    # agente rápido: o push de conclusão (só status, sem artefato) chega antes da
+    # resposta do SendMessage; a saída vem da tarefa inteira (GetTask), não vira "violado"
+    h = Harness(public_url="http://router.test")
+    h.agent.push = True
+    run_id, prepared = await _prepared(h)
+    task_id = "t-rapida"
+    h.agent.tasks[task_id] = {"id": task_id, "contextId": "c", "history": []}
+    h.agent.complete(task_id, {"risco": "baixo", "score": 800})
+    done = await h.manager.apply_push(
+        prepared.contract.id,
+        prepared.push_token,
+        _status_push(task_id, "TASK_STATE_COMPLETED"),
+    )
+    assert done.state == states.COMPLETED, done.error
+    assert done.output == {"risco": "baixo", "score": 800}
+    assert done.remote_task_id == task_id
+
+
+async def test_lost_artifact_chunk_is_recovered_from_the_task():
+    h = Harness(public_url="http://router.test")
+    h.agent.push = True
+    _, contract = await h.open()
+    token = h.agent.sent[-1]["configuration"]["taskPushNotificationConfig"]["token"]
+    task_id = contract.remote_task_id
+    # primeiro pedaço (só texto) chega; o segundo, com a parte data, se perde
+    await h.manager.apply_push(
+        contract.id,
+        token,
+        {
+            "artifactUpdate": {
+                "taskId": task_id,
+                "artifact": {"artifactId": "a1", "parts": [{"text": "analisando"}]},
+            }
+        },
+    )
+    h.agent.complete(task_id, {"risco": "alto", "score": 120}, text="Risco alto.")
+    done = await h.manager.apply_push(
+        contract.id, token, _status_push(task_id, "TASK_STATE_COMPLETED")
+    )
+    assert done.state == states.COMPLETED and done.output["risco"] == "alto"
+    assert done.last_message == "Risco alto."  # a última palavra do agente é o resultado
+
+
+async def test_stale_working_snapshot_does_not_undo_an_input_request():
+    h = Harness(public_url="http://router.test")
+    h.agent.push = True
+    run_id, contract = await h.open()
+    token = h.agent.sent[-1]["configuration"]["taskPushNotificationConfig"]["token"]
+    task_id = contract.remote_task_id
+    h.agent.ask(task_id, "Qual o canal da operação?")
+    question = h.agent.tasks[task_id]["status"]["message"]["messageId"]
+    await h.manager.apply_push(
+        contract.id,
+        token,
+        _status_push(
+            task_id,
+            "TASK_STATE_INPUT_REQUIRED",
+            text="Qual o canal da operação?",
+            message_id=question,
+        ),
+    )
+    assert (await h.store.get_run(run_id)).status == "needs_input"
+    # retrato WORKING atrasado (resposta do SendMessage ou polling que saiu antes do push)
+    stale = parse_stream_event({"task": {"id": task_id, "status": {"state": "TASK_STATE_WORKING"}}})
+    await h.manager.apply_event(contract.id, stale, source="poll")
+    waiting = await h.store.get_contract(contract.id)
+    assert waiting.state == states.INPUT_REQUIRED
+    assert waiting.last_message == "Qual o canal da operação?"
+    # a resposta do usuário chega ao agente
+    forwarded = await h.manager.provide_input(run_id, "app")
+    assert [c.id for c in forwarded] == [contract.id]
+    assert h.agent.sent[-1]["message"]["parts"] == [{"text": "app"}]
+
+
+async def test_input_requests_are_told_apart_by_identity_not_by_clock():
+    h = Harness()
+    run_id, contract = await h.open()
+    task_id = contract.remote_task_id
+    h.agent.ask(task_id, "Qual o canal?")
+    await h.manager.check(await h.store.get_contract(contract.id))
+    assert (await h.store.get_run(run_id)).status == "needs_input"
+    await h.manager.provide_input(run_id, "app")
+    # o agente ainda não processou a resposta e o relógio dele está adiantado: o
+    # polling vê a MESMA pergunta com carimbo "no futuro" — não é um pedido novo
+    h.agent.tasks[task_id]["status"]["timestamp"] = "2999-01-01T00:00:00Z"
+    await h.manager.check(await h.store.get_contract(contract.id))
+    assert (await h.store.get_contract(contract.id)).state == states.ACTIVE
+    assert (await h.store.get_run(run_id)).status == "pending"
+    # pergunta nova com o relógio do agente atrasado: é um pedido novo, sim
+    h.agent.ask(task_id, "E o valor exato?")
+    h.agent.tasks[task_id]["status"]["timestamp"] = "2000-01-01T00:00:00Z"
+    await h.manager.check(await h.store.get_contract(contract.id))
+    assert (await h.store.get_contract(contract.id)).state == states.INPUT_REQUIRED
+    run = await h.store.get_run(run_id)
+    assert run.status == "needs_input" and run.answer == "E o valor exato?"
+
+
+async def test_concurrent_resumes_forward_the_answer_once():
+    h = Harness()
+    run_id, contract = await h.open()
+    h.agent.ask(contract.remote_task_id, "Qual o canal?")
+    await h.manager.check(await h.store.get_contract(contract.id))
+    first, second = await asyncio.gather(
+        h.manager.provide_input(run_id, "app"), h.manager.provide_input(run_id, "app")
+    )
+    assert sorted([len(first), len(second)]) == [0, 1]
+    replies = [s for s in h.agent.sent if s["message"]["parts"] == [{"text": "app"}]]
+    assert len(replies) == 1
+
+
+async def test_fan_out_saves_every_contract_before_sending():
+    # o primeiro agente termina na hora; o INSERT do segundo contrato demora: a
+    # execução não pode ser consolidada só com o primeiro resultado
+    class SlowStore(MemoryContractStore):
+        async def add_contract(self, contract, events):
+            if contract.skill == "b":
+                await asyncio.sleep(0.05)
+            await super().add_contract(contract, events)
+
+    skill = {
+        "description": "x",
+        "terms": {
+            "input_schema": {"type": "object", "properties": {"n": {"type": "integer"}}},
+            "output_schema": {"type": "object", "properties": {"ok": {"type": "boolean"}}},
+        },
+    }
+    agent = FakeA2AAgent(skills={"a": skill, "b": skill})
+
+    def instant(params):  # o agente conclui já na resposta do SendMessage
+        return {
+            "status": {"state": "TASK_STATE_COMPLETED"},
+            "artifacts": [{"artifactId": "r", "parts": [{"data": {"ok": True}}]}],
+        }
+
+    agent.on_send = instant
+    h = Harness(agent)
+    h.store = SlowStore()
+    h.manager.store = h.store
+    seen: list[int] = []
+
+    async def consolidator(run, contracts):
+        seen.append(len(contracts))
+        return Consolidation(f"{len(contracts)} resultado(s)")
+
+    h.manager.consolidator = consolidator
+    info = await h.directory.describe(h.spec, refresh=True)
+    run_id = new_trace_id()
+    await h.manager.begin_run(RunRecord(id=run_id, profile="p", question="q"))
+    opened = await h.manager.open_many(
+        [
+            OpenRequest(run_id, "p", h.spec, info, info.skill(name), {"n": 1}, "", 60)
+            for name in ("a", "b")
+        ]
+    )
+    assert [c.state for c in opened] == [states.COMPLETED, states.COMPLETED]
+    run = await h.manager.wait_run(run_id, 1)
+    assert run.status == "completed" and run.answer == "2 resultado(s)" and seen == [2]
+
+
+async def test_interrupted_consolidation_is_redone_and_waits_are_finite():
+    h = Harness(consolidation_timeout_s=0)
+    run_id, contract = await h.open()
+    # contrato encerrado sem a consolidação (restart no meio da chamada ao LLM)
+    current = await h.store.get_contract(contract.id)
+    current.state = states.COMPLETED
+    current.output = {"risco": "baixo", "score": 900}
+    assert await h.store.save_contract(current, [])
+    await h.store.update_run(run_id, status="consolidating")
+    # espera com timeout inválido (NaN) não trava
+    run = await asyncio.wait_for(h.manager.wait_run(run_id, float("nan")), 1.0)
+    assert run.status == "consolidating"
+    await h.manager.recover()
+    run = await h.store.get_run(run_id)
+    assert run.status == "completed" and "900" in run.answer
+    assert run_id not in h.manager._run_events  # execução encerrada não fica na memória

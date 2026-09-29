@@ -23,6 +23,7 @@
     <label for="f-state">Estado</label>
     <select id="f-state" name="state">
       <option value="">todos</option>
+      <option value="abertos" {% if filters.state == 'abertos' %}selected{% endif %}>em aberto (todos)</option>
       {% for st in contract_states %}<option value="{{ st }}" {% if filters.state == st %}selected{% endif %}>{{ contract_labels[st] }}</option>{% endfor %}
     </select>
   </div>

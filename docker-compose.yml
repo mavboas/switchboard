@@ -98,7 +98,7 @@ services:
       SWITCHBOARD_ALLOWED_HOSTS: ${SWITCHBOARD_ALLOWED_HOSTS:-localhost,127.0.0.1,[::1],router}
       SWITCHBOARD_DEFAULT_PROFILE: ${SWITCHBOARD_DEFAULT_PROFILE:-default}
       # URL pela qual os agentes A2A alcançam o router (push notifications em /a2a/push/...)
-      SWITCHBOARD_PUBLIC_URL: ${SWITCHBOARD_PUBLIC_URL:-http://router:8080}
+      SWITCHBOARD_PUBLIC_URL: ${SWITCHBOARD_PUBLIC_URL-http://router:8080}  # vazio no .env = só polling
       # hosts aceitos em callback_url (webhook do cliente quando uma execução termina)
       SWITCHBOARD_CALLBACK_HOSTS: ${SWITCHBOARD_CALLBACK_HOSTS:-}
     ports:

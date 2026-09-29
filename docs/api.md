@@ -25,7 +25,7 @@ Autenticação opcional: com `SWITCHBOARD_API_KEYS` definida, envie `Authorizati
 | `profile` | roteador (padrão: `SWITCHBOARD_DEFAULT_PROFILE`) |
 | `wait_s` | quanto esperar os agentes A2A antes de responder `pending` (padrão: o do roteador; teto `SWITCHBOARD_MAX_WAIT_S`) |
 | `run_id` | continua uma execução em `needs_input`: a mensagem vai para o agente que perguntou, na mesma tarefa e sob o mesmo contrato |
-| `callback_url` | webhook chamado (POST) com o resultado final de uma execução em segundo plano; só hosts de `SWITCHBOARD_CALLBACK_HOSTS` |
+| `callback_url` | webhook (POST com a execução e o resumo dos contratos) chamado quando a execução de uma delegação termina (`completed`/`failed`) ou para esperando o usuário (`needs_input`) — também se isso acontecer dentro da espera do pedido; só hosts de `SWITCHBOARD_CALLBACK_HOSTS` |
 
 Resposta de uma **tool MCP** (`200`):
 
@@ -89,7 +89,7 @@ Resposta de uma **delegação** que passou da espera (`202`):
 | Método e caminho | Descrição |
 |---|---|
 | `GET /v1/runs/{id}` | a execução completa: estado, resposta, tarefas, spans e os contratos com termos, entrada, saída e eventos |
-| `GET /v1/runs/{id}/events` | SSE: `event: run` a cada mudança (estado, resposta ou contratos), `event: done` no fim, `event: timeout` depois de 15 min; comentários `: ping` mantêm a conexão viva |
+| `GET /v1/runs/{id}/events` | SSE: `event: run` a cada mudança (estado, resposta ou contratos), `event: done` quando termina (`completed`/`failed`), `event: timeout` depois de 15 min; comentários `: ping` mantêm a conexão viva. Em `needs_input` a conexão continua aberta: o `run` traz a pergunta, e o stream segue depois da resposta |
 | `POST /v1/runs/{id}/cancel` | cancela os contratos abertos (`CancelTask` nos agentes) e devolve os cancelados |
 
 Fluxo típico de um cliente:
@@ -99,9 +99,9 @@ RUN=$(curl -s localhost:8080/v1/chat -H 'Content-Type: application/json' \
   -d '{"message": "Analise uma proposta de crédito de 800 mil para João Lima em 120 meses com renda de 60 mil"}' \
   | python3 -c 'import sys, json; print(json.load(sys.stdin)["run_id"])')
 
-curl -N localhost:8080/v1/runs/$RUN/events            # acompanha até needs_input ou done
+curl -N localhost:8080/v1/runs/$RUN/events   # eventos 'run'; num deles, status needs_input e a pergunta em answer
 
-# o agente perguntou (needs_input): a resposta segue para ele, sob o mesmo contrato
+# o agente perguntou (needs_input): a resposta segue para ele, sob o mesmo contrato (o SSE continua até done)
 curl -s localhost:8080/v1/chat -H 'Content-Type: application/json' \
   -d "{\"run_id\": \"$RUN\", \"message\": \"sim, um imóvel\"}"
 ```
@@ -191,6 +191,6 @@ curl -s -X POST localhost:8000/api/profiles -H 'Content-Type: application/json' 
 | `SWITCHBOARD_MAX_UPLOAD_MB` | console | `20` | limite por arquivo enviado |
 | `TYPESAFE_API_KEY`, `OPENAI_API_KEY`… | ambos | vazio | chaves dos provedores, referenciadas como `env:NOME` no cadastro dos modelos |
 
-Agentes de exemplo (`switchboard-agent`): `AGENT_PUBLIC_URL` (URL que vai no Agent Card), `AGENT_PUSH_HOSTS` (hosts aceitos nas URLs de push, separados por vírgula), `ANALISE_DELAY_S` (padrão 12) e `RISCO_DELAY_S` (padrão 2).
+Agentes de exemplo (`switchboard-agent`): `AGENT_PUBLIC_URL` (URL que vai no Agent Card), `AGENT_PUSH_HOSTS` (destinos aceitos nas URLs de push — `host` ou `host:porta`, separados por vírgula; padrão: a própria máquina; `*` libera qualquer um), `AGENT_TOKENS` (tokens aceitos em `Authorization: Bearer` no JSON-RPC; vazio = aberto), `ANALISE_DELAY_S` (padrão 12) e `RISCO_DELAY_S` (padrão 2).
 
 No `docker-compose.yml` também valem `CONSOLE_BIND`, `ROUTER_BIND` e `AGENTS_BIND` (padrão `127.0.0.1`) e `CONSOLE_PORT`/`ROUTER_PORT`.

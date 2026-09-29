@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% from "_macros.html" import route_badge, run_badge, state_badge, kind_badge %}
 {% block title %}Execução {{ trace.trace_id[:8] }}{% endblock %}
-{% block head %}{% if running %}<meta http-equiv="refresh" content="3">{% endif %}{% endblock %}
+{% block head %}{% if refresh_s %}<meta name="sb-autorefresh" content="{{ refresh_s }}">{% endif %}{% endblock %}
 {% block content %}
 <div class="page-head">
   <div>
@@ -9,7 +9,7 @@
     <h1>Execução <span class="mono">{{ trace.trace_id[:12] }}</span> {{ route_badge(trace.route) }} {{ run_badge(trace.status) }}</h1>
     <p>{{ trace.created_at|datetime }} · roteador <strong>{{ trace.profile }}</strong> · {{ trace.latency_ms|ms }} até a primeira resposta
       {% if trace.finished_at %}· encerrada em {{ trace.finished_at|datetime }}{% endif %}
-      {% if running %}<span class="badge info live"><span class="dot"></span>atualizando a cada 3 s</span>{% endif %}</p>
+      {% if refresh_s %}<span class="badge info live" id="autorefresh"><span class="dot"></span>atualizando a cada {{ refresh_s }} s</span>{% endif %}</p>
   </div>
   <div class="actions">
     {% if running and trace.contracts %}
@@ -123,3 +123,4 @@
 </div>
 {% endif %}
 {% endblock %}
+{% block scripts %}{% if refresh_s %}<script src="{{ url_for('static', path='app.js') }}?v={{ version }}"></script>{% endif %}{% endblock %}

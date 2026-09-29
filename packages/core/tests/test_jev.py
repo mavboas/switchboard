@@ -277,6 +277,24 @@ async def test_jev_missing_parameter_becomes_clarify_without_llm_invention(catal
     assert any("descartei b" in w for w in result.warnings)
 
 
+async def test_guarded_parameter_is_not_reinvented_when_the_profile_does_not_ask(catalog):
+    # sem perguntas no perfil, escalar para o LLM traria b de volta (inventado);
+    # o roteador diz o que falta e não chama a tool
+    jev = scripted_jev(route_script("calc/somar", stated_1=0.03))
+    chat = ScriptedChat(
+        [
+            '{"arguments": {"a": 3, "b": 7}}',
+            '{"action": "tool", "connector": "calc", "tool": "somar", "arguments": {"a": 3, "b": 7}}',
+        ]
+    )
+    engine = RouterEngine(_profile(allow_clarify=False), chat=chat, connectors=catalog, jev=jev)
+    result = await engine.handle("some 3 com outro número")
+    assert result.route == "direct" and result.decided_by == "jev"
+    assert result.answer.startswith("Para seguir com isso, preciso de:")
+    assert "segunda parcela da soma" in result.answer
+    assert result.tool is None and len(chat.calls) == 1  # o LLM só extraiu os argumentos
+
+
 async def test_low_confidence_escalates_to_llm(catalog):
     jev = scripted_jev(route_script("calc/somar", confidence=0.3))
     chat = ScriptedChat(['{"action": "answer", "answer": "Posso ajudar com somas e câmbio."}'])

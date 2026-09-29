@@ -94,6 +94,8 @@ class ContractRecord:
     finished_at: datetime | None = None
     next_check_at: datetime | None = None
     input_sent_at: datetime | None = None
+    question: str | None = None  # identidade do pedido de entrada em aberto
+    answered_questions: list[str] = field(default_factory=list)  # já respondidos pelo usuário
     checks: int = 0
     last_message: str = ""
     error: str | None = None

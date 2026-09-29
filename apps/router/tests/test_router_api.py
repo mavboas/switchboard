@@ -73,6 +73,7 @@ def make_client(
     )
     runtime.contracts.poll_min_s = 0.05
     app = create_app(settings, runtime=runtime)
+    app.state.test_transport = transport  # os testes leem o que foi enviado aos agentes
     transport.mount("router.test", app)
     return TestClient(app)
 
@@ -290,16 +291,39 @@ def test_push_endpoint_requires_the_contract_token(database):
             == 401
         )
         assert client.post("/a2a/push/ctr_nao_existe", json=event).status_code == 404
+        # sem o token, o corpo nem é lido: 401 antes do parse e do limite de tamanho
+        big = b'{"x": "' + b"a" * 2_000_000 + b'"}'
+        assert client.post(f"/a2a/push/{contract_id}", content=big).status_code == 401
+        # com o token do contrato (o que o router mandou ao agente no SendMessage)
+        sent = [
+            json.loads(r.content)
+            for r in client.app.state.test_transport.sent
+            if r.url.host == "analise.test" and r.method == "POST"
+        ]
+        [config] = [
+            m["params"]["configuration"]["taskPushNotificationConfig"]
+            for m in sent
+            if m.get("method") == "SendMessage"
+        ]
+        auth = {"X-A2A-Notification-Token": config["token"]}
         assert (
             client.post(
                 f"/a2a/push/{contract_id}",
                 content=b"{",
-                headers={"content-type": "application/json"},
+                headers={**auth, "content-type": "application/json"},
             ).status_code
             == 400
         )
-        big = b'{"x": "' + b"a" * 2_000_000 + b'"}'
-        assert client.post(f"/a2a/push/{contract_id}", content=big).status_code == 413
+        assert client.post(f"/a2a/push/{contract_id}", content=big, headers=auth).status_code == 413
+
+        def chunked():  # sem Content-Length: o teto vale durante a leitura
+            for _ in range(40):
+                yield b"a" * 65536
+
+        assert (
+            client.post(f"/a2a/push/{contract_id}", content=chunked(), headers=auth).status_code
+            == 413
+        )
         client.post(f"/v1/runs/{body['run_id']}/cancel")
 
 

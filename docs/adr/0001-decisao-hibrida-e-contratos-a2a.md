@@ -54,14 +54,14 @@ Os termos viajam como extensão A2A (`urn:switchboard:a2a:contract:v1`): o agent
 ### 4. Delegação assíncrona: espera curta + segundo plano
 
 - O pedido abre os contratos e espera até `wait_s` (padrão 8 s, configurável por perfil e por pedido). Se todos terminam a tempo, a resposta consolidada volta na hora, como antes.
-- Senão, volta `status: "pending"` (HTTP 202 na API nativa; 200 com o campo `switchboard.status` no endpoint compatível com OpenAI) com uma resposta provisória e o `run_id`. O resultado final chega por `GET /v1/runs/{id}`, por SSE (`GET /v1/runs/{id}/events`) ou por webhook (`callback_url`, restrito a hosts liberados).
+- Senão, volta `status: "pending"` (HTTP 202 na API nativa; 200 com o campo `switchboard.status` no endpoint compatível com OpenAI) com uma resposta provisória e o `run_id`. O resultado final chega por `GET /v1/runs/{id}`, por SSE (`GET /v1/runs/{id}/events`) ou por webhook (`callback_url`, restrito a hosts liberados e chamado também quando a execução para em `needs_input`).
 - Quando o último contrato de uma execução termina (push, polling ou prazo), o roteador **consolida** os resultados com o LLM (ou por modelo de texto, se offline) e grava a resposta final. A consolidação é atômica no banco, então vários processos do router podem receber os eventos.
-- Um supervisor por processo retoma contratos abertos depois de reiniciar, faz polling de quem não suporta push (ou ficou em silêncio) e expira contratos vencidos com `CancelTask`.
+- Um supervisor por processo retoma contratos abertos depois de reiniciar, faz polling de quem não suporta push (ou ficou em silêncio), expira contratos vencidos com `CancelTask` e revisita periodicamente as execuções abertas (consolidações perdidas ou interrompidas).
 - Se o agente pede informação (`TASK_STATE_INPUT_REQUIRED`), a execução fica `needs_input` e a pergunta volta ao usuário; a resposta dele segue para o mesmo agente, na mesma tarefa e sob o mesmo contrato (`run_id` no pedido seguinte).
 
 ### 5. Observabilidade: cada spawn é um span
 
-- Cada execução vira uma árvore de **spans** (`pedido` → `rag`, `descoberta`, `decisao` → `jev`/`llm`, `tool_mcp`, `delegacao` → `contrato: agente/skill` (um por spawn), `espera`, `consolidacao`; e `entrada_do_usuario` quando o usuário responde a um agente), com início, fim, status e atributos. O span do contrato fica aberto até o estado terminal e carrega a linha do tempo dos eventos do agente (aceite, progresso, artefatos, pedidos de entrada).
+- Cada execução vira uma árvore de **spans** (`pedido` → `rag`, `descoberta`, `decisao` → `jev`/`llm`, `tool_mcp`, `delegacao` → `contrato: agente/skill` (um por spawn), `espera`, `consolidacao`; e `entrada_do_usuario` quando o usuário responde a um agente), com início, fim, status e atributos. O span do contrato fica aberto até o estado terminal e aponta para o contrato, que guarda a linha do tempo dos eventos do agente (aceite, progresso, artefatos, pedidos de entrada).
 - O console mostra a cascata (waterfall) de cada execução, a página **Contratos** lista todos os spawns com estado e prazo, e as execuções pendentes se atualizam sozinhas.
 - O `trace_id` segue o formato W3C e vai para os agentes no cabeçalho `traceparent` (e na `metadata` do pedido A2A), para correlacionar com o tracing do lado deles.
 

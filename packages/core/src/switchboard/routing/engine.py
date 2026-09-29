@@ -476,15 +476,18 @@ class RouterEngine:
         )
         await self.contracts.begin_run(run)
         with recorder.span("delegacao", "delegacao", tarefas=len(decision.tasks)) as span:
-
-            async def open_one(task) -> ContractRecord | str:
+            problems: list[str] = []
+            requests: list[tuple[str, OpenRequest]] = []
+            for task in decision.tasks:
                 agent_spec = self.profile.agent(task.owner)
                 info = by_name.get(task.owner)
                 skill = info.skill(task.name) if info else None
                 if agent_spec is None or info is None or skill is None:
-                    return f"{task.key}: agente ou skill fora do perfil"
-                try:
-                    return await self.contracts.open(
+                    problems.append(f"{task.key}: agente ou skill fora do perfil")
+                    continue
+                requests.append(
+                    (
+                        task.key,
                         OpenRequest(
                             run_id=result.trace_id,
                             profile=spec.name,
@@ -495,14 +498,17 @@ class RouterEngine:
                             instruction=task.instruction or question,
                             deadline_s=spec.deadline_s,
                             parent_span_id=span.id,
-                        )
+                        ),
                     )
-                except ContractError as exc:
-                    return f"{task.key}: {exc}"
-
-            opened = await asyncio.gather(*(open_one(t) for t in decision.tasks))
-            contracts = [c for c in opened if isinstance(c, ContractRecord)]
-            problems = [p for p in opened if isinstance(p, str)]
+                )
+            # todos os contratos são gravados antes do primeiro envio (fan-out sem corrida)
+            opened = await self.contracts.open_many([req for _, req in requests])
+            contracts: list[ContractRecord] = []
+            for (key, _), item in zip(requests, opened, strict=True):
+                if isinstance(item, ContractError):
+                    problems.append(f"{key}: {item}")
+                else:
+                    contracts.append(item)
             span.attributes["contratos"] = [c.summary() for c in contracts]
             if problems:
                 span.status = "warn"
@@ -582,6 +588,11 @@ class RouterEngine:
             with recorder.span("entrada", "entrada", texto=truncate(text, 500)) as span:
                 updated = await self.contracts.provide_input(run_id, text)
                 span.attributes["contratos"] = [c.summary() for c in updated]
+                if not updated:
+                    span.status = "warn"
+                    result.warnings.append(
+                        "nenhum contrato aguardava esta resposta (já entregue por outro pedido?)"
+                    )
             await self._await_run(result, recorder, wait_s, run.answer)
         recorder.close("error" if result.route == "error" else "ok", execucao=result.status)
         result.spans = recorder.to_list()

@@ -17,6 +17,22 @@
     return node;
   }
 
+  // execução ou contrato em andamento: a página se atualiza sozinha, mas não
+  // enquanto um span/evento está aberto (a leitura não é interrompida)
+  const autorefresh = document.querySelector('meta[name="sb-autorefresh"]');
+  if (autorefresh) {
+    const every = Math.max(Number(autorefresh.content) || 3, 1) * 1000;
+    const badge = document.getElementById("autorefresh");
+    const label = badge ? badge.lastChild.textContent : "";
+    const openByDefault = new Set(document.querySelectorAll("details[open]"));
+    setInterval(() => {
+      // só o que o usuário abriu pausa (os eventos de um contrato aberto já vêm abertos)
+      const reading = [...document.querySelectorAll("details[open]")].some((d) => !openByDefault.has(d));
+      if (badge) badge.lastChild.textContent = reading ? "pausado enquanto você lê um detalhe" : label;
+      if (!document.hidden && !reading) window.location.reload();
+    }, every);
+  }
+
   const ROUTES = {
     direct: "Resposta direta",
     tool: "Tool MCP",
@@ -207,6 +223,8 @@
     let generation = 0; // invalida acompanhamentos de uma conversa anterior
     let selectedRun = null;
     const latest = new Map(); // run_id -> dados mais recentes
+    const polling = new Set(); // execuções com um acompanhamento ativo (um por execução)
+    const finished = new Set(); // execuções cuja resposta final já está na conversa
 
     function scroll() {
       messagesBox.scrollTop = messagesBox.scrollHeight;
@@ -224,6 +242,7 @@
       awaitingRun = null;
       selectedRun = null;
       latest.clear();
+      finished.clear();
       messagesBox.innerHTML = "";
       renderTrace(null);
       setPlaceholder();
@@ -291,7 +310,7 @@
             text: "cancelar",
             onclick: async () => {
               await fetch("/playground/runs/" + runId + "/cancel", { method: "POST" });
-              refresh(runId, generation, true);
+              refresh(runId, generation); // o acompanhamento que já existe pega o estado final
             },
           })
         );
@@ -373,40 +392,75 @@
       if (selectedRun === runId) renderTrace(latest.get(runId));
     }
 
-    // acompanha uma execução em andamento até concluir, falhar ou um agente pedir informação
-    async function refresh(runId, gen, once) {
-      let delay = 1000;
-      while (gen === generation) {
-        let data;
-        try {
-          const resp = await fetch("/playground/runs/" + runId);
-          data = await resp.json();
-          if (!resp.ok) throw new Error(typeof data.error === "string" ? data.error : pretty(data.error));
-        } catch (err) {
-          if (once) return;
-          await new Promise((r) => setTimeout(r, Math.min(delay * 2, 5000)));
-          continue;
-        }
-        if (gen !== generation) return;
-        remember(data);
-        if (data.status === "completed" || data.status === "failed") {
-          const extra = data.status === "failed" ? "error" : "";
-          assistantBubble(data, data.answer || "(sem resposta)", extra);
-          history.push({ role: "assistant", content: data.answer || "" });
-          return;
-        }
-        if (data.status === "needs_input") {
-          if (awaitingRun !== runId) {
-            awaitingRun = runId;
-            setPlaceholder();
-            assistantBubble(data, data.answer || "O agente precisa de uma informação para continuar.", "asks");
-            history.push({ role: "assistant", content: data.answer || "" });
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    // resposta final de uma execução: entra uma vez só na conversa
+    function finish(runId, data) {
+      if (awaitingRun === runId) {
+        awaitingRun = null; // a execução acabou: a próxima mensagem é uma conversa nova
+        setPlaceholder();
+      }
+      if (finished.has(runId)) return;
+      finished.add(runId);
+      assistantBubble(data, data.answer || "(sem resposta)", data.status === "failed" ? "error" : "");
+      history.push({ role: "assistant", content: data.answer || "" });
+    }
+
+    // acompanha uma execução até concluir ou falhar. Enquanto um agente espera
+    // informação, segue olhando devagar: o prazo pode vencer ou alguém cancelar.
+    async function refresh(runId, gen) {
+      if (polling.has(runId)) return;
+      polling.add(runId);
+      try {
+        let delay = 1000;
+        let failures = 0;
+        while (gen === generation) {
+          let data;
+          try {
+            const resp = await fetch("/playground/runs/" + runId);
+            data = await resp.json().catch(() => ({}));
+            if (resp.status === 404) {
+              if (awaitingRun === runId) {
+                awaitingRun = null;
+                setPlaceholder();
+              }
+              addBubble("assistant", "Não encontrei mais essa execução (o router pode ter reiniciado).", "error");
+              return;
+            }
+            if (!resp.ok) throw new Error(typeof data.error === "string" ? data.error : "HTTP " + resp.status);
+            failures = 0;
+          } catch (err) {
+            failures += 1;
+            if (failures >= 8) {
+              addBubble("assistant", "Parei de acompanhar a execução: " + err.message, "error");
+              return;
+            }
+            await sleep(Math.min(1000 * 2 ** failures, 30000));
+            continue;
           }
-          return;
+          if (gen !== generation) return;
+          remember(data);
+          if (data.status === "completed" || data.status === "failed") {
+            finish(runId, data);
+            return;
+          }
+          if (data.status === "needs_input") {
+            if (awaitingRun !== runId) {
+              awaitingRun = runId;
+              setPlaceholder();
+              assistantBubble(data, data.answer || "O agente precisa de uma informação para continuar.", "asks");
+              history.push({ role: "assistant", content: data.answer || "" });
+            }
+            await sleep(5000);
+            continue;
+          }
+          await sleep(delay);
+          delay = Math.min(delay * 1.3, 3000);
         }
-        if (once) return;
-        await new Promise((r) => setTimeout(r, delay));
-        delay = Math.min(delay * 1.3, 3000);
+      } finally {
+        polling.delete(runId);
       }
     }
 
@@ -448,10 +502,16 @@
           awaitingRun = runId;
           setPlaceholder();
         }
-        const bubble = assistantBubble(data, data.answer, data.status === "needs_input" ? "asks" : data.status === "failed" ? "error" : "");
-        history.push({ role: "assistant", content: data.answer });
-        select(bubble, runId);
-        if (OPEN_RUN.includes(data.status)) refresh(runId, gen, false);
+        const final = data.status === "completed" || data.status === "failed";
+        if (final && finished.has(runId)) {
+          select(messagesBox.lastElementChild, runId); // o acompanhamento já mostrou o resultado
+        } else {
+          if (final) finished.add(runId);
+          const bubble = assistantBubble(data, data.answer, data.status === "needs_input" ? "asks" : data.status === "failed" ? "error" : "");
+          history.push({ role: "assistant", content: data.answer });
+          select(bubble, runId);
+        }
+        if (OPEN_RUN.includes(data.status) || data.status === "needs_input") refresh(runId, gen);
       } catch (err) {
         history.pop();
         pending.className = "msg assistant error";

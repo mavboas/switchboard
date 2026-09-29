@@ -325,6 +325,8 @@ class Contract(Base):
     next_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     input_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    question: Mapped[str | None] = mapped_column(Text)
+    answered_questions: Mapped[list[str] | None] = mapped_column(JSON)
     checks: Mapped[int] = mapped_column(Integer, default=0)
     last_message: Mapped[str] = mapped_column(Text, default="")
     error: Mapped[str | None] = mapped_column(Text)

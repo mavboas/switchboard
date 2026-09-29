@@ -16,7 +16,7 @@ from switchboard.routing.args import (
     validate_arguments,
 )
 from switchboard.routing.capabilities import INSTRUCTION_SCHEMA, capabilities
-from switchboard.routing.deciders import HeuristicDecider, is_question
+from switchboard.routing.deciders import HeuristicDecider, assistant_asked, is_question
 from switchboard.routing.decision import (
     DecisionError,
     clarify_for_missing,
@@ -438,3 +438,43 @@ async def test_heuristic_questions_with_weak_matches_go_to_the_knowledge_base(te
 )
 def test_is_question(text, expected):
     assert is_question(text) is expected
+
+
+async def test_follow_up_joins_the_previous_request_only_after_a_question():
+    tool = ToolInfo(
+        "abrir_chamado",
+        "Abre um chamado de suporte",
+        {
+            "type": "object",
+            "properties": {"descricao": {"type": "string", "description": "Descrição do problema"}},
+            "required": ["descricao"],
+        },
+    )
+    caps = capabilities(
+        [ConnectorInfo("chamados", "Chamados", "http://c", "online", tools=[tool])], []
+    )
+    hits = [Hit("c1", "manual", "Manual", "Atendemos aos sábados das 9h às 14h.", 0.4)]
+    asked = [
+        Message("user", "Quero abrir um chamado"),
+        Message(
+            "assistant",
+            "Consigo ajudar com isso, mas preciso de: descrição do problema. Pode me informar?",
+        ),
+        Message("user", "o aplicativo fecha sozinho quando faço login"),
+    ]
+    assert assistant_asked(asked)
+    decision, _ = await HeuristicDecider().decide(
+        profile=ProfileSpec(model="offline"), messages=asked, caps=caps, hits=hits
+    )
+    assert decision.action == "tool" and decision.tasks[0].name == "abrir_chamado"
+    # sem pergunta no meio (ex.: a conversa anterior foi cancelada), é assunto novo
+    moved_on = [
+        Message("user", "Quero abrir um chamado"),
+        Message("assistant", "chamados (abrir_chamado): cancelado."),
+        Message("user", "Qual o horário de atendimento aos sábados"),
+    ]
+    assert not assistant_asked(moved_on)
+    decision, _ = await HeuristicDecider().decide(
+        profile=ProfileSpec(model="offline"), messages=moved_on, caps=caps, hits=hits
+    )
+    assert decision.action == "answer" and "9h às 14h" in decision.answer

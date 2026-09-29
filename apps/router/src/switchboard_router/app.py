@@ -25,6 +25,7 @@ import contextlib
 import hmac
 import json
 import logging
+import math
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -212,7 +213,9 @@ def create_app(settings: Settings | None = None, runtime: Runtime | None = None)
         return url
 
     def wait_budget(wait_s: float | None) -> float | None:
-        return None if wait_s is None else min(max(wait_s, 0.0), settings.max_wait_s)
+        if wait_s is None or not math.isfinite(wait_s):  # NaN/inf (JSON aceita NaN) = padrão
+            return None
+        return min(max(wait_s, 0.0), settings.max_wait_s)
 
     def log_result(result: RouterResult) -> None:
         log.info(
@@ -488,20 +491,28 @@ def create_app(settings: Settings | None = None, runtime: Runtime | None = None)
     @app.post("/a2a/push/{contract_id}", tags=["a2a"])
     async def a2a_push(contract_id: str, request: Request, runtime: Runtime = Depends(rt)):
         """Recebe um ``StreamResponse`` A2A; autenticado pelo token exclusivo do contrato."""
+        token = request.headers.get(NOTIFICATION_TOKEN_HEADER)
+        try:
+            # o token é conferido antes de ler o corpo: sem ele, nada é bufferizado
+            await runtime.contracts.authorize_push(contract_id, token)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail="contrato não encontrado") from exc
+        except PushRejected as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
         declared = request.headers.get("content-length")
         if declared and declared.isdigit() and int(declared) > settings.max_push_bytes:
             raise HTTPException(status_code=413, detail="notificação grande demais")
-        raw = await request.body()
-        if len(raw) > settings.max_push_bytes:
-            raise HTTPException(status_code=413, detail="notificação grande demais")
+        raw = bytearray()
+        async for chunk in request.stream():  # corpo sem Content-Length (chunked) também tem teto
+            raw.extend(chunk)
+            if len(raw) > settings.max_push_bytes:
+                raise HTTPException(status_code=413, detail="notificação grande demais")
         try:
             payload = json.loads(raw)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail="corpo não é JSON") from exc
         try:
-            contract = await runtime.contracts.apply_push(
-                contract_id, request.headers.get(NOTIFICATION_TOKEN_HEADER), payload
-            )
+            contract = await runtime.contracts.apply_push(contract_id, token, payload)
         except LookupError as exc:
             raise HTTPException(status_code=404, detail="contrato não encontrado") from exc
         except PushRejected as exc:

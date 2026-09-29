@@ -134,7 +134,7 @@ proposto ──► ativo ◄──► aguardando_entrada
 | `expirado` | o prazo venceu — o roteador manda `CancelTask` |
 | `violado` | o agente quebrou o contrato: saída fora do `output_schema`, sem a parte `data` exigida ou resposta de protocolo inválida |
 
-Nada sai de um estado terminal: eventos que chegam depois (um push atrasado, por exemplo) são registrados e ignorados, assim como eventos de outra tarefa. Cada mudança vira um evento do contrato (`state`, `message`, `artifact`, `note`, `violation`) com a origem — `router`, `response`, `push` ou `poll` — e o console mostra essa linha do tempo.
+Nada sai de um estado terminal: eventos que chegam depois (um push atrasado, por exemplo) são registrados e ignorados, assim como eventos de outra tarefa. Como push, resposta do `SendMessage` e polling chegam fora de ordem, o roteador também aplica duas regras: `aguardando_entrada` só volta a `ativo` pela resposta do usuário (um `WORKING` atrasado não desfaz o pedido de entrada), e um `INPUT_REQUIRED` com a mesma pergunta que o usuário já respondeu — identificada pelo `messageId` da mensagem de status (ou, sem ele, pelo carimbo de tempo) — é um retrato antigo, não um pedido novo. Uma conclusão recebida por push sem a tarefa inteira faz o roteador buscar a tarefa (`GetTask`) antes de validar a saída. Cada mudança vira um evento do contrato (`state`, `message`, `artifact`, `note`, `violation`) com a origem — `router`, `response`, `push` ou `poll` — e o console mostra essa linha do tempo.
 
 Quando o último contrato de uma execução chega a um estado final, a execução é **consolidada** uma única vez (a troca de estado no banco é condicional, então vários processos do router podem receber eventos ao mesmo tempo) e quem espera — o pedido original, `GET /v1/runs/{id}`, o SSE e o `callback_url` — recebe a resposta final.
 
@@ -148,8 +148,12 @@ from switchboard_agentkit import ContractAgent, SkillContext, SkillFailed, Skill
 agent = ContractAgent(
     name="cambio",
     description="Cotações e câmbio para clientes.",
-    url="http://localhost:8301",  # URL pública: vai no card como endpoint JSON-RPC
-    push_hosts=["localhost", "router"],  # hosts aceitos nas URLs de push (None = qualquer um)
+    # URL pública: vai no card como endpoint JSON-RPC
+    url="http://localhost:8301",
+    # destinos aceitos nas URLs de push: host ou host:porta (None = qualquer um)
+    push_hosts=["localhost", "router:8080"],
+    # opcional: exige este Bearer no JSON-RPC (o card continua público)
+    auth_tokens=["token-do-roteador"],
 )
 
 
@@ -194,6 +198,7 @@ if __name__ == "__main__":
 - `ctx.require_input(pergunta)` põe a tarefa em `INPUT_REQUIRED`. Quando a resposta chega (mesma tarefa), a skill roda de novo com as respostas em `ctx.replies`.
 - `SkillFailed(motivo)` termina a tarefa como `FAILED`; exceções inesperadas também, com a mensagem do erro.
 - `ContractAgent(require_contract=False)` aceita tarefas sem os termos (clientes A2A que não conhecem a extensão).
+- `auth_tokens` exige o token que o roteador envia (`auth_token` no cadastro do agente, de preferência `env:A2A_…`); `push_hosts` limita para onde o agente manda push notifications. Os agentes de exemplo leem `AGENT_TOKENS` e `AGENT_PUSH_HOSTS` (padrão: só a própria máquina).
 
 Os agentes de exemplo em [examples/agents](../examples/agents/src/switchboard_agents) — `analise-credito` (tarefa longa que pede garantia acima de R$ 500 mil) e `risco` — são implementações completas.
 

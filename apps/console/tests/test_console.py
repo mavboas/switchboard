@@ -414,7 +414,7 @@ def test_playground_tool_call_and_trace(db_url):
         detail = client.get(f"/traces/{trace_id}").text
         assert "tool: credito/simular_financiamento" in detail and "Simulação Price" in detail
         assert (
-            'class="wf-row' in detail and "http-equiv" not in detail
+            'class="wf-row' in detail and "sb-autorefresh" not in detail
         )  # concluída: sem auto refresh
 
 
@@ -439,7 +439,9 @@ def test_playground_delegation_runs_in_background_and_is_consolidated(db_url):
         run_id = body["run_id"]
 
         live = client.get(f"/traces/{run_id}").text
-        assert "http-equiv" in live and "analise-credito/analisar_proposta" in live  # auto refresh
+        # em andamento: a página se atualiza sozinha (pausa com um detalhe aberto)
+        assert 'name="sb-autorefresh" content="3"' in live and "app.js" in live
+        assert "analise-credito/analisar_proposta" in live
 
         done = _wait_run(client, run_id, ("completed", "failed"))
         assert done["status"] == "completed" and "analise-credito" in done["answer"]
@@ -450,7 +452,9 @@ def test_playground_delegation_runs_in_background_and_is_consolidated(db_url):
         assert {"pedido", "decisao", "delegacao", "contrato", "consolidacao"} <= kinds
 
         page = client.get(f"/traces/{run_id}").text
-        assert "http-equiv" not in page and "contrato: analise-credito/analisar_proposta" in page
+        assert (
+            "sb-autorefresh" not in page and "contrato: analise-credito/analisar_proposta" in page
+        )
         assert "consolidacao" in page and "Eventos de" in page
 
         contracts = client.get("/contracts").text
@@ -475,7 +479,13 @@ def test_playground_answers_an_agent_that_needs_input(db_url):
         run_id = first["run_id"]
         asked = _wait_run(client, run_id, ("needs_input", "completed", "failed"))
         assert asked["status"] == "needs_input" and "garantia" in asked["answer"]
-        assert client.get("/").status_code == 200  # painel mostra a execução aguardando entrada
+        # o painel mostra a execução aguardando entrada, e os links levam a listas que a incluem
+        dashboard = client.get("/").text
+        assert "/contracts?state=abertos" in dashboard and "/traces?status=abertas" in dashboard
+        assert run_id in client.get("/traces?status=abertas").text
+        assert "aguardando entrada" in client.get("/contracts?state=abertos").text
+        waiting_page = client.get(f"/traces/{run_id}").text  # esperando o usuário: devagar
+        assert 'name="sb-autorefresh" content="15"' in waiting_page
 
         history += [
             {"role": "assistant", "content": asked["answer"]},

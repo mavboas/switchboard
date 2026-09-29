@@ -25,7 +25,8 @@ import asyncio
 import contextlib
 import json
 import logging
-from collections.abc import Awaitable, Callable, Mapping
+import math
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -34,12 +35,12 @@ import httpx
 
 from ..a2a.client import A2AClient
 from ..a2a.protocol import (
+    TERMINAL_TASK_STATES,
     StreamEvent,
     data_part,
     merge_artifact,
     new_message,
     parse_stream_event,
-    parse_timestamp,
     parts_data,
     parts_text,
     text_part,
@@ -94,6 +95,15 @@ class OpenRequest:
     instruction: str
     deadline_s: float
     parent_span_id: str | None = None
+
+
+@dataclass
+class PreparedContract:
+    """Contrato já gravado (``proposto``) e ainda não enviado ao agente."""
+
+    contract: ContractRecord
+    request: OpenRequest
+    push_token: str | None = None
 
 
 @dataclass
@@ -153,6 +163,21 @@ def input_question(contracts: list[ContractRecord]) -> str:
     return "\n".join(lines)
 
 
+def question_key(event: StreamEvent) -> str:
+    """Identidade de um pedido de entrada do agente.
+
+    O id da mensagem de status (cada pergunta é uma mensagem nova); sem ele, o
+    carimbo de tempo do status; sem os dois, o texto. Um retrato antigo da
+    mesma pergunta tem a mesma identidade, então não reabre o que o usuário já
+    respondeu — sem depender do relógio do agente bater com o do roteador.
+    """
+    if event.status_message_id:
+        return f"msg:{event.status_message_id}"
+    if event.timestamp:
+        return f"ts:{event.timestamp}"
+    return f"txt:{event.status_text.strip()}"
+
+
 class ContractManager:
     def __init__(
         self,
@@ -169,6 +194,8 @@ class ContractManager:
         poll_max_s: float = 15.0,
         lease_s: float = 30.0,
         proposed_timeout_s: float = 60.0,
+        recover_every_s: float = 30.0,
+        consolidation_timeout_s: float = 300.0,
         callback_http: httpx.AsyncClient | None = None,
     ):
         self.store = store
@@ -183,6 +210,8 @@ class ContractManager:
         self.poll_max_s = poll_max_s
         self.lease_s = lease_s
         self.proposed_timeout_s = proposed_timeout_s
+        self.recover_every_s = recover_every_s
+        self.consolidation_timeout_s = consolidation_timeout_s
         self.consolidator: Consolidator | None = None
         self._callback_http = callback_http
         self._run_events: dict[str, asyncio.Event] = {}
@@ -213,8 +242,12 @@ class ContractManager:
     def _run_event(self, run_id: str) -> asyncio.Event:
         return self._run_events.setdefault(run_id, asyncio.Event())
 
-    def _signal(self, run_id: str) -> None:
-        self._run_event(run_id).set()
+    def _signal(self, run_id: str, *, final: bool = False) -> None:
+        # execução encerrada: acorda quem espera e esquece o evento (senão o
+        # dicionário cresce para sempre num router de longa duração)
+        event = self._run_events.pop(run_id, None) if final else self._run_event(run_id)
+        if event is not None:
+            event.set()
 
     # --------------------------------------------------------------- execuções
 
@@ -228,8 +261,8 @@ class ContractManager:
         Devolve o registro no estado em que estiver ao fim da espera.
         """
         loop = asyncio.get_running_loop()
+        timeout_s = timeout_s if math.isfinite(timeout_s) else 0.0  # NaN/inf não travam a espera
         end = loop.time() + max(timeout_s, 0.0)
-        event = self._run_event(run_id)
         while True:
             run = await self.store.get_run(run_id)
             if run is None or run.status in RUN_FINAL or run.status == RUN_NEEDS_INPUT:
@@ -237,6 +270,7 @@ class ContractManager:
             remaining = end - loop.time()
             if remaining <= 0:
                 return run
+            event = self._run_event(run_id)
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(event.wait(), timeout=min(remaining, 0.5))
 
@@ -244,6 +278,29 @@ class ContractManager:
 
     async def open(self, req: OpenRequest) -> ContractRecord:
         """Abre um contrato: valida, grava, envia e aplica a resposta do agente."""
+        return await self.send(await self.prepare(req))
+
+    async def open_many(self, reqs: Sequence[OpenRequest]) -> list[ContractRecord | ContractError]:
+        """Abre os contratos de uma execução: grava todos antes de enviar o primeiro.
+
+        Assim um agente que termina na hora não consolida a execução antes de os
+        contratos irmãos existirem. Entrada inválida vira um ``ContractError`` na
+        posição da tarefa (as outras seguem).
+        """
+        prepared: list[PreparedContract | ContractError] = []
+        for req in reqs:
+            try:
+                prepared.append(await self.prepare(req))
+            except ContractError as exc:
+                prepared.append(exc)
+
+        async def send(item: PreparedContract | ContractError) -> ContractRecord | ContractError:
+            return item if isinstance(item, ContractError) else await self.send(item)
+
+        return list(await asyncio.gather(*(send(item) for item in prepared)))
+
+    async def prepare(self, req: OpenRequest) -> PreparedContract:
+        """Valida a entrada e grava o contrato (``proposto``), sem enviar nada."""
         now = self._clock()
         terms = req.skill.terms
         arguments = dict(req.arguments or {})
@@ -303,10 +360,15 @@ class ContractManager:
                 )
             ],
         )
+        return PreparedContract(contract, req, token)
+
+    async def send(self, prepared: PreparedContract) -> ContractRecord:
+        """Envia o ``SendMessage`` de um contrato gravado e aplica a resposta do agente."""
+        contract, req, token = prepared.contract, prepared.request, prepared.push_token
         extensions = [CONTRACT_EXTENSION_URI] if contract.kind == "completo" else None
         parts = []
         if contract.kind == "completo":
-            parts.append(data_part(arguments))
+            parts.append(data_part(contract.input))
         if req.instruction.strip():
             parts.append(text_part(req.instruction.strip()))
         if not parts:
@@ -320,7 +382,7 @@ class ContractManager:
             "acceptedOutputModes": ACCEPTED_OUTPUT_MODES,
             "returnImmediately": True,
         }
-        if use_push:
+        if contract.reply_mode == "push" and token:
             configuration["taskPushNotificationConfig"] = {
                 "url": f"{self.public_url}/a2a/push/{contract.id}",
                 "token": token,
@@ -358,14 +420,19 @@ class ContractManager:
 
     # ------------------------------------------------------ aplicação de eventos
 
-    async def apply_push(
-        self, contract_id: str, token: str | None, payload: Mapping[str, Any]
-    ) -> ContractRecord:
+    async def authorize_push(self, contract_id: str, token: str | None) -> ContractRecord:
+        """Confere o token de push do contrato (o router chama antes de ler o corpo)."""
         contract = await self.store.get_contract(contract_id)
         if contract is None:
             raise LookupError(f"contrato {contract_id} não existe")
         if contract.reply_mode != "push" or not token_matches(token, contract.push_token_hash):
             raise PushRejected("token de notificação inválido para este contrato")
+        return contract
+
+    async def apply_push(
+        self, contract_id: str, token: str | None, payload: Mapping[str, Any]
+    ) -> ContractRecord:
+        contract = await self.authorize_push(contract_id, token)
         event = parse_stream_event(payload)  # ValueError = payload inválido
         return await self.apply_event(contract_id, event, source="push") or contract
 
@@ -398,31 +465,36 @@ class ContractManager:
     async def _complete_snapshot(
         self, contract_id: str, event: StreamEvent, source: str
     ) -> StreamEvent:
-        """Status COMPLETED sem artefatos conhecidos: busca a tarefa inteira antes."""
+        """Status ``COMPLETED`` sem a tarefa inteira (push de status): busca a tarefa antes.
+
+        A saída do contrato é a que a tarefa tem no fim. Assim um pedaço de
+        artefato perdido, ou um push de conclusão que chega antes da resposta do
+        ``SendMessage``, não viram um contrato violado por falta da parte ``data``.
+        """
         if event.kind != "status" or event.state is None:
             return event
         if states.from_task_state(event.state) != states.COMPLETED:
             return event
         contract = await self.store.get_contract(contract_id)
-        if (
-            contract is None
-            or contract.artifacts
-            or not contract.remote_task_id
-            or not contract.rpc_url
-        ):
+        if contract is None or contract.terminal or not contract.rpc_url:
+            return event
+        task_id = contract.remote_task_id or event.task_id
+        if not task_id:
             return event
         spec = await self._spec(contract.agent)
         try:
             task = await self.client.get_task(
                 contract.rpc_url,
-                contract.remote_task_id,
+                task_id,
                 token=self._token(spec),
                 timeout_s=spec.timeout_s if spec else None,
             )
-            return parse_stream_event({"task": task})
+            fetched = parse_stream_event({"task": task})
         except (AgentError, ValueError) as exc:
-            log.warning("contrato %s: não consegui buscar os artefatos: %s", contract_id, exc)
+            log.warning("contrato %s: não consegui buscar a tarefa concluída: %s", contract_id, exc)
             return event
+        # a tarefa ainda não aparece encerrada (réplica atrasada do agente): vale o push
+        return fetched if fetched.state in TERMINAL_TASK_STATES else event
 
     def _reduce(
         self,
@@ -463,8 +535,8 @@ class ContractManager:
             c.remote_task_id, changed = event.task_id, True
         if event.context_id and not c.remote_context_id:
             c.remote_context_id, changed = event.context_id, True
-        if self._stale_input_request(c, event, source):
-            # retrato de antes da entrada chegar ao agente: não é um pedido novo
+        if self._stale_event(c, event):
+            # retrato antigo: não reabre uma pergunta já respondida nem desfaz um pedido de entrada
             if reschedule_s is not None:
                 c.next_check_at = now + timedelta(seconds=reschedule_s)
                 c.checks += 1
@@ -527,6 +599,8 @@ class ContractManager:
                 )
             elif target != c.state:
                 self._move(c, target, now, error=error)
+                if target == states.INPUT_REQUIRED:
+                    c.question = question_key(event)
                 changed = True
                 out.append(
                     ContractEvent(
@@ -549,21 +623,21 @@ class ContractManager:
         return out if (out or changed) else None
 
     @staticmethod
-    def _stale_input_request(c: ContractRecord, event: StreamEvent, source: str) -> bool:
-        """``INPUT_REQUIRED`` que só repete o estado de antes da resposta do usuário.
+    def _stale_event(c: ContractRecord, event: StreamEvent) -> bool:
+        """Um retrato de estado que chegou fora de ordem.
 
-        Com ``returnImmediately``, a resposta ao envio da entrada é o retrato da
-        tarefa antes de o agente processá-la; um polling logo depois também
-        pode vê-lo. Um pedido de entrada novo tem carimbo de tempo posterior.
+        * ``aguardando_entrada`` só volta para ``ativo`` pela resposta do usuário
+          (``provide_input``): um ``WORKING`` que chega depois do pedido de entrada
+          (a resposta do ``SendMessage`` atrás de um push, um polling atrasado) é antigo;
+        * um ``INPUT_REQUIRED`` com uma pergunta que o usuário já respondeu é o
+          retrato de antes de a resposta chegar ao agente, não um pedido novo.
         """
-        if c.input_sent_at is None or event.state is None:
+        target = states.from_task_state(event.state) if event.state else None
+        if target is None:
             return False
-        if states.from_task_state(event.state) != states.INPUT_REQUIRED:
-            return False
-        if source == "response":
+        if c.state == states.INPUT_REQUIRED and target == states.ACTIVE:
             return True
-        stamp = parse_timestamp(event.timestamp)
-        return stamp is not None and stamp <= c.input_sent_at
+        return target == states.INPUT_REQUIRED and question_key(event) in c.answered_questions
 
     def _move(self, c: ContractRecord, target: str, now: datetime, *, error: str | None) -> None:
         c.state = target
@@ -611,6 +685,7 @@ class ContractManager:
         error: str | None = None,
         detail: dict | None = None,
         input_sent: bool = False,
+        answered: str | None = None,
     ) -> ContractRecord | None:
         for _attempt in range(6):
             c = await self.store.get_contract(contract_id)
@@ -620,6 +695,8 @@ class ContractManager:
                 return c
             now = self._clock()
             self._move(c, target, now, error=error)
+            if answered and answered not in c.answered_questions:
+                c.answered_questions = [*c.answered_questions, answered][-20:]
             if input_sent:
                 c.input_sent_at = now
                 c.next_check_at = now + timedelta(
@@ -754,15 +831,19 @@ class ContractManager:
         return out
 
     async def provide_input(self, run_id: str, text: str) -> list[ContractRecord]:
-        """Leva a resposta do usuário aos contratos que aguardam entrada."""
+        """Leva a resposta do usuário aos contratos que aguardam entrada.
+
+        Só um pedido leva a resposta: a troca ``needs_input → pending`` é
+        condicional, e um segundo envio simultâneo (clique duplo) não repete a
+        mensagem ao agente.
+        """
         waiting = [
             c for c in await self.store.run_contracts(run_id) if c.state == states.INPUT_REQUIRED
         ]
         if not waiting:
             return []
-        self._run_events[run_id] = asyncio.Event()
         agents = ", ".join(dict.fromkeys(c.agent for c in waiting))
-        await self.store.update_run(
+        if not await self.store.update_run(
             run_id,
             expect={RUN_NEEDS_INPUT},
             status=RUN_PENDING,
@@ -771,9 +852,25 @@ class ContractManager:
                 f"Recebi sua resposta e repassei para {agents}. Assim que houver resultado, "
                 "eu consolido para você."
             ),
-        )
+        ):
+            return []
+        self._run_events[run_id] = asyncio.Event()
         out = []
         for c in waiting:
+            # volta para "ativo" antes do envio, guardando qual pergunta foi respondida:
+            # um pedido de entrada novo do agente é visto (e a execução volta a
+            # needs_input); um retrato antigo da mesma pergunta, não
+            moved = await self._transition(
+                c.id,
+                states.ACTIVE,
+                "router",
+                detail={"motivo": "entrada do usuário enviada", "texto": text[:2000]},
+                input_sent=True,
+                answered=c.question,
+            )
+            if moved is None or moved.state != states.ACTIVE:
+                out.append(moved or c)  # encerrado nesse meio-tempo (prazo, cancelamento)
+                continue
             spec = await self._spec(c.agent)
             extensions = [CONTRACT_EXTENSION_URI] if c.kind == "completo" else None
             message = new_message(
@@ -782,15 +879,6 @@ class ContractManager:
                 context_id=c.remote_context_id,
                 metadata={CONTRACT_EXTENSION_URI: contract_terms(c, c.deadline_at)},
                 extensions=extensions,
-            )
-            # volta para "ativo" antes da resposta: se o agente pedir outra coisa, a
-            # mudança para aguardando_entrada é vista e a execução volta a needs_input
-            await self._transition(
-                c.id,
-                states.ACTIVE,
-                "router",
-                detail={"motivo": "entrada do usuário enviada", "texto": text[:2000]},
-                input_sent=True,
             )
             parent = traceparent(run_id, c.span_id)
             try:
@@ -828,6 +916,9 @@ class ContractManager:
         if open_:
             if all(c.state == states.INPUT_REQUIRED for c in open_):
                 question = input_question(open_)
+                run = await self.store.get_run(run_id)
+                if run is not None and run.status == RUN_NEEDS_INPUT and run.answer == question:
+                    return  # nada mudou (o supervisor revisita execuções abertas)
                 if await self.store.update_run(
                     run_id,
                     expect={RUN_PENDING, RUN_NEEDS_INPUT},
@@ -863,7 +954,7 @@ class ContractManager:
                 error=f"falha na consolidação: {exc}"[:500],
                 finished_at=self._clock(),
             )
-        self._signal(run_id)
+        self._signal(run_id, final=True)
         self._spawn(self._notify_callback(run_id))
 
     async def _notify_callback(self, run_id: str) -> None:
@@ -883,14 +974,20 @@ class ContractManager:
             await asyncio.sleep(1.0)
 
     async def recover(self) -> None:
-        """Depois de um restart: consolida execuções cujos contratos já terminaram."""
+        """Revisita as execuções abertas e consolida as que ficaram para trás.
+
+        Roda na subida e periodicamente: uma execução cujos contratos já
+        terminaram é consolidada, e uma consolidação interrompida (restart no
+        meio da chamada ao LLM) volta a ``pending`` depois de
+        ``consolidation_timeout_s`` e é refeita.
+        """
         runs = getattr(self.store, "open_runs", None)
         if runs is None:
             return
         now = self._clock()
         for run in await runs():
             if run.status == RUN_CONSOLIDATING:
-                if (now - run.updated_at).total_seconds() < 120:
+                if (now - run.updated_at).total_seconds() < self.consolidation_timeout_s:
                     continue
                 await self.store.update_run(run.id, expect={RUN_CONSOLIDATING}, status=RUN_PENDING)
             await self._check_run(run.id)
@@ -929,9 +1026,15 @@ class ContractManager:
             await asyncio.gather(*list(self._background), return_exceptions=True)
 
     async def _loop(self) -> None:
-        with contextlib.suppress(Exception):
-            await self.recover()
+        loop = asyncio.get_running_loop()
+        recovered_at: float | None = None
         while True:
+            if recovered_at is None or loop.time() - recovered_at >= self.recover_every_s:
+                recovered_at = loop.time()
+                try:
+                    await self.recover()
+                except Exception:
+                    log.exception("supervisor de contratos: falha ao revisitar execuções")
             try:
                 await self.tick()
             except Exception:

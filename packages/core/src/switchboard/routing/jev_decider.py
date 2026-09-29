@@ -293,24 +293,28 @@ class JevDecider:
         if len(selected) > 1:
             reason += "; também: " + ", ".join(c.key for c in selected[1:])
         if missing_questions:
+            labels = [
+                label
+                for cap, missing in missing_questions
+                for label in describe_fields(cap.arguments_schema, missing)
+            ]
             if not profile.allow_clarify:
-                return await self._escalate(
-                    profile,
-                    messages,
-                    caps,
-                    hits,
-                    ctx,
-                    "faltam parâmetros e o perfil não faz perguntas",
+                # o perfil não faz perguntas, mas escalar para o LLM traria de volta o
+                # valor que a guarda acabou de descartar (inventado): diz o que falta
+                return (
+                    Decision(
+                        action="answer",
+                        answer=f"Para seguir com isso, preciso de: {', '.join(dict.fromkeys(labels))}.",
+                        reason=reason + "; faltam parâmetros e o perfil não faz perguntas",
+                        decided_by="jev",
+                        confidence=confidence,
+                    ),
+                    calls,
                 )
             if len(missing_questions) == 1:
                 cap, missing = missing_questions[0]
                 question = clarify_for_missing(cap, missing)
             else:
-                labels = [
-                    label
-                    for cap, missing in missing_questions
-                    for label in describe_fields(cap.arguments_schema, missing)
-                ]
                 question = f"Consigo ajudar com isso, mas preciso de: {', '.join(dict.fromkeys(labels))}. Pode me informar?"
             return (
                 Decision(

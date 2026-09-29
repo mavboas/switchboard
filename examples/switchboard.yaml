@@ -57,8 +57,9 @@ connectors:
 
 # Agentes A2A: tarefas delegadas que podem demorar. Cada delegação abre um
 # contrato fechado com os termos que o agente publicou no Agent Card
-# (schemas de entrada e saída, prazo). No modo framework o acompanhamento é
-# por polling (GetTask); o router com banco também aceita push notifications.
+# (schemas de entrada e saída, prazo). Na CLI e na biblioteca o acompanhamento é
+# por polling (GetTask); o router (com banco ou lendo este YAML) usa push
+# notifications quando SWITCHBOARD_PUBLIC_URL está definida.
 agents:
   - name: analise-credito
     url: http://localhost:8201

@@ -151,6 +151,12 @@ INTERROGATIVES = frozenset(
 )
 
 
+def assistant_asked(messages: Sequence[Message]) -> bool:
+    """A última fala do assistente foi uma pergunta ao usuário?"""
+    last = next((m for m in reversed(messages) if m.role == "assistant"), None)
+    return last is not None and last.content.rstrip().endswith("?")
+
+
 def is_question(text: str) -> bool:
     """Pergunta ("Quais documentos…?", "Como faço…") e não pedido de ação ("Simule…")."""
     words = fold(text).split()
@@ -248,7 +254,9 @@ class HeuristicDecider:
         if match is not None and match.score < self.strong_score and hits and is_question(question):
             # "Quais documentos preciso para pedir crédito?" cita o crédito, mas não pede a análise
             return self._from_knowledge(hits, f"pergunta com casamento fraco ({match.cap.key})")
-        if match is None and len(turns) >= 2:
+        if match is None and len(turns) >= 2 and assistant_asked(messages):
+            # resposta a uma pergunta de esclarecimento: completa o pedido anterior
+            # (sem pergunta no meio, "e o horário de sábado?" é assunto novo)
             joined = f"{turns[-2]}\n{question}"
             match = self._best(joined, caps)
             context = joined

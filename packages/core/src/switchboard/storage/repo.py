@@ -595,6 +595,10 @@ def save_trace(session: Session, result: RouterResult) -> Trace:
     return row
 
 
+OPEN_RUNS = "abertas"  # filtro: execuções em andamento (pending, needs_input, consolidating)
+OPEN_CONTRACTS = "abertos"  # filtro: contratos em aberto (proposto, ativo, aguardando_entrada)
+
+
 def query_traces(
     session: Session,
     *,
@@ -609,7 +613,9 @@ def query_traces(
         query = query.where(Trace.profile == profile)
     if route:
         query = query.where(Trace.route == route)
-    if status:
+    if status == OPEN_RUNS:  # todas as que ainda não terminaram
+        query = query.where(Trace.status.in_(["pending", "needs_input", "consolidating"]))
+    elif status:
         query = query.where(Trace.status == status)
     return list(session.scalars(query.limit(limit).offset(offset)))
 
@@ -735,8 +741,12 @@ def query_contracts(
     limit: int = 50,
     offset: int = 0,
 ) -> list[dict[str, Any]]:
+    from ..contracts import states
+
     query = select(Contract).order_by(Contract.created_at.desc())
-    if state:
+    if state == OPEN_CONTRACTS:
+        query = query.where(Contract.state.in_(sorted(states.OPEN)))
+    elif state:
         query = query.where(Contract.state == state)
     if agent:
         query = query.where(Contract.agent == agent)

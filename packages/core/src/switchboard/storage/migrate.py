@@ -8,7 +8,8 @@ partir da v0.2:
    anuláveis; os valores padrão são preenchidos com ``UPDATE``);
 3. dados legados são movidos: no MVP, "agentes" eram servidores MCP (tabela
    ``agents``); eles viram **conectores MCP** (``mcp_connectors``), mantendo os
-   vínculos com os roteadores, e as tabelas antigas são removidas;
+   vínculos com os roteadores, e as tabelas antigas são removidas; as execuções
+   antigas com rota ``delegated`` (tool MCP na v0.1) passam a ``tool``;
 4. a versão do schema fica em ``switchboard_meta``.
 
 Tudo roda na mesma transação do ``Database.init`` (no PostgreSQL, sob o
@@ -125,6 +126,10 @@ def upgrade(conn: Connection) -> None:
     current = conn.execute(
         text("SELECT value FROM switchboard_meta WHERE key = 'schema_version'")
     ).scalar()
+    if current is None or int(current) < 2:
+        # na v0.1, "delegated" era uma chamada de tool MCP; na v0.2 essa rota é
+        # "tool" e "delegated" passou a ser delegação a agente A2A
+        conn.execute(text("UPDATE traces SET route = 'tool' WHERE route = 'delegated'"))
     if current is None:
         conn.execute(
             text("INSERT INTO switchboard_meta (key, value) VALUES ('schema_version', :v)"),

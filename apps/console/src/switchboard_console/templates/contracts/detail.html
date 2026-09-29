@@ -1,14 +1,14 @@
 {% extends "base.html" %}
 {% from "_macros.html" import state_badge, kind_badge, schema_table %}
 {% block title %}Contrato {{ contract.id[:10] }}{% endblock %}
-{% block head %}{% if running %}<meta http-equiv="refresh" content="3">{% endif %}{% endblock %}
+{% block head %}{% if refresh_s %}<meta name="sb-autorefresh" content="{{ refresh_s }}">{% endif %}{% endblock %}
 {% block content %}
 <div class="page-head">
   <div>
     <div class="crumbs"><a href="/contracts">Contratos</a> /</div>
     <h1><span class="mono">{{ contract.agent }}/{{ contract.skill }}</span> {{ state_badge(contract.state) }} {{ kind_badge(contract.kind) }}</h1>
     <p>Contrato <span class="mono">{{ contract.id }}</span> · execução <a class="mono" href="/traces/{{ contract.run_id }}">{{ contract.run_id[:12] }}</a> · roteador <strong>{{ contract.profile }}</strong>
-      {% if running %}<span class="badge info live"><span class="dot"></span>atualizando a cada 3 s</span>{% endif %}</p>
+      {% if refresh_s %}<span class="badge info live" id="autorefresh"><span class="dot"></span>atualizando a cada {{ refresh_s }} s</span>{% endif %}</p>
   </div>
   <div class="actions">
     <a class="btn" href="/api/contracts/{{ contract.id }}" target="_blank" rel="noopener">JSON</a>
@@ -73,3 +73,4 @@
   </ul>
 </div>
 {% endblock %}
+{% block scripts %}{% if refresh_s %}<script src="{{ url_for('static', path='app.js') }}?v={{ version }}"></script>{% endif %}{% endblock %}

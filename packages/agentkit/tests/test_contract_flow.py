@@ -313,3 +313,35 @@ async def test_risk_agent_fan_out_contracts_finish_independently():
         assert all(c.state == states.COMPLETED for c in contracts)
     finally:
         await h.aclose()
+
+
+async def test_agent_token_is_required_on_json_rpc_but_not_on_the_card():
+    agent = analise.build("http://analise.test", delay_s=0.05)
+    agent.auth_tokens = ["segredo-do-roteador"]
+    h = Harness(agent=agent)
+    try:
+        # o card continua público (a descoberta funciona sem token)
+        info = await h.directory.describe(h.spec, refresh=True)
+        assert info.status == "online"
+        _, refused = await h.open(PROPOSTA, info=info)
+        assert refused.state == states.FAILED and "401" in (refused.error or "")
+        h.spec = h.spec.model_copy(update={"auth_token": "segredo-do-roteador"})
+        run_id, _ = await h.open(PROPOSTA, info=info)
+        run = await h.manager.wait_run(run_id, 5)
+        assert run.status == "completed", run
+    finally:
+        await h.aclose()
+
+
+@pytest.mark.parametrize(
+    ("url", "ok"),
+    [
+        ("http://router:8080/a2a/push/x", True),
+        ("http://router/a2a/push/x", False),  # porta 80: não é a liberada
+        ("https://outro:8080/a2a/push/x", False),
+        ("file:///etc/passwd", False),
+    ],
+)
+async def test_push_targets_can_pin_the_port(url, ok):
+    agent = risco.build("http://risco.test", push_hosts=["router:8080"])
+    assert await agent._push_url_ok(url) is ok

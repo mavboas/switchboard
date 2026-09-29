@@ -17,7 +17,7 @@
   <div class="stat"><div class="label">Roteadores</div><div class="value">{{ data.counts.profiles }}</div><div class="hint">{{ data.counts.models }} modelo(s) cadastrado(s)</div></div>
   <div class="stat"><div class="label">Conectores MCP</div><div class="value">{{ connectors|selectattr('status', 'equalto', 'online')|list|length }}/{{ data.counts.connectors }}</div><div class="hint">online agora</div></div>
   <div class="stat"><div class="label">Agentes A2A</div><div class="value">{{ agents|selectattr('status', 'equalto', 'online')|list|length }}/{{ data.counts.agents }}</div><div class="hint">online agora</div></div>
-  <div class="stat"><div class="label">Contratos</div><div class="value">{{ data.counts.contracts }}</div><div class="hint">{% if open_contracts %}<a href="/contracts?state=ativo">{{ open_contracts }} em aberto</a>{% else %}nenhum em aberto{% endif %}</div></div>
+  <div class="stat"><div class="label">Contratos</div><div class="value">{{ data.counts.contracts }}</div><div class="hint">{% if open_contracts %}<a href="/contracts?state=abertos">{{ open_contracts }} em aberto</a>{% else %}nenhum em aberto{% endif %}</div></div>
   <div class="stat"><div class="label">Conhecimento</div><div class="value">{{ data.counts.documents }}</div><div class="hint">{{ data.counts.chunks }} trechos em {{ data.counts.kbs }} base(s)</div></div>
   <div class="stat"><div class="label">Execuções</div><div class="value">{{ data.counts.traces }}</div>
     <div class="hint">{% for r, n in data.routes.items() %}{{ route_labels.get(r, r)|lower }}: {{ n }}{% if not loop.last %} · {% endif %}{% else %}nenhuma ainda{% endfor %}</div></div>
@@ -25,7 +25,7 @@
 
 {% if data.open_runs %}
 <div class="card">
-  <div class="card-head"><h2>Em andamento</h2><a class="btn small" href="/traces?status=pending">ver todas</a></div>
+  <div class="card-head"><h2>Em andamento</h2><a class="btn small" href="/traces?status=abertas">ver todas</a></div>
   <div class="table-wrap"><table>
     <thead><tr><th>Quando</th><th>Roteador</th><th>Situação</th><th>Pedido</th><th>Agentes</th></tr></thead>
     <tbody>

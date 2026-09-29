@@ -199,6 +199,14 @@ async def traces_list(
     )
 
 
+def _refresh_s(running: bool, *, waiting: bool) -> int | None:
+    """De quanto em quanto a página se atualiza: rápido com o agente trabalhando,
+    devagar esperando o usuário (pode levar até o prazo do contrato)."""
+    if not running:
+        return None
+    return 15 if waiting else 3
+
+
 @router.get("/traces/{trace_id}")
 async def traces_detail(request: Request, trace_id: str, console: Console = Depends(get_console)):
     trace = await console.run_db(repo.run_details, trace_id)
@@ -213,6 +221,7 @@ async def traces_detail(request: Request, trace_id: str, console: Console = Depe
         nav="traces",
         trace=trace,
         running=running,
+        refresh_s=_refresh_s(running, waiting=trace["status"] == "needs_input"),
         spans=waterfall(trace["spans"]),
     )
 
@@ -283,10 +292,12 @@ async def contracts_detail(
     contract = await console.run_db(repo.contract_details, contract_id)
     if contract is None:
         return redirect("/contracts", erro="Contrato não encontrado.")
+    running = contract["state"] in states.OPEN
     return console.render(
         request,
         "contracts/detail.html",
         nav="contracts",
         contract=contract,
-        running=contract["state"] in states.OPEN,
+        running=running,
+        refresh_s=_refresh_s(running, waiting=contract["state"] == states.INPUT_REQUIRED),
     )

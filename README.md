@@ -195,11 +195,11 @@ O formato da extensão, o que viaja em cada mensagem, a máquina de estados e co
 
 ### Espera, segundo plano e consolidação
 
-O roteador espera os agentes por até `wait_s` (padrão 8 s, por roteador e por pedido). Se todos terminam a tempo, a resposta consolidada volta na hora. Senão, a API responde `pending` com o `run_id`, os contratos seguem em segundo plano e, quando o último termina, o roteador **consolida** os resultados (com o LLM, ou por modelo de texto no modo offline). O resultado chega por `GET /v1/runs/{id}`, por SSE (`/v1/runs/{id}/events`) ou por webhook (`callback_url`). Se um agente pede informação, a execução fica `needs_input` com a pergunta dele; a resposta do usuário, enviada com o mesmo `run_id`, vai para o mesmo agente, na mesma tarefa e sob o mesmo contrato. Um supervisor no router retoma contratos abertos depois de um restart, faz polling de reserva e expira quem passou do prazo (com `CancelTask`).
+O roteador espera os agentes por até `wait_s` (padrão 8 s, por roteador e por pedido). Se todos terminam a tempo, a resposta consolidada volta na hora. Senão, a API responde `pending` com o `run_id`, os contratos seguem em segundo plano e, quando o último termina, o roteador **consolida** os resultados (com o LLM, ou por modelo de texto no modo offline). O resultado chega por `GET /v1/runs/{id}`, por SSE (`/v1/runs/{id}/events`) ou por webhook (`callback_url`, chamado também quando um agente pede informação). Se um agente pede informação, a execução fica `needs_input` com a pergunta dele; a resposta do usuário, enviada com o mesmo `run_id`, vai para o mesmo agente, na mesma tarefa e sob o mesmo contrato. Um supervisor no router retoma contratos abertos depois de um restart, faz polling de reserva e expira quem passou do prazo (com `CancelTask`).
 
 ## Observabilidade
 
-Cada execução é uma árvore de **spans** — `pedido` → `rag`, `descoberta`, `decisao` (com as perguntas ao Jev e as chamadas ao LLM), `tool_mcp` ou `delegacao` → um span `contrato: agente/skill` **por spawn**, `espera`, `consolidacao` e, quando o usuário responde a um agente, `entrada_do_usuario`. O span do contrato fica aberto até o estado final e carrega a linha do tempo dos eventos do agente (aceite, progresso, artefatos, pedidos de entrada).
+Cada execução é uma árvore de **spans** — `pedido` → `rag`, `descoberta`, `decisao` (com as perguntas ao Jev e as chamadas ao LLM), `tool_mcp` ou `delegacao` → um span `contrato: agente/skill` **por spawn**, `espera`, `consolidacao` e, quando o usuário responde a um agente, `entrada_do_usuario`. O span do contrato fica aberto até o estado final e aponta para o contrato, cuja linha do tempo (aceite, progresso, artefatos, pedidos de entrada) aparece junto na execução.
 
 ![Execução com um contrato por spawn e a cascata de spans](docs/img/execucao.png)
 
@@ -266,7 +266,7 @@ async with Switchboard.from_yaml("examples/switchboard.yaml") as sb:
         print(run.status, run.answer)
 ```
 
-No modo framework os contratos ficam em memória e são acompanhados por polling.
+Na biblioteca e na CLI os contratos ficam em memória e são acompanhados por polling; o router lendo o YAML usa push notifications quando `SWITCHBOARD_PUBLIC_URL` está definida.
 
 ## Banco de dados
 
@@ -297,7 +297,7 @@ A suíte cobre provedores (com transporte HTTP simulado), o cliente do Jev, RAG,
 
 - **Segredos**: chaves de API e tokens são `env:NOME` (lidos do ambiente) ou cifrados no banco com a chave mestra (gerada na primeira subida ou `SWITCHBOARD_SECRET_KEY`); nunca aparecem na UI nem na API admin. Só variáveis liberadas em `SWITCHBOARD_ALLOWED_ENV_SECRETS` (padrão `*_API_KEY,MCP_*,A2A_*` — dê aos tokens nomes como `MCP_CRM_TOKEN` ou `A2A_RISCO_TOKEN`; `SWITCHBOARD_*` nunca) podem ser referenciadas.
 - **Exposição**: fora do Docker, console e router escutam só em `127.0.0.1`; o compose publica tudo só em `127.0.0.1`. Com a API do router aberta (sem `SWITCHBOARD_API_KEYS`), ele só atende os hosts de `SWITCHBOARD_ALLOWED_HOSTS`. Para expor, ajuste `CONSOLE_BIND`/`ROUTER_BIND` no `.env` **e** defina `SWITCHBOARD_CONSOLE_PASSWORD`, `SWITCHBOARD_API_KEYS` e `SWITCHBOARD_CONSOLE_ALLOWED_HOSTS`.
-- **Agentes A2A**: o endpoint JSON-RPC do Agent Card precisa estar na mesma origem da URL cadastrada (senão, `allow_cross_origin` explícito); cada contrato tem um token de push exclusivo (o banco guarda só o hash) e o endpoint de push recusa token errado; `callback_url` só aceita hosts de `SWITCHBOARD_CALLBACK_HOSTS`; os agentes de exemplo só mandam push para os hosts de `AGENT_PUSH_HOSTS`. Entrada e saída são validadas contra os schemas do contrato dos dois lados.
+- **Agentes A2A**: o endpoint JSON-RPC do Agent Card precisa estar na mesma origem da URL cadastrada (senão, `allow_cross_origin` explícito); cada contrato tem um token de push exclusivo (o banco guarda só o hash) e o endpoint de push recusa token errado; `callback_url` só aceita hosts de `SWITCHBOARD_CALLBACK_HOSTS`; os agentes de exemplo só mandam push para os destinos de `AGENT_PUSH_HOSTS` (padrão: a própria máquina) e o `switchboard-agentkit` pode exigir o token do roteador (`auth_tokens`) no JSON-RPC. Entrada e saída são validadas contra os schemas do contrato dos dois lados.
 - **Console**: senha opcional (HTTP Basic) e bloqueio de formulários vindos de outra origem.
 - **Router**: chaves de API opcionais; allowlist de tools por conector e de skills por agente; argumentos validados contra o schema antes do `tools/call` ou do `SendMessage`.
 - **Resiliência**: conector ou agente lento não trava os pedidos (descoberta com timeout curto e cache servido enquanto revalida); Jev fora → decide o LLM; LLM fora ou resposta inválida → decide o heurístico, com aviso no trace; contratos têm prazo e são retomados depois de um restart.

@@ -28,6 +28,7 @@
     <label for="f-status">Situação</label>
     <select id="f-status" name="status">
       <option value="">todas</option>
+      <option value="abertas" {% if filters.status == 'abertas' %}selected{% endif %}>em andamento (todas)</option>
       {% for key, label in statuses.items() %}<option value="{{ key }}" {% if filters.status == key %}selected{% endif %}>{{ label }}</option>{% endfor %}
     </select>
   </div>

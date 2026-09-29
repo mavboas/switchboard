@@ -167,15 +167,30 @@ def test_mvp_database_is_migrated(empty_db_url):
         tables = set(inspect(db.engine).get_table_names())
         assert "agents" not in tables and "profile_agents" not in tables
         assert {"mcp_connectors", "a2a_agents", "contracts", "contract_events", "spans"} <= tables
+        with db.session() as s:  # delegação A2A da v0.2 não é relabelada em subidas seguintes
+            s.execute(
+                text(
+                    "INSERT INTO traces (id, created_at, profile, question, answer, route, model, reason, sources, steps, warnings, latency_ms, input_tokens, output_tokens, status) "
+                    "VALUES ('t2', :t, 'default', 'q', 'a', 'delegated', 'm', '', '[]', '[]', '[]', 1, 0, 0, 'completed')"
+                ),
+                {"t": now},
+            )
+            s.commit()
+        db.init()
         with db.session() as s:
+            assert (
+                s.execute(text("SELECT route FROM traces WHERE id = 't2'")).scalar() == "delegated"
+            )
             names = sorted(c.name for c in s.scalars(select(Connector)))
             assert names == ["chamados", "credito"]
             resolved = repo.resolve_profile(s, "default")
             assert sorted(c.name for c in resolved.connectors) == ["chamados", "credito"]
             assert resolved.connectors[0].allowed_tools == ["x"] and resolved.agents == []
             assert resolved.spec.wait_s == 8.0 and resolved.spec.decision_threshold == 0.6
-            [trace] = repo.query_traces(s)
-            assert repo.trace_to_dict(trace)["status"] == "completed"
+            trace = next(t for t in repo.query_traces(s) if t.id == "t1")
+            migrated = repo.trace_to_dict(trace)
+            # "delegated" da v0.1 era tool MCP: vira "tool" (e só nesta migração)
+            assert migrated["status"] == "completed" and migrated["route"] == "tool"
             version = s.execute(
                 text("SELECT value FROM switchboard_meta WHERE key = 'schema_version'")
             ).scalar()

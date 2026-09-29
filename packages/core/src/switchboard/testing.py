@@ -132,6 +132,7 @@ class HostRoutingTransport(httpx.AsyncBaseTransport):
 
     def __init__(self, apps: Mapping[str, Any] | None = None):
         self._apps: dict[str, httpx.ASGITransport] = {}
+        self.sent: list[httpx.Request] = []  # tudo o que passou, para os testes inspecionarem
         for host, app in (apps or {}).items():
             self.mount(host, app)
 
@@ -147,6 +148,7 @@ class HostRoutingTransport(httpx.AsyncBaseTransport):
             raise httpx.ConnectError(
                 f"nenhum app em processo para {request.url.host}", request=request
             )
+        self.sent.append(request)
         return await transport.handle_async_request(request)
 
 

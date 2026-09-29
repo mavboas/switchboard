@@ -86,7 +86,7 @@ O **portão de confiança**: se a confiança da escolha do Jev fica abaixo de `d
 
 - `answer`: com LLM, redige a resposta com os trechos e cita as fontes; no heurístico, a resposta é extrativa.
 - `tool`: chama a tool via `tools/call`; o resultado (ou o erro) vai para a síntese pelo LLM, que escreve a resposta sem inventar nada além do resultado. Com `synthesize` desligado, o texto do conector volta como veio.
-- `delegate`: abre um contrato por tarefa (em paralelo) e espera até `wait_s`. Se todos terminam a tempo, consolida e responde; senão, responde `pending` com uma resposta provisória e o `run_id`, e a consolidação acontece em segundo plano quando o último contrato termina.
+- `delegate`: grava um contrato por tarefa e só então envia as mensagens, em paralelo — assim um agente que termina na hora não consolida a execução antes de os contratos irmãos existirem — e espera até `wait_s`. Se todos terminam a tempo, consolida e responde; senão, responde `pending` com uma resposta provisória e o `run_id`, e a consolidação acontece em segundo plano quando o último contrato termina.
 - `clarify`: devolve a pergunta. O próximo turno do usuário chega com o histórico e completa os argumentos.
 
 ## Execuções e contratos em segundo plano
@@ -105,11 +105,13 @@ Pedidos que não delegam nascem `completed`. Numa delegação, o `ContractManage
 1. **abrir** — valida a entrada contra o `input_schema` da skill, grava o contrato (`proposto`) **antes** de enviar (o push pode chegar antes da resposta) e faz o `SendMessage` com os termos na `metadata`, `returnImmediately` e, se houver URL pública, a configuração de push notification com um token exclusivo;
 2. **acompanhar** — aplica as push notifications (`POST /a2a/push/{contrato}`, autenticadas pelo token) e faz polling de reserva com `GetTask`, com backoff; valida a saída contra o `output_schema` (fora do schema = `violado`);
 3. **encerrar** — prazo vencido vira `expirado`, e cancelamento pedido pelo cliente vira `cancelado`; nos dois casos o roteador manda `CancelTask`;
-4. **consolidar** — quando todos os contratos de uma execução terminam, uma única consolidação acontece (a troca `pending → consolidating` é condicional no banco, então vários processos do router podem receber eventos ao mesmo tempo) e quem espera é avisado: o pedido original, `GET /v1/runs/{id}`, o SSE e o `callback_url`. Se sobra só contrato aguardando entrada, a execução fica `needs_input` com a pergunta do agente.
+4. **consolidar** — quando todos os contratos de uma execução terminam, uma única consolidação acontece (a troca `pending → consolidating` é condicional no banco, então vários processos do router podem receber eventos ao mesmo tempo) e quem espera é avisado: o pedido original, `GET /v1/runs/{id}`, o SSE e o `callback_url`. Se sobra só contrato aguardando entrada, a execução fica `needs_input` com a pergunta do agente (e o `callback_url` também é chamado).
 
-O **supervisor** roda em cada processo do router: a cada segundo pega os contratos com consulta vencida (com *lease* no banco, para dois processos não consultarem o mesmo contrato ao mesmo tempo), expira os que passaram do prazo e, na subida, retoma o que estava aberto e consolida execuções cujos contratos terminaram enquanto o router estava fora. O agendamento fica no próprio contrato (`next_check_at`), então nada se perde num restart.
+O **supervisor** roda em cada processo do router: a cada segundo pega os contratos com consulta vencida (com *lease* no banco, para dois processos não consultarem o mesmo contrato ao mesmo tempo) e expira os que passaram do prazo; na subida e a cada 30 s revisita as execuções abertas — consolida as que ficaram para trás (contratos que terminaram com o router fora do ar) e refaz uma consolidação interrompida depois de 5 minutos. O agendamento fica no próprio contrato (`next_check_at`), então nada se perde num restart.
 
-Quando o usuário responde a um agente, a mensagem vai na mesma tarefa A2A (`taskId`/`contextId`) e sob o mesmo contrato; o contrato volta para `ativo` antes do envio, para que um novo pedido de entrada do agente seja percebido.
+Quando o usuário responde a um agente, a mensagem vai na mesma tarefa A2A (`taskId`/`contextId`) e sob o mesmo contrato; o contrato volta para `ativo` antes do envio e guarda qual pergunta foi respondida (pelo id da mensagem do agente), para que um novo pedido de entrada seja percebido e um retrato antigo da mesma pergunta, não. A troca `needs_input → pending` é condicional: dois envios simultâneos da resposta não a repetem ao agente.
+
+Eventos chegam fora de ordem (push antes da resposta do `SendMessage`, polling atrasado), então há duas regras: um contrato em `aguardando_entrada` só volta a `ativo` pela resposta do usuário, e uma conclusão recebida por push busca a tarefa inteira (`GetTask`) antes de validar a saída — um pedaço de artefato perdido não vira contrato violado.
 
 ## Spans
 
@@ -121,7 +123,7 @@ Cada execução é uma árvore de spans (`switchboard.tracing`), gravada na tabe
 | `rag` · `descoberta` | busca nas bases; tools e skills descobertas (e quem está fora do ar) |
 | `decisao` → `jev` · `llm` | a decisão, com as perguntas ao Jev (probabilidades) e as chamadas ao LLM (tokens) |
 | `tool_mcp` · `sintese` | a chamada à tool e a redação da resposta |
-| `delegacao` → `contrato: agente/skill` | um span **por spawn**, aberto até o estado final do contrato, com os eventos do agente |
+| `delegacao` → `contrato: agente/skill` | um span **por spawn**, aberto até o estado final do contrato e ligado a ele (id, estado, tipo); os eventos do agente ficam na linha do tempo do contrato |
 | `espera` | quanto o pedido esperou os agentes |
 | `consolidacao` | a composição da resposta final a partir dos contratos |
 | `entrada_do_usuario` → `entrada` | a resposta do usuário a um agente, levada ao contrato |
@@ -130,7 +132,7 @@ O console desenha a cascata (waterfall) a partir desses spans, no servidor e no 
 
 ## Recarga de configuração
 
-O router relê cada roteador do banco a cada `SWITCHBOARD_CONFIG_TTL_S` (5 s) e só recria o motor quando o fingerprint da configuração efetiva muda (spec do roteador + modelos + conectores + agentes). Clientes HTTP de modelos que saíram de uso são fechados depois de 30 s, para não cortar pedidos em andamento. Os contratos abertos não dependem do motor: o supervisor continua com eles mesmo se o roteador for editado, e se ele for removido a consolidação sai sem LLM.
+O router relê cada roteador do banco a cada `SWITCHBOARD_CONFIG_TTL_S` (5 s) e só recria o motor quando o fingerprint da configuração efetiva muda (spec do roteador + modelos + conectores + agentes). Clientes HTTP de modelos que saíram de uso são fechados depois de 5 minutos, para não cortar pedidos em andamento. Os contratos abertos não dependem do motor: o supervisor continua com eles mesmo se o roteador for editado, e se ele for removido a consolidação sai sem LLM.
 
 ## Modelo de dados
 

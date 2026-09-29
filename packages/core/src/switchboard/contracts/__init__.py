@@ -6,10 +6,12 @@ from .manager import (
     Consolidator,
     ContractManager,
     OpenRequest,
+    PreparedContract,
     PushRejected,
     contract_terms,
     default_consolidation,
     input_question,
+    question_key,
 )
 from .models import (
     RUN_COMPLETED,
@@ -54,6 +56,7 @@ __all__ = [
     "ContractStore",
     "MemoryContractStore",
     "OpenRequest",
+    "PreparedContract",
     "PushRejected",
     "RunRecord",
     "SkillTerms",
@@ -63,6 +66,7 @@ __all__ = [
     "default_consolidation",
     "input_question",
     "normalize_numbers",
+    "question_key",
     "schema_hash",
     "skills_from_extension",
     "states",

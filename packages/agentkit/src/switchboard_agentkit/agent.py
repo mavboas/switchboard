@@ -39,6 +39,7 @@ O lado do agente do contrato:
 
 from __future__ import annotations
 
+import hmac
 import logging
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -70,6 +71,8 @@ from a2a.types.a2a_pb2 import (
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.struct_pb2 import Struct
 from starlette.applications import Starlette
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from switchboard.a2a.protocol import parts_data, parts_text
 from switchboard.contracts.terms import (
@@ -297,6 +300,24 @@ class ContractExecutor(AgentExecutor):
         await updater.cancel(updater.new_agent_message([new_text_part("tarefa cancelada")]))
 
 
+class _BearerAuth:
+    """Exige ``Authorization: Bearer <token>`` no JSON-RPC; o Agent Card continua público."""
+
+    def __init__(self, app: ASGIApp, tokens: Iterable[str]):
+        self.app = app
+        self.tokens = [t.encode("utf-8") for t in tokens]
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and not scope["path"].startswith("/.well-known/"):
+            header = dict(scope.get("headers") or []).get(b"authorization", b"")
+            given = header[7:].strip() if header[:7].lower() == b"bearer " else b""
+            if not any(hmac.compare_digest(given, t) for t in self.tokens):
+                response = JSONResponse({"error": "token ausente ou inválido"}, status_code=401)
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 class ContractAgent:
     def __init__(
         self,
@@ -308,14 +329,18 @@ class ContractAgent:
         organization: str | None = None,
         require_contract: bool = True,
         push_hosts: Iterable[str] | None = None,
+        auth_tokens: Iterable[str] | None = None,
         http: httpx.AsyncClient | None = None,
     ):
         """
         Args:
             url: URL pública do agente (vai no card como endpoint JSON-RPC).
             require_contract: rejeita tarefas sem os termos do contrato.
-            push_hosts: hosts aceitos nas URLs de push notification (``None``
-                aceita qualquer um — só para desenvolvimento).
+            push_hosts: destinos aceitos nas URLs de push notification: ``host``
+                (qualquer porta) ou ``host:porta``; ``None`` aceita qualquer um —
+                só para desenvolvimento.
+            auth_tokens: tokens aceitos em ``Authorization: Bearer`` no JSON-RPC
+                (o do cadastro do agente no roteador); vazio = sem autenticação.
             http: cliente usado para enviar as push notifications.
         """
         self.name = name
@@ -325,6 +350,7 @@ class ContractAgent:
         self.organization = organization
         self.require_contract = require_contract
         self.push_hosts = {h.lower() for h in push_hosts} if push_hosts is not None else None
+        self.auth_tokens = [t for t in (auth_tokens or ()) if t]
         self.http = http
         self.skills: dict[str, Skill] = {}
 
@@ -406,10 +432,14 @@ class ContractAgent:
         )
 
     async def _push_url_ok(self, url: str) -> bool:
+        parts = urlsplit(url)
+        if parts.scheme not in ("http", "https"):
+            return False
         if self.push_hosts is None:
             return True
-        host = (urlsplit(url).hostname or "").lower()
-        return host in self.push_hosts
+        host = (parts.hostname or "").lower()
+        port = parts.port or {"http": 80, "https": 443}[parts.scheme]
+        return host in self.push_hosts or f"{host}:{port}" in self.push_hosts
 
     def build_app(self) -> Starlette:
         card = self.card()
@@ -429,6 +459,8 @@ class ContractAgent:
         routes = create_agent_card_routes(card) + create_jsonrpc_routes(handler, rpc_url="/")
         app = Starlette(routes=routes)
         app.state.agent = self
+        if self.auth_tokens:
+            app.add_middleware(_BearerAuth, tokens=self.auth_tokens)
         return app
 
     def run(self, host: str = "127.0.0.1", port: int = 8201) -> None:  # pragma: no cover

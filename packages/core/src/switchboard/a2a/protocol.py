@@ -128,6 +128,7 @@ class TaskView:
     status_text: str = ""
     timestamp: str | None = None
     artifacts: list[dict[str, Any]] = field(default_factory=list)
+    status_message_id: str | None = None
 
     @classmethod
     def parse(cls, data: Mapping[str, Any]) -> TaskView:
@@ -142,6 +143,7 @@ class TaskView:
             else "",
             timestamp=status.get("timestamp") if isinstance(status, Mapping) else None,
             artifacts=[a for a in data.get("artifacts") or [] if isinstance(a, Mapping)],
+            status_message_id=_message_id(message),
         )
 
 
@@ -160,6 +162,13 @@ class StreamEvent:
     append: bool = False
     last_chunk: bool = False
     message: dict[str, Any] | None = None
+    status_message_id: str | None = None  # id da mensagem do status (ex.: a pergunta)
+
+
+def _message_id(message: Any) -> str | None:
+    if isinstance(message, Mapping) and message.get("messageId"):
+        return str(message["messageId"])
+    return None
 
 
 def parse_stream_event(payload: Mapping[str, Any]) -> StreamEvent:
@@ -176,6 +185,7 @@ def parse_stream_event(payload: Mapping[str, Any]) -> StreamEvent:
             status_text=task.status_text,
             timestamp=task.timestamp,
             task=task,
+            status_message_id=task.status_message_id,
         )
     update = payload.get("statusUpdate") or payload.get("status_update")
     if isinstance(update, Mapping):
@@ -188,6 +198,7 @@ def parse_stream_event(payload: Mapping[str, Any]) -> StreamEvent:
             state=normalize_state(status.get("state") if isinstance(status, Mapping) else None),
             status_text=parts_text(message.get("parts")) if isinstance(message, Mapping) else "",
             timestamp=status.get("timestamp") if isinstance(status, Mapping) else None,
+            status_message_id=_message_id(message),
         )
     update = payload.get("artifactUpdate") or payload.get("artifact_update")
     if isinstance(update, Mapping):
