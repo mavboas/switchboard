@@ -2,7 +2,7 @@
 # comandos equivalentes do README.
 
 .DEFAULT_GOAL := help
-.PHONY: help env up down reset logs dev smoke test test-pg lint fmt
+.PHONY: help env up down reset logs dev smoke test test-pg lint fmt check
 
 help: ## lista os comandos
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  %-9s %s\n", $$1, $$2}'
@@ -43,3 +43,7 @@ lint: ## ruff (lint + formatação)
 
 fmt: ## corrige lint e formata
 	uv run ruff check --fix . && uv run ruff format .
+
+check: ## valida o YAML de exemplo e o plugin de exemplo (varredura estrita)
+	uv run switchboard plugin validate examples/plugins/acme-credito --strict
+	uv run switchboard -c examples/switchboard.yaml check

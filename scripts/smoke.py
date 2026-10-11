@@ -8,7 +8,10 @@ ou scripts/dev.sh) e sai com código 1 no primeiro que falhar:
 2. tool de um conector MCP (síncrono);
 3. delegação a um agente A2A que responde dentro da espera do pedido;
 4. delegação longa: "pending" na hora, acompanhamento por /v1/runs e consolidação;
-5. contrato que pede entrada no meio (needs_input) e é retomado pelo run_id.
+5. contrato que pede entrada no meio (needs_input) e é retomado pelo run_id;
+6. plugin (com o console): sobe o plugin de exemplo, liga a um roteador novo, usa a tool
+   dele com o playbook e confere o uso por versão; no fim, remove o que criou (se o plugin
+   já estava instalado, o passo é pulado para não mexer na sua configuração).
 
     python3 scripts/smoke.py                           # http://localhost:8080 e :8000
     python3 scripts/smoke.py --router http://localhost:8080 --console ""
@@ -21,15 +24,22 @@ from __future__ import annotations
 
 import argparse
 import base64
+import io
 import json
 import os
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import zipfile
+from pathlib import Path
 from typing import Any
 
 FINAL = {"completed", "failed"}
+PLUGIN_DIR = Path(__file__).resolve().parent.parent / "examples" / "plugins" / "acme-credito"
+PLUGIN = "acme-credito"
+PLUGIN_PROFILE = "smoke-plugins"
 
 
 class SmokeError(Exception):
@@ -37,13 +47,20 @@ class SmokeError(Exception):
 
 
 def _request(
-    url: str, *, data: dict[str, Any] | None = None, headers: dict[str, str] | None = None
+    url: str,
+    *,
+    data: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+    method: str | None = None,
+    body: bytes | None = None,
+    content_type: str | None = None,
 ) -> tuple[int, Any]:
-    body = json.dumps(data).encode() if data is not None else None
-    req = urllib.request.Request(url, data=body, method="POST" if body else "GET")
+    if data is not None:
+        body, content_type = json.dumps(data).encode(), "application/json"
+    req = urllib.request.Request(url, data=body, method=method or ("POST" if body else "GET"))
     req.add_header("Accept", "application/json")
-    if body:
-        req.add_header("Content-Type", "application/json")
+    if content_type:
+        req.add_header("Content-Type", content_type)
     for key, value in (headers or {}).items():
         req.add_header(key, value)
     # a stack é local: não passa pelo proxy do ambiente
@@ -177,6 +194,119 @@ def check_needs_input(s: Smoke) -> str:
     return f"needs_input → retomado → completed ({contract['output']['decisao']})"
 
 
+def _plugin_zip() -> bytes:
+    """O plugin de exemplo como .zip (o console normaliza o pacote ao instalar)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in sorted(PLUGIN_DIR.rglob("*")):
+            if path.is_file():
+                zf.write(path, path.relative_to(PLUGIN_DIR).as_posix())
+    return buf.getvalue()
+
+
+def _multipart(package: bytes, **fields: str) -> tuple[bytes, str]:
+    boundary = f"smoke-{os.urandom(8).hex()}"
+    parts = [
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
+        for name, value in fields.items()
+    ]
+    parts.append(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; '
+        f'filename="{PLUGIN}.zip"\r\nContent-Type: application/zip\r\n\r\n'.encode()
+        + package
+        + b"\r\n"
+    )
+    parts.append(f"--{boundary}--\r\n".encode())
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+def check_plugin(s: Smoke) -> str:
+    """Sobe o plugin de exemplo, liga a um roteador novo e usa a tool dele com o playbook."""
+    assert s.console
+    api, auth = f"{s.console}/api", s.console_headers
+
+    def call(path: str, **kw: Any) -> tuple[int, Any]:
+        return _request(f"{api}{path}", headers=auth, **kw)
+
+    status, _ = call(f"/plugins/{PLUGIN}")
+    if status == 200:
+        return f"pulado: {PLUGIN} já está instalado (o smoke não mexe na sua configuração)"
+    # os endereços dos servidores de exemplo são os da demonstração
+    _, connectors = call("/connectors")
+    _, agents = call("/agents")
+    credito = next((c["url"] for c in connectors if c["name"] == "credito"), None)
+    analise = next((a["url"] for a in agents if a["name"] == "analise-credito"), None)
+    expect(bool(credito and analise), "plugin: faltam os servidores da demonstração", connectors)
+
+    package = _plugin_zip()
+    body, ctype = _multipart(package)
+    status, preview = call("/plugins/validate", body=body, content_type=ctype)
+    expect(status == 200 and preview.get("ok") is True, "plugin: validação", preview)
+    expect(not preview["preview"]["pending"], "plugin: achado pedindo aprovação", preview)
+    config = json.dumps({"CREDITO_URL": credito, "ANALISE_URL": analise})
+    body, ctype = _multipart(package, config=config)
+    status, installed = call("/plugins", body=body, content_type=ctype)
+    expect(status == 201, f"plugin: instalação respondeu {status}", installed)
+    plugin = installed["plugin"]
+    version = plugin["version"]
+    profile_id = None
+    try:
+        expect(plugin["state"] == "pronto", "plugin: não ficou pronto", installed)
+        status, profile = call(
+            "/profiles",
+            data={
+                "name": PLUGIN_PROFILE,
+                "model": "offline",
+                "plugins": [PLUGIN],
+                "min_score": 0.15,
+            },
+        )
+        expect(status == 201, f"plugin: criar o roteador respondeu {status}", profile)
+        profile_id = profile["id"]
+
+        # o router aplica a configuração nova em poucos segundos, sem reiniciar
+        query = urllib.parse.urlencode({"profile": PLUGIN_PROFILE})
+        end = time.monotonic() + 30
+        while True:
+            status, listing = _request(f"{s.router}/v1/plugins?{query}", headers=s.headers)
+            if status == 200 and [p["name"] for p in listing["plugins"]] == [PLUGIN]:
+                break
+            expect(time.monotonic() < end, "plugin: o router não recebeu o plugin", listing)
+            time.sleep(1)
+
+        _, d = s.chat(
+            "Simule um empréstimo de R$ 30 mil em 12 meses a 2% ao mês", profile=PLUGIN_PROFILE
+        )
+        expect(
+            (d["route"], d["agent"], d["tool"])
+            == ("tool", f"{PLUGIN}.credito", "simular_financiamento"),
+            "plugin: esperava a tool do conector do plugin",
+            d,
+        )
+        used = {(u["kind"], u["component"], u["version"]) for u in d.get("plugins") or []}
+        for item in (
+            ("playbook", "politica-de-credito", version),
+            ("tool", f"{PLUGIN}.credito/simular_financiamento", version),
+        ):
+            expect(item in used, f"plugin: falta o uso {item}", d.get("plugins"))
+        # a execução (e o uso por versão) é gravada logo depois da resposta
+        end = time.monotonic() + 15
+        while True:
+            _, usage = call(f"/plugins/usage?plugin={PLUGIN}")
+            if isinstance(usage, list) and usage and usage[0]["requests"] >= 1:
+                break
+            expect(time.monotonic() < end, "plugin: o uso por versão não apareceu", usage)
+            time.sleep(0.5)
+        for page in ("/plugins", f"/plugins/{plugin['id']}", f"/traces/{d['run_id']}"):
+            status, _ = _request(f"{s.console}{page}", headers=auth)
+            expect(status == 200, f"console: {page} respondeu {status}")
+    finally:  # deixa a configuração como estava
+        if profile_id is not None:
+            call(f"/profiles/{profile_id}", method="DELETE")
+        call(f"/plugins/{PLUGIN}", method="DELETE")
+    return f"{PLUGIN} {version} instalado, usado ({d['agent']}/{d['tool']} + playbook) e removido"
+
+
 def check_console(s: Smoke) -> str:
     assert s.console
     pages = ["/", "/connectors", "/agents", "/contracts"]
@@ -211,11 +341,14 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(f"ok  {label}: {detail} ({time.monotonic() - started:.1f} s)")
     if s.console:
-        try:
-            print(f"ok  console: {check_console(s)}")
-        except SmokeError as exc:
-            print(f"FALHOU console: {exc}", file=sys.stderr)
-            return 1
+        for label, check in (("console", check_console), ("plugin", check_plugin)):
+            started = time.monotonic()
+            try:
+                detail = check(s)
+            except (SmokeError, KeyError, ValueError, TypeError) as exc:
+                print(f"FALHOU {label}: {exc}", file=sys.stderr)
+                return 1
+            print(f"ok  {label}: {detail} ({time.monotonic() - started:.1f} s)")
     return 0
 
 

@@ -23,6 +23,11 @@ jobs:
       - run: uv sync --frozen
       - run: uv run ruff check .
       - run: uv run ruff format --check .
+      - name: Plugin de exemplo e YAML do modo framework
+        # --strict: avisos também falham, para o exemplo continuar sendo um bom modelo
+        run: |
+          uv run switchboard plugin validate examples/plugins/acme-credito --strict
+          uv run switchboard -c examples/switchboard.yaml check
 
   test:
     runs-on: ubuntu-latest
