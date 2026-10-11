@@ -1,13 +1,17 @@
 [project]
 name = "switchboard-example-agents"
 version = "0.1.0"
-description = "Agentes MCP de exemplo (simulador de crédito e central de chamados) para demonstrar a delegação"
+description = "Conectores MCP (simulador de crédito, chamados) e agentes A2A (análise de crédito, risco) de exemplo"
 license = "Apache-2.0"
 requires-python = ">=3.11"
 dependencies = [
     "mcp>=2.2,<3",
+    "switchboard-agentkit",
     "uvicorn>=0.30",
 ]
+
+[tool.uv.sources]
+switchboard-agentkit = { workspace = true }
 
 [project.scripts]
 switchboard-agent = "switchboard_agents.__main__:main"

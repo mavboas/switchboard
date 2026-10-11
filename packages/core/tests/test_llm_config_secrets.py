@@ -229,6 +229,7 @@ def test_env_references_are_restricted(monkeypatch):
         with pytest.raises(SecretError):
             box.open(f"env:{name}")  # mesmo que alguém grave direto no banco
     assert box.seal("env:MCP_CRM_TOKEN") == "env:MCP_CRM_TOKEN"
+    assert box.seal("env:A2A_RISCO_TOKEN") == "env:A2A_RISCO_TOKEN"  # token de agente A2A
     assert box.seal("env:OPENAI_API_KEY") == "env:OPENAI_API_KEY"
     custom = SecretBox("k", "MEU_SEGREDO,ACME_*")
     assert custom.seal("env:ACME_CHAVE") == "env:ACME_CHAVE"

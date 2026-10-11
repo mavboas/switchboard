@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
@@ -14,10 +15,15 @@ from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from switchboard import __version__
-from switchboard.agents import AgentCatalog
+from switchboard.a2a import A2AClient, AgentDirectory
+from switchboard.connectors import ConnectorCatalog
+from switchboard.contracts import states
 from switchboard.llm import PRESETS
+from switchboard.plugins import LEVEL_LABELS
 from switchboard.secrets import SecretBox, load_master_key
-from switchboard.storage import Database, EmbedderCache, KnowledgeService
+from switchboard.storage import Database, EmbedderCache, KnowledgeService, PluginService
+from switchboard.storage.orm import KnowledgeBase, Plugin
+from switchboard.storage.plugins import STATE_LABELS as PLUGIN_STATE_LABELS
 
 from .settings import Settings
 
@@ -26,23 +32,132 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 ROUTE_LABELS = {
     "direct": "Resposta direta",
-    "delegated": "Delegado",
+    "tool": "Tool MCP",
+    "delegated": "Agente A2A",
     "clarify": "Esclarecimento",
     "error": "Erro",
 }
 
+RUN_STATUS_LABELS = {
+    "completed": "concluída",
+    "pending": "em andamento",
+    "needs_input": "aguardando entrada",
+    "consolidating": "consolidando",
+    "failed": "falhou",
+}
+
+# classe de cor (badge) de cada estado de contrato e de execução
+STATE_TONES = {
+    states.PROPOSED: "",
+    states.ACTIVE: "info",
+    states.INPUT_REQUIRED: "warn",
+    states.COMPLETED: "ok",
+    states.FAILED: "danger",
+    states.REJECTED: "danger",
+    states.CANCELED: "",
+    states.EXPIRED: "danger",
+    states.BREACHED: "danger",
+    "completed": "ok",
+    "pending": "info",
+    "needs_input": "warn",
+    "consolidating": "info",
+    "failed": "danger",
+}
+
+
+# estado de um plugin, nível de um achado da varredura e tipo de uso: cor (badge) e texto
+PLUGIN_TONES = {
+    "pronto": "ok",
+    "desativado": "",
+    "aguardando_aprovacao": "warn",
+    "config_incompleta": "warn",
+    "invalido": "danger",
+}
+FINDING_TONES = {"block": "danger", "held": "warn", "warning": "info", "note": ""}
+FINDING_LABELS = {
+    "block": "bloqueia",
+    "held": "exige aprovação",
+    "warning": "aviso",
+    "note": "informação",
+}
+USE_LABELS = {
+    "playbook": "playbook",
+    "tool": "tool MCP",
+    "skill": "skill A2A",
+    "knowledge": "base de conhecimento",
+}
+PLUGIN_EVENT_LABELS = {
+    "install": "instalado",
+    "upgrade": "atualizado",
+    "approve": "achados aprovados",
+    "config": "configuração alterada",
+    "enable": "ativado",
+    "disable": "desativado",
+    "rescan": "varredura refeita",
+    "profiles": "roteadores alterados",
+    "uninstall": "removido",
+}
+
+
+def _as_datetime(value: Any) -> datetime | None:
+    if value is None or isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+
 
 def _fmt_datetime(value) -> str:
+    value = _as_datetime(value)
     if value is None:
         return "—"
     return value.strftime("%d/%m/%Y %H:%M:%S")
 
 
+def _fmt_ms(value) -> str:
+    if value is None:
+        return "—"
+    value = float(value)
+    if value >= 60_000:
+        return f"{value / 60_000:.1f} min"
+    if value >= 1000:
+        return f"{value / 1000:.1f} s"
+    return f"{value:.0f} ms"
+
+
 def build_templates() -> Jinja2Templates:
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     env = templates.env
-    env.globals.update(version=__version__, route_labels=ROUTE_LABELS, presets=PRESETS)
+    env.globals.update(
+        version=__version__,
+        route_labels=ROUTE_LABELS,
+        run_labels=RUN_STATUS_LABELS,
+        contract_labels=states.LABELS,
+        contract_states=[
+            states.PROPOSED,
+            states.ACTIVE,
+            states.INPUT_REQUIRED,
+            states.COMPLETED,
+            states.FAILED,
+            states.REJECTED,
+            states.CANCELED,
+            states.EXPIRED,
+            states.BREACHED,
+        ],
+        open_states=states.OPEN,
+        tones=STATE_TONES,
+        presets=PRESETS,
+        plugin_tones=PLUGIN_TONES,
+        plugin_labels=PLUGIN_STATE_LABELS,
+        finding_tones=FINDING_TONES,
+        finding_labels=FINDING_LABELS,
+        finding_levels=LEVEL_LABELS,
+        use_labels=USE_LABELS,
+        plugin_event_labels=PLUGIN_EVENT_LABELS,
+    )
     env.filters["datetime"] = _fmt_datetime
+    env.filters["ms"] = _fmt_ms
     env.filters["secret"] = SecretBox.describe
     env.policies["json.dumps_kwargs"] = {"ensure_ascii": False, "sort_keys": False}
     return templates
@@ -54,17 +169,23 @@ class Console:
     db: Database
     box: SecretBox
     knowledge: KnowledgeService
-    catalog: AgentCatalog
+    plugins: PluginService
+    connectors: ConnectorCatalog
+    agents: AgentDirectory
     templates: Jinja2Templates
     http: httpx.AsyncClient
+    # transporte HTTP do teste de modelos de decisão (Jev); None = rede de verdade
+    jev_transport: httpx.AsyncBaseTransport | None = None
 
     @classmethod
     def create(
         cls,
         settings: Settings,
         *,
-        catalog: AgentCatalog | None = None,
+        connectors: ConnectorCatalog | None = None,
+        agents: AgentDirectory | None = None,
         http: httpx.AsyncClient | None = None,
+        jev_transport: httpx.AsyncBaseTransport | None = None,
     ) -> Console:
         db = Database(settings.database_url, vector_backend=settings.vector_backend)
         db.init()
@@ -72,18 +193,24 @@ class Console:
             load_master_key(settings.secret_key, settings.secret_key_file),
             settings.allowed_env_secrets,
         )
+        knowledge = KnowledgeService(db, EmbedderCache(box.open))
         return cls(
             settings=settings,
             db=db,
             box=box,
-            knowledge=KnowledgeService(db, EmbedderCache(box.open)),
-            catalog=catalog or AgentCatalog(ttl_s=15.0, resolve_secret=box.open),
+            knowledge=knowledge,
+            plugins=PluginService(db, knowledge, box),
+            connectors=connectors or ConnectorCatalog(ttl_s=15.0, resolve_secret=box.open),
+            agents=agents
+            or AgentDirectory(client=A2AClient(), ttl_s=15.0, resolve_secret=box.open),
             templates=build_templates(),
             http=http or httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=5.0)),
+            jev_transport=jev_transport,
         )
 
     async def aclose(self) -> None:
         await self.knowledge.aclose()
+        await self.agents.aclose()
         await self.http.aclose()
         self.db.dispose()
 
@@ -98,6 +225,19 @@ class Console:
 
         return await anyio.to_thread.run_sync(call)
 
+    async def kb_plugin(self, kb_id: int) -> str | None:
+        """Nome do plugin dono da base (``None`` para uma base comum ou inexistente).
+
+        Os documentos de uma base de plugin vêm do pacote: quem os troca é o plugin.
+        """
+
+        def look(session) -> str | None:
+            kb = session.get(KnowledgeBase, kb_id)
+            owner = session.get(Plugin, kb.plugin_id) if kb and kb.plugin_id else None
+            return owner.name if owner else None
+
+        return await self.run_db(look)
+
     def render(self, request: Request, name: str, **context: Any):
         context.setdefault("nav", "")
         context["flash_ok"] = request.query_params.get("ok")
@@ -111,6 +251,12 @@ class Console:
             headers["Authorization"] = f"Bearer {self.settings.router_api_key}"
         url = self.settings.router_url.rstrip("/") + path
         return await self.http.request(method, url, headers=headers, **kwargs)
+
+
+KB_FROM_PLUGIN = (
+    "Os documentos desta base vêm do plugin {plugin}: para mudá-los, envie uma nova versão do "
+    "plugin (ou use 'Sincronizar documentos' na página dele)."
+)
 
 
 def get_console(request: Request) -> Console:

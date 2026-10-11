@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% from "_macros.html" import empty, delete_button, plugin_state_badge, component_counts %}
+{% block title %}Plugins{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Plugins</h1>
+    <p>Um plugin é um pacote <strong>declarativo</strong> que o router recebe pronto: <strong>conectores MCP</strong>, <strong>agentes A2A</strong>, <strong>bases de conhecimento</strong> e <strong>playbooks</strong> (o jeito de usar tudo isso, no formato Agent Skills). O console valida o pacote, varre o conteúdo e só ativa o que você aprovou e configurou; os roteadores a que você ligar o plugin passam a usá-lo, e o uso é medido por plugin e por versão. Nada de um plugin é executado.</p>
+  </div>
+  <div class="actions"><a class="btn primary" href="/plugins/new">Subir plugin</a></div>
+</div>
+
+<div class="card">
+  {% if plugins %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Plugin</th><th>Situação</th><th>Traz</th><th>Roteadores</th><th>Uso</th><th class="right">Ações</th></tr></thead>
+    <tbody>
+    {% for p in plugins %}
+      <tr id="{{ p.name }}">
+        <td><a href="/plugins/{{ p.id }}"><strong>{{ p.name }}</strong></a> <span class="muted mono small">v{{ p.version }}</span>
+          <span class="sub">{{ p.description or 'Sem descrição.' }}</span>
+          {% if p.format == 'claude' %}<span class="sub"><span class="badge">importado do formato Claude</span></span>{% endif %}</td>
+        <td>{{ plugin_state_badge(p.state, p.state_label) }}
+          {% if p.state == 'aguardando_aprovacao' %}<span class="sub">{{ p.pending }} achado(s) para aprovar</span>
+          {% elif p.state == 'config_incompleta' %}<span class="sub">falta: {{ p.missing|join(', ') }}</span>{% endif %}</td>
+        <td class="small">{{ component_counts(p.component_counts) }}</td>
+        <td><div class="pill-list">{% for name in p.profiles %}<span class="pill">{{ name }}</span>{% else %}<span class="muted">nenhum</span>{% endfor %}</div></td>
+        <td class="small nowrap">
+          {% if p.usage.requests %}{{ p.usage.requests }} pedido(s)
+            {% if p.usage.errors %}<span class="sub"><span class="badge danger">{{ p.usage.errors }} erro(s)</span></span>{% endif %}
+            <span class="sub">{{ p.usage.versions }} versão(ões)</span>
+          {% else %}<span class="muted">sem uso ainda</span>{% endif %}
+        </td>
+        <td class="right nowrap">
+          <a class="btn small" href="/plugins/{{ p.id }}">Abrir</a>
+          <form class="inline" method="post" action="/plugins/{{ p.id }}/{{ 'disable' if p.enabled else 'enable' }}"><button class="btn small" type="submit">{{ 'Desativar' if p.enabled else 'Ativar' }}</button></form>
+          {{ delete_button("/plugins/" ~ p.id ~ "/delete", confirm="Remover o plugin " ~ p.name ~ " e os conectores, agentes e bases dele?") }}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}
+  {{ empty("Nenhum plugin instalado", "Suba um pacote .zip para trazer conectores, agentes, bases e playbooks prontos. A página de envio mostra o formato do pacote.", "/plugins/new", "Subir plugin") }}
+  {% endif %}
+</div>
+
+{% if events %}
+<div class="card">
+  <h2>Atividade recente</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Quando</th><th>Plugin</th><th>O que aconteceu</th><th>Quem</th></tr></thead>
+    <tbody>
+    {% for e in events %}
+      <tr>
+        <td class="nowrap small">{{ e.at|datetime }}</td>
+        <td>{% if e.plugin_id %}<a href="/plugins/{{ e.plugin_id }}"><strong>{{ e.plugin }}</strong></a>{% else %}<strong>{{ e.plugin }}</strong>{% endif %}
+          <span class="muted mono small">v{{ e.version }}</span></td>
+        <td>{{ plugin_event_labels.get(e.action, e.action) }}{% if e.summary %}<span class="sub">{{ e.summary }}</span>{% endif %}</td>
+        <td class="small">{{ e.actor or '—' }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+</div>
+{% endif %}
+{% endblock %}

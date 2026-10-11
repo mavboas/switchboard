@@ -1,7 +1,7 @@
 [project]
 name = "switchboard-console"
 version = "0.1.0"
-description = "Console (control plane): monólito com UI e API admin para configurar modelos, agentes, bases e roteadores"
+description = "Console (control plane): UI e API admin para configurar modelos, conectores MCP, agentes A2A, bases e roteadores e acompanhar execuções e contratos"
 license = "Apache-2.0"
 requires-python = ">=3.11"
 dependencies = [

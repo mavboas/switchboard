@@ -4,13 +4,14 @@
 [project]
 name = "switchboard-workspace"
 version = "0.1.0"
-description = "Monorepo do Switchboard: roteador de agentes com RAG e delegação via MCP"
+description = "Monorepo do Switchboard: roteador de agentes com RAG, tools via MCP e delegação a agentes via A2A"
 requires-python = ">=3.11"
 dependencies = [
     "switchboard-core",
     "switchboard-router",
     "switchboard-console",
     "switchboard-example-agents",
+    "switchboard-agentkit",
 ]
 
 [dependency-groups]
@@ -24,19 +25,21 @@ dev = [
 package = false
 
 [tool.uv.workspace]
-members = ["packages/core", "apps/router", "apps/console", "examples/agents"]
+members = ["packages/core", "packages/agentkit", "apps/router", "apps/console", "examples/agents"]
 
 [tool.uv.sources]
 switchboard-core = { workspace = true }
 switchboard-router = { workspace = true }
 switchboard-console = { workspace = true }
 switchboard-example-agents = { workspace = true }
+switchboard-agentkit = { workspace = true }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = [
     "packages/core/tests",
+    "packages/agentkit/tests",
     "apps/router/tests",
     "apps/console/tests",
     "examples/agents/tests",
@@ -55,4 +58,4 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "ASYNC"]
 ignore = ["E501", "B008", "SIM905"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["switchboard", "switchboard_router", "switchboard_console", "switchboard_agents"]
+known-first-party = ["switchboard", "switchboard_router", "switchboard_console", "switchboard_agents", "switchboard_agentkit"]

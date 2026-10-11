@@ -1,24 +1,34 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import anyio
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from switchboard.agents import AgentCatalog
+from switchboard.connectors import ConnectorCatalog
+from switchboard.plugins import load_plugin, pack
 from switchboard.secrets import SecretBox
-from switchboard.storage import Database, repo, seed_demo
+from switchboard.storage import Database, KnowledgeService, PluginService, repo, seed_demo
+from switchboard.storage import plugins as plugin_repo
 from switchboard.storage.orm import LlmModel, RouterProfile
-from switchboard.testing import inproc_connector
-from switchboard_agents import chamados, credito
+from switchboard.testing import HostRoutingTransport, inproc_connector
+from switchboard_agents import analise, chamados, credito, risco
 from switchboard_router.app import create_app
 from switchboard_router.runtime import DbRuntime
 from switchboard_router.settings import Settings
 
 KNOWLEDGE_DIR = Path(__file__).resolve().parents[3] / "examples" / "knowledge"
-SERVERS = {"credito": credito.server, "chamados": chamados.server}
+EXAMPLE_PLUGIN = Path(__file__).resolve().parents[3] / "examples" / "plugins" / "acme-credito"
+# o conector do plugin de exemplo (nome qualificado) fala com o mesmo servidor em processo
+SERVERS = {
+    "credito": credito.server,
+    "chamados": chamados.server,
+    "acme-credito.credito": credito.server,
+}
 
 
 @pytest.fixture
@@ -29,23 +39,62 @@ def database(tmp_path):
         lambda: seed_demo(
             db,
             knowledge_dir=KNOWLEDGE_DIR,
-            agent_urls={"credito": "http://credito/mcp", "chamados": "http://chamados/mcp"},
+            connector_urls={"credito": "http://credito/mcp", "chamados": "http://chamados/mcp"},
+            agent_urls={"analise-credito": "http://analise.test", "risco": "http://risco.test"},
         )
     )
     chamados.reset()
     yield db
 
 
-def make_client(db: Database, **settings_kwargs) -> TestClient:
+def make_client(
+    db: Database, *, analise_delay: float = 0.05, risco_delay: float = 0.05, **settings_kwargs
+) -> TestClient:
+    """Router com os agentes A2A de exemplo (SDK oficial) em processo.
+
+    Um transporte httpx roteia por host: o router fala com ``analise.test`` e
+    ``risco.test``, e os agentes mandam push notifications para ``router.test``
+    — que é o próprio app do router.
+    """
     settings_kwargs.setdefault("allowed_hosts", "testserver")
-    settings = Settings(database_url=db.url, config_ttl_s=0, **settings_kwargs)
+    settings_kwargs.setdefault("public_url", "http://router.test")
+    settings = Settings(
+        database_url=db.url, config_ttl_s=0, supervisor_tick_s=0.05, **settings_kwargs
+    )
+    transport = HostRoutingTransport()
+    http = httpx.AsyncClient(transport=transport)
+    for host, module, delay in (
+        ("analise.test", analise, analise_delay),
+        ("risco.test", risco, risco_delay),
+    ):
+        agent = module.build(f"http://{host}", delay_s=delay)
+        agent.http = http
+        transport.mount(host, agent.build_app())
     runtime = DbRuntime(
         db,
         SecretBox(None),
         config_ttl_s=0,
-        catalog=AgentCatalog(connector=inproc_connector(SERVERS)),
+        public_url=settings.public_url,
+        supervisor_tick_s=0.05,
+        connectors=ConnectorCatalog(connector=inproc_connector(SERVERS)),
+        http=http,
     )
-    return TestClient(create_app(settings, runtime=runtime))
+    runtime.contracts.poll_min_s = 0.05
+    app = create_app(settings, runtime=runtime)
+    app.state.test_transport = transport  # os testes leem o que foi enviado aos agentes
+    transport.mount("router.test", app)
+    return TestClient(app)
+
+
+def wait_run(
+    client: TestClient, run_id: str, status: str = "completed", timeout: float = 5.0
+) -> dict:
+    end = time.monotonic() + timeout
+    while True:
+        body = client.get(f"/v1/runs/{run_id}").json()
+        if body["status"] == status or time.monotonic() > end:
+            return body
+        time.sleep(0.05)
 
 
 def test_health_and_models(database):
@@ -64,14 +113,20 @@ def test_chat_direct_answer_and_trace_is_recorded(database):
         assert resp.status_code == 200
         body = resp.json()
         assert body["route"] == "direct" and "9h às 14h" in body["answer"]
+        assert body["status"] == "completed" and body["decided_by"] == "heuristic"
         assert body["sources"][0]["kb"] == "manual-atendimento"
-        assert [s["name"] for s in body["steps"]] == ["rag", "descoberta_mcp", "decisao"]
+        assert [s["name"] for s in body["steps"]] == ["rag", "descoberta", "decisao"]
+        assert body["spans"][0]["kind"] == "pedido" and body["spans"][0]["parent_id"] is None
     with database.session() as s:
         [trace] = repo.query_traces(s)
-        assert trace.id == body["trace_id"] and trace.route == "direct"
+        assert (
+            trace.id == body["trace_id"] and trace.route == "direct" and trace.status == "completed"
+        )
+        details = repo.run_details(s, trace.id)
+        assert {sp["kind"] for sp in details["spans"]} >= {"pedido", "rag", "descoberta", "decisao"}
 
 
-def test_chat_delegates_to_mcp_agent(database):
+def test_chat_calls_mcp_tool(database):
     with make_client(database) as client:
         body = client.post(
             "/v1/chat",
@@ -81,15 +136,16 @@ def test_chat_delegates_to_mcp_agent(database):
             },
         ).json()
     assert (body["route"], body["agent"], body["tool"]) == (
-        "delegated",
+        "tool",
         "credito",
         "simular_financiamento",
     )
     assert body["arguments"] == {"valor": 30000.0, "prazo_meses": 12, "taxa_mensal_percentual": 2.0}
     assert "Parcela mensal: R$ 2.836,79" in body["answer"]
+    assert "links" not in body and body["contracts"] == []
 
 
-def test_chat_multi_turn_clarify_then_delegate(database):
+def test_chat_multi_turn_clarify_then_tool(database):
     with make_client(database) as client:
         first = client.post("/v1/chat", json={"message": "quero abrir um chamado"}).json()
         assert first["route"] == "clarify"
@@ -102,13 +158,205 @@ def test_chat_multi_turn_clarify_then_delegate(database):
             },
         ]
         second = client.post("/v1/chat", json={"messages": history}).json()
-    assert second["route"] == "delegated" and second["tool"] == "abrir_chamado"
+    assert second["route"] == "tool" and second["tool"] == "abrir_chamado"
     assert second["arguments"]["prioridade"] == "alta"
     assert "CH-1001" in second["answer"]
 
 
-def test_openai_compatible_endpoint(database):
+def test_delegation_completes_within_the_wait(database):
     with make_client(database) as client:
+        resp = client.post(
+            "/v1/chat",
+            json={
+                "message": "Avalie o risco de fraude da operação de R$ 80 mil do cliente Maria Souza"
+            },
+        )
+        assert resp.status_code == 200, resp.json()
+        body = resp.json()
+        assert (body["route"], body["status"], body["agent"], body["tool"]) == (
+            "delegated",
+            "completed",
+            "risco",
+            "avaliar_risco",
+        )
+        assert "risco (avaliar_risco)" in body["answer"] and "Risco " in body["answer"]
+        [contract] = body["contracts"]
+        assert contract["state"] == "concluido" and contract["kind"] == "completo"
+        assert body["links"]["run"] == f"/v1/runs/{body['run_id']}"
+        details = wait_run(client, body["run_id"])
+        [full] = details["contracts"]
+        assert full["reply_mode"] == "push" and full["output"]["risco"] in (
+            "baixo",
+            "medio",
+            "alto",
+        )
+        sources = {e["source"] for e in full["events"]}
+        assert "push" in sources  # o agente (SDK) avisou o router
+        kinds = {sp["kind"] for sp in details["spans"]}
+        assert {"pedido", "delegacao", "espera", "contrato", "consolidacao"} <= kinds
+        contract_span = next(sp for sp in details["spans"] if sp["kind"] == "contrato")
+        delegation = next(sp for sp in details["spans"] if sp["kind"] == "delegacao")
+        assert contract_span["parent_id"] == delegation["id"] and contract_span["status"] == "ok"
+
+
+def test_long_task_returns_202_and_finishes_in_background(database):
+    with make_client(database, analise_delay=0.6) as client:
+        resp = client.post(
+            "/v1/chat",
+            json={
+                "message": "Analise uma proposta de crédito de 80 mil para Maria Souza em 24 meses com renda de 12 mil",
+                "wait_s": 0.05,
+            },
+        )
+        assert resp.status_code == 202, resp.json()
+        body = resp.json()
+        assert body["status"] == "pending" and body["agent"] == "analise-credito"
+        assert "Encaminhei seu pedido" in body["answer"]
+        run_id = body["run_id"]
+        with client.stream("GET", f"/v1/runs/{run_id}/events") as stream:
+            events = []
+            for line in stream.iter_lines():
+                if line.startswith("event: "):
+                    events.append(line.removeprefix("event: "))
+                if line.startswith("data: ") and events and events[-1] == "done":
+                    break
+        assert events[0] == "run" and events[-1] == "done"
+        details = wait_run(client, run_id)
+        assert details["status"] == "completed" and "Proposta aprovada" in details["answer"]
+        assert details["contracts"][0]["output"]["decisao"] == "aprovado"
+    with database.session() as s:
+        row = repo.trace_to_dict(
+            s.get(__import__("switchboard.storage.orm", fromlist=["Trace"]).Trace, run_id)
+        )
+        assert row["status"] == "completed" and row["route"] == "delegated"
+
+
+def test_agent_asks_for_input_and_user_reply_continues_the_contract(database):
+    with make_client(database) as client:
+        body = client.post(
+            "/v1/chat",
+            json={
+                "message": "Analise uma proposta de crédito de 800 mil para João Lima em 120 meses com renda de 60 mil",
+                "wait_s": 3,
+            },
+        ).json()
+        assert body["status"] == "needs_input", body
+        assert "garantia" in body["answer"]
+        run_id = body["run_id"]
+        reply = client.post(
+            "/v1/chat", json={"run_id": run_id, "message": "sim, imóvel quitado", "wait_s": 3}
+        )
+        assert reply.status_code == 200, reply.json()
+        final = reply.json()
+        assert final["run_id"] == run_id and final["status"] == "completed", final
+        details = wait_run(client, run_id)
+        [contract] = details["contracts"]
+        assert contract["output"]["garantia"] == "imóvel"
+        states = [e["state"] for e in contract["events"] if e["kind"] == "state"]
+        assert (
+            states[:3] == ["proposto", "ativo", "aguardando_entrada"] and states[-1] == "concluido"
+        )
+        assert (
+            client.post("/v1/chat", json={"run_id": "0" * 32, "message": "oi"}).status_code == 404
+        )
+
+
+def test_cancel_run(database):
+    with make_client(database, analise_delay=5.0) as client:
+        body = client.post(
+            "/v1/chat",
+            json={
+                "message": "Analise uma proposta de crédito de 50 mil para Ana Costa em 12 meses com renda de 9 mil",
+                "wait_s": 0,
+            },
+        ).json()
+        assert body["status"] == "pending"
+        canceled = client.post(f"/v1/runs/{body['run_id']}/cancel").json()
+        assert [c["state"] for c in canceled["canceled"]] == ["cancelado"]
+        details = wait_run(client, body["run_id"])
+        assert details["status"] == "completed" and "cancelado" in details["answer"]
+        assert client.post("/v1/runs/nao-existe/cancel").status_code == 404
+
+
+def test_push_endpoint_requires_the_contract_token(database):
+    with make_client(database, analise_delay=5.0) as client:
+        body = client.post(
+            "/v1/chat",
+            json={
+                "message": "Analise uma proposta de crédito de 50 mil para Ana Costa em 12 meses com renda de 9 mil",
+                "wait_s": 0,
+            },
+        ).json()
+        contract_id = body["contracts"][0]["id"]
+        event = {"statusUpdate": {"taskId": "x", "status": {"state": "TASK_STATE_COMPLETED"}}}
+        assert client.post(f"/a2a/push/{contract_id}", json=event).status_code == 401
+        assert (
+            client.post(
+                f"/a2a/push/{contract_id}",
+                json=event,
+                headers={"X-A2A-Notification-Token": "chute"},
+            ).status_code
+            == 401
+        )
+        assert client.post("/a2a/push/ctr_nao_existe", json=event).status_code == 404
+        # sem o token, o corpo nem é lido: 401 antes do parse e do limite de tamanho
+        big = b'{"x": "' + b"a" * 2_000_000 + b'"}'
+        assert client.post(f"/a2a/push/{contract_id}", content=big).status_code == 401
+        # com o token do contrato (o que o router mandou ao agente no SendMessage)
+        sent = [
+            json.loads(r.content)
+            for r in client.app.state.test_transport.sent
+            if r.url.host == "analise.test" and r.method == "POST"
+        ]
+        [config] = [
+            m["params"]["configuration"]["taskPushNotificationConfig"]
+            for m in sent
+            if m.get("method") == "SendMessage"
+        ]
+        auth = {"X-A2A-Notification-Token": config["token"]}
+        assert (
+            client.post(
+                f"/a2a/push/{contract_id}",
+                content=b"{",
+                headers={**auth, "content-type": "application/json"},
+            ).status_code
+            == 400
+        )
+        assert client.post(f"/a2a/push/{contract_id}", content=big, headers=auth).status_code == 413
+
+        def chunked():  # sem Content-Length: o teto vale durante a leitura
+            for _ in range(40):
+                yield b"a" * 65536
+
+        assert (
+            client.post(f"/a2a/push/{contract_id}", content=chunked(), headers=auth).status_code
+            == 413
+        )
+        client.post(f"/v1/runs/{body['run_id']}/cancel")
+
+
+def test_push_endpoint_is_open_to_agents_even_with_api_keys(database):
+    with make_client(database, api_keys="k1") as client:
+        # sem a chave da API: a rota de push não pede chave (autentica pelo token do contrato)
+        assert client.post("/a2a/push/ctr_x", json={}).status_code == 404
+        assert client.post("/v1/chat", json={"message": "oi"}).status_code == 401
+
+
+def test_callbacks_need_allowed_hosts(database):
+    with make_client(database) as client:
+        resp = client.post(
+            "/v1/chat", json={"message": "oi", "callback_url": "http://cliente/hook"}
+        )
+        assert resp.status_code == 422 and "desligados" in resp.json()["detail"]
+    with make_client(database, callback_hosts="cliente") as client:
+        bad = client.post("/v1/chat", json={"message": "oi", "callback_url": "http://outro/hook"})
+        assert bad.status_code == 422
+        ok = client.post("/v1/chat", json={"message": "oi", "callback_url": "http://cliente/hook"})
+        assert ok.status_code == 200
+
+
+def test_openai_compatible_endpoint(database):
+    with make_client(database, analise_delay=0.5) as client:
         resp = client.post(
             "/v1/chat/completions",
             json={
@@ -121,7 +369,27 @@ def test_openai_compatible_endpoint(database):
         body = resp.json()
         assert body["object"] == "chat.completion"
         assert "60 meses" in body["choices"][0]["message"]["content"]
-        assert body["switchboard"]["route"] == "direct"
+        assert (
+            body["switchboard"]["route"] == "direct"
+            and body["switchboard"]["status"] == "completed"
+        )
+
+        pending = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "default",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Analise uma proposta de crédito de 80 mil para Maria Souza em 24 meses com renda de 12 mil",
+                    }
+                ],
+                "switchboard": {"wait_s": 0},
+            },
+        ).json()
+        assert pending["switchboard"]["status"] == "pending"
+        assert "Encaminhei" in pending["choices"][0]["message"]["content"]
+        assert pending["switchboard"]["links"]["events"].endswith("/events")
 
         missing = client.post(
             "/v1/chat/completions",
@@ -139,6 +407,7 @@ def test_openai_compatible_endpoint(database):
             },
         ) as stream:
             lines = [line for line in stream.iter_lines() if line]
+        wait_run(client, pending["switchboard"]["run_id"])
     assert lines[-1] == "data: [DONE]"
     first = json.loads(lines[0].removeprefix("data: "))
     assert (
@@ -148,16 +417,21 @@ def test_openai_compatible_endpoint(database):
     assert json.loads(lines[1].removeprefix("data: "))["choices"][0]["finish_reason"] == "stop"
 
 
-def test_agents_endpoint_reports_discovery(database):
+def test_connectors_and_agents_endpoints(database):
     with make_client(database) as client:
-        body = client.get("/v1/agents").json()
-    agents = {a["name"]: a for a in body["agents"]}
-    assert agents["credito"]["status"] == "online"
-    assert {t["name"] for t in agents["chamados"]["tools"]} == {
+        connectors = {c["name"]: c for c in client.get("/v1/connectors").json()["connectors"]}
+        agents = {a["name"]: a for a in client.get("/v1/agents?refresh=true").json()["agents"]}
+    assert connectors["credito"]["status"] == "online"
+    assert {t["name"] for t in connectors["chamados"]["tools"]} == {
         "abrir_chamado",
         "consultar_chamado",
         "listar_chamados",
     }
+    assert agents["analise-credito"]["status"] == "online" and agents["analise-credito"]["push"]
+    [skill] = agents["risco"]["skills"]
+    assert (
+        skill["id"] == "avaliar_risco" and skill["contract"] == "completo" and skill["input_hash"]
+    )
 
 
 def test_api_keys_are_enforced(database):
@@ -170,6 +444,7 @@ def test_api_keys_are_enforced(database):
             == 200
         )
         assert client.get("/v1/models", headers={"x-api-key": "chave-1"}).status_code == 200
+        assert client.get("/v1/runs/x").status_code == 401
         assert client.get("/healthz").status_code == 200  # health continua aberto
 
 
@@ -186,9 +461,12 @@ def test_config_changes_are_picked_up_without_restart(database):
 def test_validation_errors(database):
     with make_client(database) as client:
         assert client.post("/v1/chat", json={}).status_code == 422
+        assert client.post("/v1/chat", json={"message": "oi", "wait_s": -1}).status_code == 422
         assert (
             client.post("/v1/chat", json={"profile": "outro", "message": "oi"}).status_code == 404
         )
+        assert client.get("/v1/runs/nao-existe").status_code == 404
+        assert client.get("/v1/runs/nao-existe/events").status_code == 404
 
 
 def test_yaml_mode(tmp_path):
@@ -207,6 +485,9 @@ profiles: [{{name: default, model: offline, knowledge_bases: [manual], min_score
         body = client.post("/v1/chat", json={"message": "Qual o e-mail da ouvidoria?"}).json()
         assert body["route"] == "direct" and "ouvidoria@acme.example" in body["answer"]
         assert client.get("/v1/models").json()["data"][0]["id"] == "default"
+        assert (
+            client.get(f"/v1/runs/{body['run_id']}").status_code == 404
+        )  # sem delegação, sem execução guardada
 
 
 def test_unreadable_model_secret_falls_back_to_offline(database):
@@ -234,6 +515,11 @@ def test_open_api_only_answers_known_hosts(database):
             ).status_code
             == 200
         )
+        # o host da URL pública (push dos agentes) entra na lista sozinho
+        assert (
+            client.post("/a2a/push/ctr_x", json={}, headers={"Host": "router.test"}).status_code
+            == 404
+        )
         assert client.get("/healthz", headers={"Host": "10.0.0.7:8080"}).status_code == 200
     with make_client(database, allowed_hosts="localhost", api_keys="k1") as client:
         # com chave, qualquer host serve (a chave é a proteção)
@@ -243,3 +529,173 @@ def test_open_api_only_answers_known_hosts(database):
             headers={"Host": "api.empresa.com", "Authorization": "Bearer k1"},
         )
         assert ok.status_code == 200
+
+
+# --------------------------------------------------------------------------
+# plugins
+
+
+PLUGIN_CONFIG = {"CREDITO_URL": "http://credito/mcp", "ANALISE_URL": "http://analise.test"}
+
+
+def install_example_plugin(db: Database, source=EXAMPLE_PLUGIN, config=None) -> None:
+    """Instala o plugin (com os documentos das bases indexados), como o console faz."""
+    service = PluginService(db, KnowledgeService(db), SecretBox(None))
+    anyio.run(
+        lambda: service.install(
+            load_plugin(source).pack(), config=PLUGIN_CONFIG if config is None else config
+        )
+    )
+
+
+def attach_plugin(db: Database, name: str, *, only_plugin: bool = False) -> None:
+    """Liga o plugin ao roteador 'default'; com ``only_plugin``, tira o que foi cadastrado à mão."""
+    with db.session() as s:
+        profile = s.query(RouterProfile).one()
+        if only_plugin:
+            profile.connectors, profile.agents, profile.knowledge_bases = [], [], []
+        plugin_repo.set_profile_plugins(s, profile, [plugin_repo.require_plugin(s, name).id])
+
+
+def test_plugin_components_and_playbook_serve_the_chat_and_usage_is_kept_per_version(database):
+    install_example_plugin(database)
+    attach_plugin(database, "acme-credito", only_plugin=True)
+    with make_client(database) as client:
+        listing = client.get("/v1/plugins").json()
+        assert listing["profile"] == "default" and listing["warnings"] == []
+        [info] = listing["plugins"]
+        assert (info["name"], info["version"]) == ("acme-credito", "1.0.0")
+        assert info["connectors"] == ["acme-credito.credito"]
+        assert info["agents"] == ["acme-credito.analise-credito"]
+        assert info["knowledge_bases"] == ["acme-credito.politicas"]
+        [playbook] = info["playbooks"]
+        assert playbook["skill"] == "politica-de-credito" and "body" not in playbook
+        assert client.get("/v1/plugins?profile=outro").status_code == 404
+
+        # ação síncrona: a tool do conector do plugin, orientada pelo playbook
+        tool = client.post(
+            "/v1/chat",
+            json={"message": "Simule um empréstimo de R$ 30 mil em 12 meses a 2% ao mês"},
+        ).json()
+        assert (tool["route"], tool["agent"], tool["tool"]) == (
+            "tool",
+            "acme-credito.credito",
+            "simular_financiamento",
+        )
+        assert "Parcela mensal: R$ 2.836,79" in tool["answer"]
+        used = {(u["kind"], u["component"], u["ok"]) for u in tool["plugins"]}
+        assert {
+            ("playbook", "politica-de-credito", None),
+            ("tool", "acme-credito.credito/simular_financiamento", True),
+        } <= used
+        assert {(u["plugin"], u["version"]) for u in tool["plugins"]} == {("acme-credito", "1.0.0")}
+        assert any(s["kind"] == "playbooks" for s in tool["spans"])
+
+        # resposta direta: o RAG vem da base do plugin
+        direct = client.post(
+            "/v1/chat",
+            json={"message": "Em quanto tempo o dinheiro é liberado depois da assinatura digital?"},
+        ).json()
+        assert direct["route"] == "direct" and "1 dia útil" in direct["answer"]
+        assert {s["kb"] for s in direct["sources"]} == {"acme-credito.politicas"}
+        assert ("knowledge", "acme-credito.politicas") in {
+            (u["kind"], u["component"]) for u in direct["plugins"]
+        }
+
+        # a execução guardada traz os plugins que participaram
+        assert client.get(f"/v1/runs/{tool['run_id']}").json()["plugins"] == tool["plugins"]
+
+        # a compatibilidade com a API da OpenAI também informa
+        completion = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "default",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Simule um empréstimo de R$ 30 mil em 12 meses a 2% ao mês",
+                    }
+                ],
+            },
+        ).json()
+        assert {u["plugin"] for u in completion["switchboard"]["plugins"]} == {"acme-credito"}
+
+    with database.session() as s:
+        [row] = plugin_repo.usage_by_version(s, "acme-credito")
+        assert (row["version"], row["requests"], row["errors"]) == ("1.0.0", 3, 0)
+        assert row["kinds"]["playbook"] >= 2 and row["kinds"]["tool"] == 2
+        assert row["kinds"]["knowledge"] == 1
+
+
+def test_plugin_waiting_for_approval_stays_out_until_it_is_approved(database):
+    files = {
+        "plugin.yaml": (
+            "name: acme-fila\nversion: 1.0.0\ndescription: Playbook sempre ativo.\n"
+            "playbooks:\n  - skill: atender\n    always: true\n"
+        ),
+        "skills/atender/SKILL.md": (
+            "---\nname: atender\ndescription: Como atender o cliente.\n---\n\n"
+            "Seja cordial e objetivo.\n"
+        ),
+    }
+    install_example_plugin(database, pack({k: v.encode() for k, v in files.items()}), config={})
+    attach_plugin(database, "acme-fila")
+    with make_client(database) as client:
+        listing = client.get("/v1/plugins").json()
+        assert listing["plugins"] == []
+        [warning] = listing["warnings"]
+        assert "acme-fila" in warning and "aguardando aprovação" in warning
+        body = client.post("/v1/chat", json={"message": "Qual o horário de atendimento?"}).json()
+        assert body["plugins"] == [] and any("aguardando aprovação" in w for w in body["warnings"])
+
+        with database.session() as s:  # o operador aprova no console
+            plugin_repo.approve_plugin(s, "acme-fila", actor="admin")
+        [info] = client.get("/v1/plugins").json()["plugins"]  # sem reiniciar o router
+        assert info["name"] == "acme-fila" and info["playbooks"][0]["always"] is True
+        body = client.post("/v1/chat", json={"message": "Qual o horário de atendimento?"}).json()
+        assert [(u["kind"], u["component"]) for u in body["plugins"]] == [("playbook", "atender")]
+        assert not any("aguardando" in w for w in body["warnings"])
+
+        with database.session() as s:  # e desativa: sai do roteamento na hora
+            plugin_repo.set_plugin_enabled(s, "acme-fila", False)
+        assert client.get("/v1/plugins").json()["plugins"] == []
+
+
+def test_plugin_endpoint_follows_the_api_keys(database):
+    with make_client(database, api_keys="k1") as client:
+        assert client.get("/v1/plugins").status_code == 401
+        ok = client.get("/v1/plugins", headers={"Authorization": "Bearer k1"})
+        assert ok.status_code == 200 and ok.json()["plugins"] == []
+
+
+def test_yaml_mode_with_a_plugin(tmp_path):
+    config = tmp_path / "switchboard.yaml"
+    config.write_text(
+        f"""
+models: [{{name: offline, provider: offline}}]
+plugins:
+  - name: acme-credito
+    path: "{EXAMPLE_PLUGIN.as_posix()}"
+    config:
+      CREDITO_URL: http://127.0.0.1:9/mcp
+      ANALISE_URL: http://127.0.0.1:9
+profiles:
+  - {{name: default, model: offline, plugins: [acme-credito], min_score: 0.1}}
+""",
+        encoding="utf-8",
+    )
+    with TestClient(
+        create_app(Settings(config_file=str(config), allowed_hosts="testserver"))
+    ) as client:
+        [info] = client.get("/v1/plugins").json()["plugins"]
+        assert (info["name"], info["version"]) == ("acme-credito", "1.0.0")
+        assert info["connectors"] == ["acme-credito.credito"]
+        assert info["agents"] == ["acme-credito.analise-credito"]
+        body = client.post(
+            "/v1/chat",
+            json={"message": "Em quanto tempo o dinheiro é liberado depois da assinatura digital?"},
+        ).json()
+        assert body["route"] == "direct" and "1 dia útil" in body["answer"]
+        assert ("knowledge", "acme-credito.politicas") in {
+            (u["kind"], u["component"]) for u in body["plugins"]
+        }

@@ -5,7 +5,7 @@
 <div class="page-head">
   <div>
     <h1>Modelos</h1>
-    <p>Conexões com provedores de LLM. Troque o modelo de um roteador sem mudar código: OpenAI, Anthropic, Azure, Gemini, Ollama ou qualquer API compatível com OpenAI.</p>
+    <p>Conexões com provedores de LLM (redigem respostas, extraem argumentos e consolidam resultados) e com modelos de decisão TypeSafe Jev (escolhem a rota com probabilidades). Troque o modelo de um roteador sem mudar código.</p>
   </div>
   <div class="actions"><a class="btn primary" href="/models/new">Novo modelo</a></div>
 </div>
@@ -18,7 +18,7 @@
     {% for m in models %}
       <tr>
         <td><a href="/models/{{ m.id }}"><strong>{{ m.name }}</strong></a>{% if m.base_url %}<span class="sub mono">{{ m.base_url }}</span>{% endif %}</td>
-        <td><span class="badge">{{ presets[m.preset].label if m.preset in presets else m.provider }}</span></td>
+        <td><span class="badge">{{ presets[m.preset].label if m.preset in presets else m.provider }}</span>{% if m.provider == 'typesafe' %} <span class="badge info">decisão</span>{% endif %}</td>
         <td class="mono">{{ m.model or '—' }}</td>
         <td class="small">{{ m.api_key|secret }}</td>
         <td>{% for p in m.used_by %}<span class="pill">{{ p }}</span> {% else %}<span class="muted">—</span>{% endfor %}</td>

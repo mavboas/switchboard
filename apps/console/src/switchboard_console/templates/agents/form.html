@@ -1,12 +1,12 @@
 {% extends "base.html" %}
 {% from "_macros.html" import field, textarea, checkbox %}
-{% block title %}{{ 'Editar' if values.id else 'Registrar' }} agente{% endblock %}
+{% block title %}{{ 'Editar' if values.id else 'Registrar' }} agente A2A{% endblock %}
 {% block content %}
 <div class="page-head">
   <div>
-    <div class="crumbs"><a href="/agents">Agentes MCP</a> /</div>
-    <h1>{{ values.name if values.id else 'Registrar agente' }}</h1>
-    <p>Informe o endpoint MCP do agente. Ao salvar, o console conecta, faz o handshake e lista as tools para você conferir.</p>
+    <div class="crumbs"><a href="/agents">Agentes A2A</a> /</div>
+    <h1>{{ values.name if values.id else 'Registrar agente A2A' }}</h1>
+    <p>Informe a URL base do agente. Ao salvar, o console busca o Agent Card (<code>/.well-known/agent-card.json</code>) e mostra as skills com os termos de contrato que o agente declara.</p>
   </div>
 </div>
 
@@ -14,32 +14,34 @@
 
 <form method="post" action="{{ '/agents/' ~ values.id if values.id else '/agents' }}" class="card">
   <div class="form-grid">
-    {{ field("name", "Nome", values.name, placeholder="ex.: credito", required=true, help="Minúsculas, números, - ou _. É o nome que o LLM vê no catálogo.") }}
-    <div class="field">
-      <label for="f-transport">Transporte</label>
-      <select id="f-transport" name="transport">
-        <option value="streamable-http" {% if values.transport != 'sse' %}selected{% endif %}>Streamable HTTP (recomendado)</option>
-        <option value="sse" {% if values.transport == 'sse' %}selected{% endif %}>SSE (legado)</option>
-      </select>
-    </div>
-    {{ field("url", "URL do endpoint MCP", values.url, type="url", placeholder="http://localhost:8101/mcp", required=true, cls="full") }}
-    {{ textarea("description", "Descrição para o roteador", values.description, help="Quando delegar para este agente. Se ficar vazia, usamos as <em>instructions</em> que o próprio servidor MCP publica.", cls="full", rows=2) }}
+    {{ field("name", "Nome", values.name, placeholder="ex.: analise-credito", required=true, help="Minúsculas, números, - ou _. É o nome que o roteador usa ao delegar.") }}
+    {{ field("url", "URL do agente", values.url, type="url", placeholder="http://localhost:8201", required=true, help="URL base (ou a do próprio card). O endpoint JSON-RPC vem do card e precisa estar no mesmo host, a menos que você libere abaixo.") }}
+    {{ textarea("description", "Descrição para o roteador", values.description, help="Quando delegar para este agente. Se ficar vazia, usamos a descrição do Agent Card.", cls="full", rows=2) }}
 
     <div class="field">
       <label for="f-auth_token">Token de acesso (opcional)</label>
       <input type="password" id="f-auth_token" name="auth_token" autocomplete="off"
              placeholder="{{ 'deixe em branco para manter: ' ~ (values.auth_token|secret) if values.auth_token else 'enviado como Authorization: Bearer' }}">
-      <div class="help">Texto (fica cifrado{% if not secrets_enabled %}; exige <code>SWITCHBOARD_SECRET_KEY</code>{% endif %}) ou <code>env:NOME</code>.</div>
+      <div class="help">Texto (fica cifrado{% if not secrets_enabled %}; exige <code>SWITCHBOARD_SECRET_KEY</code>{% endif %}) ou <code>env:NOME</code> (ex.: <code>env:A2A_ANALISE_TOKEN</code>).</div>
       {% if values.auth_token %}<label class="small"><input type="checkbox" name="clear_auth_token"> remover o token atual</label>{% endif %}
     </div>
-    {{ field("allowed_tools", "Tools liberadas (allowlist)", values.allowed_tools, placeholder="vazio = todas", help="Nomes separados por vírgula. Tools fora da lista ficam invisíveis para o roteador e não podem ser chamadas.") }}
+    {{ field("allowed_skills", "Skills liberadas (allowlist)", values.allowed_skills, placeholder="vazio = todas", help="Ids de skill separados por vírgula. Skills fora da lista ficam invisíveis para o roteador.") }}
 
-    {{ field("timeout_s", "Timeout (segundos)", values.timeout_s, type="number", attrs='min="1" step="1"') }}
+    <div class="section-title">Contrato e comunicação</div>
+    {{ field("deadline_s", "Prazo padrão dos contratos (segundos)", values.deadline_s, type="number", attrs='min="5" step="1"', placeholder="vazio = o da skill ou do roteador", help="Se preenchido, vale para todas as skills deste agente. Vencido o prazo, o contrato expira e a tarefa é cancelada no agente.") }}
+    {{ field("timeout_s", "Timeout de cada chamada (segundos)", values.timeout_s, type="number", attrs='min="1" max="300" step="1"', help="Tempo máximo de cada chamada JSON-RPC (SendMessage, GetTask, CancelTask). Não é o prazo da tarefa.") }}
+    {{ checkbox("push", "Receber push notifications", values.push, "Quando o agente suporta, ele avisa o router a cada mudança (em /a2a/push/...). O router continua conferindo por polling de tempos em tempos.") }}
+    {{ checkbox("allow_cross_origin", "Aceitar endpoint em outro host", values.allow_cross_origin, "Por padrão o endpoint JSON-RPC do card precisa estar no mesmo host da URL cadastrada (evita que um card redirecione chamadas autenticadas).") }}
     {{ checkbox("enabled", "Habilitado", values.enabled, "Agentes desabilitados saem do catálogo de todos os roteadores.") }}
   </div>
   <div class="form-actions">
-    <button class="btn primary" type="submit">Salvar e descobrir</button>
+    <button class="btn primary" type="submit">Salvar e ler o card</button>
     <a class="btn ghost" href="/agents">Cancelar</a>
   </div>
 </form>
+
+<div class="card">
+  <h2>Push notifications</h2>
+  <p class="muted small">Para o agente conseguir avisar o router, o router precisa de uma URL pública que o agente alcance: <code>SWITCHBOARD_PUBLIC_URL</code> no router (ex.: <code>http://router:8080</code> no docker compose). Sem ela, o router acompanha os contratos só por polling.</p>
+</div>
 {% endblock %}

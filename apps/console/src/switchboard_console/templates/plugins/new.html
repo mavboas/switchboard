@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}Subir plugin{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <div class="crumbs"><a href="/plugins">Plugins</a> /</div>
+    <h1>Subir plugin</h1>
+    <p>Envie o pacote (.zip). O console lê o conteúdo com limites, mostra o que ele traz e o que a varredura de segurança achou, e <strong>só instala quando você confirmar</strong>. Achados que exigem aprovação deixam o plugin parado até você aprová-los na página dele; nada do pacote é executado.</p>
+  </div>
+</div>
+
+{% if error %}<div class="flash error">{{ error }}</div>{% endif %}
+
+<form method="post" action="/plugins" enctype="multipart/form-data" class="card" id="plugin-form">
+  <div class="field">
+    <label for="f-file">Pacote do plugin</label>
+    <input type="file" id="f-file" name="file" accept=".zip,application/zip" required>
+    <div class="help">Até {{ limits.archive_mb }} MB, {{ limits.files }} arquivos e {{ limits.file_mb }} MB por arquivo. Só texto declarativo (YAML, JSON, Markdown, texto): qualquer outro tipo de arquivo recusa o pacote.</div>
+  </div>
+  <div class="form-actions">
+    <button class="btn" type="submit" formaction="/plugins/validate" id="plugin-validate">Validar sem instalar</button>
+    <button class="btn primary" type="submit">Instalar</button>
+  </div>
+  <div id="plugin-preview">{% if preview %}{% include "plugins/_preview.html" %}{% endif %}</div>
+</form>
+
+<div class="grid grid-2">
+  <div class="card">
+    <h2>Como é um pacote</h2>
+<pre class="block">meu-plugin.zip
+├── plugin.yaml            manifesto
+├── skills/
+│   └── politica-de-credito/
+│       └── SKILL.md       playbook (Agent Skills)
+└── knowledge/
+    └── politica.md        documentos da base</pre>
+    <p class="muted small" style="margin-top:12px">O pacote nunca traz endereços nem tokens: o manifesto declara as chaves em <code>config</code> e quem instala informa os valores (segredos ficam cifrados, ou use <code>env:NOME</code>). Os componentes ganham o nome <code>plugin.componente</code> e só mudam com o plugin.</p>
+  </div>
+  <div class="card">
+    <h2>O manifesto (plugin.yaml)</h2>
+{% raw %}<pre class="block">name: acme-credito
+version: 1.0.0
+description: Simulação e análise de crédito.
+config:
+  CREDITO_URL:
+    description: Endereço do servidor MCP
+  ANALISE_URL:
+    description: Endereço do agente A2A
+connectors:
+  - name: credito
+    url: ${config.CREDITO_URL}
+    allowed_tools: [simular_financiamento]
+agents:
+  - name: analise-credito
+    url: ${config.ANALISE_URL}
+knowledge_bases:
+  - name: politicas
+    paths: [knowledge]
+playbooks:
+  - skill: politica-de-credito
+    applies_to: [credito]
+    triggers: [financiamento, parcela]</pre>{% endraw %}
+  </div>
+</div>
+
+<div class="card">
+  <h2>Também aceita o formato de plugin do Claude</h2>
+  <p class="muted">Um pacote com <code>.claude-plugin/plugin.json</code> é importado: as <strong>skills</strong> viram playbooks e os <strong>servidores MCP remotos</strong> viram conectores (as variáveis viram configuração). Comandos, subagentes, hooks e servidores MCP locais <strong>não</strong> são importados, e cada parte deixada de fora aparece como achado: o router nunca executa código de plugin.</p>
+</div>
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', path='app.js') }}?v={{ version }}"></script><script>SwitchboardUI.pluginUpload();</script>{% endblock %}

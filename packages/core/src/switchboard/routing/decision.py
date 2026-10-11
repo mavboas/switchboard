@@ -1,4 +1,17 @@
-"""Leitura tolerante e validação da decisão devolvida pelo LLM."""
+"""Leitura tolerante e validação da decisão devolvida pelo LLM.
+
+Formatos aceitos (o LLM responde um objeto JSON)::
+
+    {"action": "answer",   "answer": "...", "sources": [1, 2], "reason": "..."}
+    {"action": "tool",     "connector": "credito", "tool": "simular_financiamento", "arguments": {...}}
+    {"action": "delegate", "tasks": [{"agent": "analise-credito", "skill": "analisar_proposta", "arguments": {...}}]}
+    {"action": "clarify",  "question": "...", "reason": "..."}
+
+``delegate`` também aceita uma tarefa só no nível de cima (``agent``,
+``skill``, ``arguments``). A validação confere cada tarefa contra as
+capacidades reais (tool MCP ou skill A2A) e o tipo final vem da capacidade
+encontrada — não do rótulo que o LLM usou.
+"""
 
 from __future__ import annotations
 
@@ -7,10 +20,11 @@ import re
 from collections.abc import Sequence
 from typing import Any
 
-from ..agents.catalog import AgentInfo, ToolInfo
+from ..contracts.terms import validate as validate_schema
 from ..text import fold
 from .args import describe_fields, validate_arguments
-from .types import Decision
+from .capabilities import Capability, find
+from .types import Decision, TaskRequest
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 
@@ -21,11 +35,15 @@ ACTION_ALIASES = {
     "direct": "answer",
     "responder": "answer",
     "resposta": "answer",
+    "tool": "tool",
+    "call_tool": "tool",
+    "use_tool": "tool",
+    "ferramenta": "tool",
+    "acionar": "tool",
     "delegate": "delegate",
     "delegar": "delegate",
-    "tool": "delegate",
-    "call_tool": "delegate",
-    "acionar": "delegate",
+    "agent": "delegate",
+    "agente": "delegate",
     "clarify": "clarify",
     "clarification": "clarify",
     "ask": "clarify",
@@ -41,14 +59,12 @@ class DecisionError(ValueError):
         self,
         message: str,
         *,
-        agent: AgentInfo | None = None,
-        tool: ToolInfo | None = None,
+        capability: Capability | None = None,
         missing: list[str] | None = None,
         arguments: dict[str, Any] | None = None,
     ):
         super().__init__(message)
-        self.agent = agent
-        self.tool = tool
+        self.capability = capability
         self.missing = missing or []
         self.arguments = arguments or {}
 
@@ -84,57 +100,119 @@ def _as_int_list(value: Any) -> list[int]:
     return out
 
 
+def _arguments(value: Any) -> dict[str, Any]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise DecisionError("'arguments' precisa ser um objeto JSON") from exc
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise DecisionError("'arguments' precisa ser um objeto JSON")
+    return value
+
+
+def _text(data: dict[str, Any], *names: str) -> str | None:
+    for name in names:
+        value = data.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _task(data: dict[str, Any], default_kind: str) -> TaskRequest:
+    owner = _text(data, "agent", "agente", "connector", "conector", "server", "owner") or ""
+    name = _text(data, "skill", "tool", "ferramenta", "name") or ""
+    kind = (
+        "skill" if (data.get("skill") or data.get("agent") or data.get("agente")) else default_kind
+    )
+    return TaskRequest(
+        kind=kind,  # type: ignore[arg-type]
+        owner=owner,
+        name=name,
+        arguments=_arguments(data.get("arguments", data.get("args", {}))),
+    )
+
+
 def parse_decision(text: str) -> Decision:
     data = extract_json_object(text)
     raw_action = str(data.get("action") or data.get("acao") or "").strip().lower()
     action = ACTION_ALIASES.get(raw_action)
     if action is None:
         raise DecisionError(
-            f"campo 'action' inválido ({raw_action!r}); use answer, delegate ou clarify"
+            f"campo 'action' inválido ({raw_action!r}); use answer, tool, delegate ou clarify"
         )
-    arguments = data.get("arguments", data.get("args", {}))
-    if isinstance(arguments, str):
-        try:
-            arguments = json.loads(arguments)
-        except json.JSONDecodeError as exc:
-            raise DecisionError("'arguments' precisa ser um objeto JSON") from exc
-    if arguments is None:
-        arguments = {}
-    if not isinstance(arguments, dict):
-        raise DecisionError("'arguments' precisa ser um objeto JSON")
-
-    def text_field(*names: str) -> str | None:
-        for name in names:
-            value = data.get(name)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-        return None
-
+    tasks: list[TaskRequest] = []
+    if action in ("tool", "delegate"):
+        raw_tasks = data.get("tasks") or data.get("tarefas")
+        if isinstance(raw_tasks, list) and raw_tasks:
+            for item in raw_tasks:
+                if not isinstance(item, dict):
+                    raise DecisionError("cada item de 'tasks' precisa ser um objeto")
+                tasks.append(_task(item, "skill" if action == "delegate" else "tool"))
+        else:
+            tasks.append(_task(data, "skill" if action == "delegate" else "tool"))
     return Decision(
         action=action,  # type: ignore[arg-type]
-        reason=text_field("reason", "motivo") or "",
-        answer=text_field("answer", "resposta"),
+        reason=_text(data, "reason", "motivo") or "",
+        answer=_text(data, "answer", "resposta"),
         sources=_as_int_list(data.get("sources", data.get("fontes"))),
-        agent=text_field("agent", "agente"),
-        tool=text_field("tool", "ferramenta"),
-        arguments=arguments,
-        question=text_field("question", "pergunta"),
+        question=_text(data, "question", "pergunta"),
+        tasks=tasks,
+        decided_by="llm",
     )
 
 
-def _find_agent(agents: Sequence[AgentInfo], name: str | None) -> AgentInfo | None:
-    if not name:
-        return None
-    wanted = fold(name).strip()
-    return next((a for a in agents if fold(a.name) == wanted), None)
+def resolve_capability(task: TaskRequest, caps: Sequence[Capability]) -> Capability:
+    """Acha a capacidade de uma tarefa (aceita ``dono/nome`` no nome e nome único)."""
+    name, owner = task.name, task.owner or None
+    for sep in ("/", ".", ":"):
+        if not owner and sep in name:
+            prefix, suffix = name.split(sep, 1)
+            if any(fold(c.owner) == fold(prefix) for c in caps):
+                owner, name = prefix, suffix
+                break
+    found = find(caps, owner, name) or (find(caps, None, name) if owner else None)
+    if found is None:
+        options = ", ".join(c.key for c in caps) or "nenhuma"
+        raise DecisionError(
+            f"capacidade {task.owner + '/' if task.owner else ''}{task.name!r} não existe; opções: {options}"
+        )
+    return found
+
+
+def check_arguments(cap: Capability, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Converte e confere os argumentos; faltas e erros viram :class:`DecisionError`."""
+    schema = cap.arguments_schema
+    converted, errors, missing = validate_arguments(schema, arguments)
+    if not errors and not missing and cap.kind == "skill" and cap.input_schema is not None:
+        errors = validate_schema(converted, cap.input_schema)  # o contrato é estrito
+    if errors:
+        raise DecisionError(
+            f"argumentos inválidos para {cap.key}: " + "; ".join(errors),
+            capability=cap,
+            missing=missing,
+            arguments=converted,
+        )
+    if missing:
+        labels = ", ".join(describe_fields(schema, missing))
+        raise DecisionError(
+            f"faltam argumentos obrigatórios para {cap.key}: {', '.join(missing)} ({labels})",
+            capability=cap,
+            missing=missing,
+            arguments=converted,
+        )
+    return converted
 
 
 def validate_decision(
     decision: Decision,
-    agents: Sequence[AgentInfo],
+    caps: Sequence[Capability],
     *,
     allow_clarify: bool,
     n_sources: int,
+    max_parallel: int = 3,
 ) -> Decision:
     if decision.action == "answer":
         if not decision.answer:
@@ -151,55 +229,39 @@ def validate_decision(
             raise DecisionError("action=clarify exige o campo 'question' preenchido")
         return decision
 
-    # delegate
-    if not agents:
-        raise DecisionError("não há agentes disponíveis; use action=answer")
-    tool_name = decision.tool or ""
-    agent = _find_agent(agents, decision.agent)
-    if agent is None and tool_name:
-        # aceita "agente/tool" ou "agente.tool" no campo tool
-        for sep in ("/", ".", ":"):
-            if sep in tool_name:
-                prefix, suffix = tool_name.split(sep, 1)
-                if _find_agent(agents, prefix):
-                    agent, tool_name = _find_agent(agents, prefix), suffix
-                    break
-    if agent is None and tool_name:
-        owners = [a for a in agents if a.tool(tool_name)]
-        if len(owners) == 1:
-            agent = owners[0]
-    if agent is None:
-        names = ", ".join(a.name for a in agents)
-        raise DecisionError(f"agente {decision.agent!r} não existe; opções: {names}")
-    tool = agent.tool(tool_name)
-    if tool is None:
-        names = ", ".join(t.name for t in agent.tools)
-        raise DecisionError(
-            f"a tool {tool_name!r} não existe no agente {agent.name}; opções: {names}", agent=agent
+    if not caps:
+        raise DecisionError("não há tools nem agentes disponíveis; use action=answer")
+    if not decision.tasks:
+        raise DecisionError("informe a tool ou as tarefas a delegar")
+    resolved: list[tuple[TaskRequest, Capability]] = []
+    for task in decision.tasks:
+        cap = resolve_capability(task, caps)
+        if any(c.key == cap.key for _, c in resolved):
+            continue  # tarefa repetida
+        resolved.append((task, cap))
+    kinds = {cap.kind for _, cap in resolved}
+    if kinds == {"tool"}:
+        if len(resolved) > 1:
+            raise DecisionError("acione uma tool por vez (use delegate só para agentes)")
+        decision.action = "tool"
+    elif kinds == {"skill"}:
+        if len(resolved) > max_parallel:
+            raise DecisionError(f"no máximo {max_parallel} tarefas delegadas por pedido")
+        decision.action = "delegate"
+    else:
+        raise DecisionError("não misture tool MCP com delegação a agente no mesmo pedido")
+    tasks = []
+    for task, cap in resolved:
+        arguments = check_arguments(cap, task.arguments)
+        instruction = str(arguments.get("instrucao") or "") if cap.input_schema is None else ""
+        tasks.append(
+            TaskRequest(cap.kind, cap.owner, cap.name, arguments, instruction or task.instruction)
         )
-    arguments, errors, missing = validate_arguments(tool.input_schema, decision.arguments)
-    if errors:
-        raise DecisionError(
-            f"argumentos inválidos para {agent.name}/{tool.name}: " + "; ".join(errors),
-            agent=agent,
-            tool=tool,
-            missing=missing,
-            arguments=arguments,
-        )
-    if missing:
-        labels = ", ".join(describe_fields(tool.input_schema, missing))
-        raise DecisionError(
-            f"faltam argumentos obrigatórios para {agent.name}/{tool.name}: {', '.join(missing)} ({labels})",
-            agent=agent,
-            tool=tool,
-            missing=missing,
-            arguments=arguments,
-        )
-    decision.agent, decision.tool, decision.arguments = agent.name, tool.name, arguments
+    decision.tasks = tasks
     return decision
 
 
-def clarify_for_missing(tool: ToolInfo, missing: list[str], agent: AgentInfo | None = None) -> str:
-    labels = describe_fields(tool.input_schema, missing)
+def clarify_for_missing(cap: Capability, missing: list[str]) -> str:
+    labels = describe_fields(cap.arguments_schema, missing)
     what = labels[0] if len(labels) == 1 else ", ".join(labels[:-1]) + " e " + labels[-1]
     return f"Consigo ajudar com isso, mas preciso de: {what}. Pode me informar?"

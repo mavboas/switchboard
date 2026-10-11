@@ -13,6 +13,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Integer,
+    LargeBinary,
     String,
     Table,
     Text,
@@ -80,11 +81,18 @@ class Timestamped:
     )
 
 
-profile_agents = Table(
-    "profile_agents",
+profile_connectors = Table(
+    "profile_mcp_connectors",
     Base.metadata,
     Column("profile_id", ForeignKey("router_profiles.id", ondelete="CASCADE"), primary_key=True),
-    Column("agent_id", ForeignKey("agents.id", ondelete="CASCADE"), primary_key=True),
+    Column("connector_id", ForeignKey("mcp_connectors.id", ondelete="CASCADE"), primary_key=True),
+)
+
+profile_agents = Table(
+    "profile_a2a_agents",
+    Base.metadata,
+    Column("profile_id", ForeignKey("router_profiles.id", ondelete="CASCADE"), primary_key=True),
+    Column("agent_id", ForeignKey("a2a_agents.id", ondelete="CASCADE"), primary_key=True),
 )
 
 profile_knowledge_bases = Table(
@@ -95,6 +103,76 @@ profile_knowledge_bases = Table(
         "knowledge_base_id", ForeignKey("knowledge_bases.id", ondelete="CASCADE"), primary_key=True
     ),
 )
+
+
+profile_plugins = Table(
+    "profile_plugins",
+    Base.metadata,
+    Column("profile_id", ForeignKey("router_profiles.id", ondelete="CASCADE"), primary_key=True),
+    Column("plugin_id", ForeignKey("plugins.id", ondelete="CASCADE"), primary_key=True),
+)
+
+
+class Plugin(Timestamped, Base):
+    """Plugin instalado: o pacote declarativo (zip normalizado) e o que se sabe dele.
+
+    Os conectores, agentes e bases do plugin viram linhas nas tabelas de sempre (com
+    ``plugin_id`` e nome ``plugin.componente``); o que depende do plugin como um todo
+    (versão, achados da varredura, aprovação, configuração, playbooks) fica aqui.
+    """
+
+    __tablename__ = "plugins"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(30), unique=True)
+    version: Mapped[str] = mapped_column(String(40))
+    description: Mapped[str] = mapped_column(Text, default="")
+    format: Mapped[str] = mapped_column(String(20), default="switchboard")
+    origin: Mapped[str] = mapped_column(String(200), default="")
+    digest: Mapped[str] = mapped_column(String(64))
+    package: Mapped[bytes] = mapped_column(LargeBinary)
+    manifest: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    findings: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    playbooks: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    examples: Mapped[dict[str, list[str]]] = mapped_column(JSON, default=dict)
+    # valores da configuração: comuns em claro; os sensíveis como env:NOME ou enc:...
+    config: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
+    approved_fingerprints: Mapped[list[str]] = mapped_column(JSON, default=list)
+    approved_by: Mapped[str | None] = mapped_column(String(100))
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class PluginEvent(Base):
+    """Histórico do ciclo de vida (instalar, atualizar, aprovar, configurar, remover…)."""
+
+    __tablename__ = "plugin_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plugin: Mapped[str] = mapped_column(String(30), index=True)
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    action: Mapped[str] = mapped_column(String(20))
+    version: Mapped[str] = mapped_column(String(40), default="")
+    actor: Mapped[str] = mapped_column(String(100), default="")
+    detail: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class PluginUse(Base):
+    """Uso de um plugin num pedido (por versão): playbook, tool, skill ou base de conhecimento."""
+
+    __tablename__ = "plugin_usage"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    trace_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("traces.id", ondelete="CASCADE"), index=True
+    )
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    plugin: Mapped[str] = mapped_column(String(30), index=True)
+    version: Mapped[str] = mapped_column(String(40))
+    profile: Mapped[str] = mapped_column(String(63), default="")
+    kind: Mapped[str] = mapped_column(String(12))  # playbook | tool | skill | knowledge
+    component: Mapped[str] = mapped_column(String(120))
+    ok: Mapped[bool | None] = mapped_column(Boolean)
 
 
 class LlmModel(Timestamped, Base):
@@ -115,8 +193,10 @@ class LlmModel(Timestamped, Base):
     json_mode: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
-class Agent(Timestamped, Base):
-    __tablename__ = "agents"
+class Connector(Timestamped, Base):
+    """Conector MCP (servidor MCP cujas tools são ações síncronas)."""
+
+    __tablename__ = "mcp_connectors"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(63), unique=True)
@@ -127,6 +207,31 @@ class Agent(Timestamped, Base):
     allowed_tools: Mapped[list[str]] = mapped_column(JSON, default=list)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     timeout_s: Mapped[float] = mapped_column(Float, default=30.0)
+    # preenchido quando o conector vem de um plugin (somente leitura no console)
+    plugin_id: Mapped[int | None] = mapped_column(
+        ForeignKey("plugins.id", ondelete="CASCADE"), index=True
+    )
+
+
+class Agent(Timestamped, Base):
+    """Agente A2A (descoberto pelo Agent Card; cada skill é delegável sob contrato)."""
+
+    __tablename__ = "a2a_agents"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(63), unique=True)
+    description: Mapped[str] = mapped_column(Text, default="")
+    url: Mapped[str] = mapped_column(String(500))
+    auth_token: Mapped[str | None] = mapped_column(Text)
+    allowed_skills: Mapped[list[str]] = mapped_column(JSON, default=list)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    timeout_s: Mapped[float] = mapped_column(Float, default=15.0)
+    deadline_s: Mapped[float | None] = mapped_column(Float)
+    push: Mapped[bool] = mapped_column(Boolean, default=True)
+    allow_cross_origin: Mapped[bool] = mapped_column(Boolean, default=False)
+    plugin_id: Mapped[int | None] = mapped_column(
+        ForeignKey("plugins.id", ondelete="CASCADE"), index=True
+    )
 
 
 class KnowledgeBase(Timestamped, Base):
@@ -143,6 +248,9 @@ class KnowledgeBase(Timestamped, Base):
     embedding_model: Mapped[str | None] = mapped_column(String(200))
     chunk_size: Mapped[int] = mapped_column(Integer, default=800)
     chunk_overlap: Mapped[int] = mapped_column(Integer, default=120)
+    plugin_id: Mapped[int | None] = mapped_column(
+        ForeignKey("plugins.id", ondelete="CASCADE"), index=True
+    )
 
     embedding_connection: Mapped[LlmModel | None] = relationship(lazy="joined")
     documents: Mapped[list[Document]] = relationship(
@@ -202,15 +310,32 @@ class RouterProfile(Timestamped, Base):
     synthesize: Mapped[bool] = mapped_column(Boolean, default=True)
     allow_clarify: Mapped[bool] = mapped_column(Boolean, default=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # colunas da v0.2 (anuláveis: bancos do MVP ganham a coluna vazia e o padrão vale)
+    decision_model_id: Mapped[int | None] = mapped_column(
+        ForeignKey("llm_models.id", ondelete="SET NULL")
+    )
+    decision_threshold: Mapped[float | None] = mapped_column(Float, default=0.6)
+    wait_s: Mapped[float | None] = mapped_column(Float, default=8.0)
+    max_parallel: Mapped[int | None] = mapped_column(Integer, default=3)
+    deadline_s: Mapped[float | None] = mapped_column(Float, default=600.0)
 
-    model: Mapped[LlmModel] = relationship(lazy="joined")
+    model: Mapped[LlmModel] = relationship(lazy="joined", foreign_keys=[model_id])
+    decision_model: Mapped[LlmModel | None] = relationship(
+        lazy="joined", foreign_keys=[decision_model_id]
+    )
+    connectors: Mapped[list[Connector]] = relationship(
+        secondary=profile_connectors, order_by=Connector.name
+    )
     agents: Mapped[list[Agent]] = relationship(secondary=profile_agents, order_by=Agent.name)
     knowledge_bases: Mapped[list[KnowledgeBase]] = relationship(
         secondary=profile_knowledge_bases, order_by=KnowledgeBase.name
     )
+    plugins: Mapped[list[Plugin]] = relationship(secondary=profile_plugins, order_by=Plugin.name)
 
 
 class Trace(Base):
+    """Uma execução (``trace_id`` = ``run_id``): pedido, decisão, resposta e estado."""
+
     __tablename__ = "traces"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
@@ -233,3 +358,98 @@ class Trace(Base):
     input_tokens: Mapped[int] = mapped_column(Integer, default=0)
     output_tokens: Mapped[int] = mapped_column(Integer, default=0)
     error: Mapped[str | None] = mapped_column(Text)
+    # v0.2: execuções assíncronas
+    status: Mapped[str | None] = mapped_column(String(20), default="completed", index=True)
+    decided_by: Mapped[str | None] = mapped_column(String(20))
+    confidence: Mapped[float | None] = mapped_column(Float)
+    tasks: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON)
+    context: Mapped[list[dict[str, str]] | None] = mapped_column(JSON)
+    callback_url: Mapped[str | None] = mapped_column(Text)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class Contract(Base):
+    """Contrato fechado com um agente A2A (um por tarefa delegada: um *spawn*)."""
+
+    __tablename__ = "contracts"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    run_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("traces.id", ondelete="CASCADE"), index=True
+    )
+    profile: Mapped[str] = mapped_column(String(63), index=True)
+    agent: Mapped[str] = mapped_column(String(63), index=True)
+    skill: Mapped[str] = mapped_column(String(200))
+    kind: Mapped[str] = mapped_column(String(20))
+    state: Mapped[str] = mapped_column(String(30), index=True)
+    rpc_url: Mapped[str | None] = mapped_column(String(500))
+    remote_task_id: Mapped[str | None] = mapped_column(String(200))
+    remote_context_id: Mapped[str | None] = mapped_column(String(200))
+    input: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    input_text: Mapped[str] = mapped_column(Text, default="")
+    output: Mapped[Any] = mapped_column(JSON)
+    output_text: Mapped[str] = mapped_column(Text, default="")
+    artifacts: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON)
+    input_schema: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    output_schema: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    input_hash: Mapped[str | None] = mapped_column(String(80))
+    output_hash: Mapped[str | None] = mapped_column(String(80))
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    reply_mode: Mapped[str] = mapped_column(String(10), default="poll")
+    push_token_hash: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    input_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    question: Mapped[str | None] = mapped_column(Text)
+    answered_questions: Mapped[list[str] | None] = mapped_column(JSON)
+    checks: Mapped[int] = mapped_column(Integer, default=0)
+    last_message: Mapped[str] = mapped_column(Text, default="")
+    error: Mapped[str | None] = mapped_column(Text)
+    span_id: Mapped[str] = mapped_column(String(16), default="")
+    parent_span_id: Mapped[str | None] = mapped_column(String(16))
+    version: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class ContractEventRow(Base):
+    __tablename__ = "contract_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    contract_id: Mapped[str] = mapped_column(
+        String(40), ForeignKey("contracts.id", ondelete="CASCADE"), index=True
+    )
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    kind: Mapped[str] = mapped_column(String(20))
+    source: Mapped[str] = mapped_column(String(20))
+    state: Mapped[str | None] = mapped_column(String(30))
+    detail: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class SpanRow(Base):
+    __tablename__ = "spans"
+
+    pk: Mapped[int] = mapped_column(primary_key=True)
+    id: Mapped[str] = mapped_column(String(16))
+    trace_id: Mapped[str] = mapped_column(String(32), index=True)
+    parent_id: Mapped[str | None] = mapped_column(String(16))
+    kind: Mapped[str] = mapped_column(String(30))
+    name: Mapped[str] = mapped_column(String(200))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(10), default="ok")
+    attributes: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class Meta(Base):
+    """Chave/valor interno (ex.: versão do schema)."""
+
+    __tablename__ = "switchboard_meta"
+
+    key: Mapped[str] = mapped_column(String(63), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, default="")

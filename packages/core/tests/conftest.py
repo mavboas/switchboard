@@ -10,12 +10,13 @@ from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
 from sqlalchemy import create_engine, text
 
-from switchboard.agents import AgentCatalog
+from switchboard.connectors import ConnectorCatalog
+from switchboard.plugins import pack
 from switchboard.storage import Database
-from switchboard.testing import inproc_connector
+from switchboard.testing import FakeA2AAgent, FakeNetwork, inproc_connector
 
 # --------------------------------------------------------------------------
-# agentes MCP em processo (sem rede)
+# conectores MCP em processo (sem rede)
 
 
 def make_calc_server() -> MCPServer:
@@ -63,8 +64,18 @@ def servers() -> dict[str, MCPServer]:
 
 
 @pytest.fixture
-def catalog(servers) -> AgentCatalog:
-    return AgentCatalog(connector=inproc_connector(servers))
+def catalog(servers) -> ConnectorCatalog:
+    return ConnectorCatalog(connector=inproc_connector(servers))
+
+
+@pytest.fixture
+def risk_agent() -> FakeA2AAgent:
+    return FakeA2AAgent()
+
+
+@pytest.fixture
+def network(risk_agent) -> FakeNetwork:
+    return FakeNetwork(risk_agent)
 
 
 # --------------------------------------------------------------------------
@@ -102,3 +113,110 @@ def db(request, tmp_path):
         with admin.begin() as conn:
             conn.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
         admin.dispose()
+
+
+@pytest.fixture(params=["sqlite", "postgres"])
+def empty_db_url(request, tmp_path):
+    """URL de um banco vazio (sem init), para testar migrações."""
+    if request.param == "sqlite":
+        yield f"sqlite:///{tmp_path / 'legado.db'}"
+        return
+    if not PG_URL:
+        pytest.skip("defina SWITCHBOARD_TEST_DATABASE_URL para testar no PostgreSQL")
+    schema, url = _pg_schema_url(PG_URL)
+    admin = create_engine(Database(PG_URL).url)
+    with admin.begin() as conn:
+        conn.execute(text(f'CREATE SCHEMA "{schema}"'))
+    try:
+        yield url
+    finally:
+        with admin.begin() as conn:
+            conn.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+        admin.dispose()
+
+
+# --------------------------------------------------------------------------
+# pacotes de plugin em memória
+
+PLUGIN_MANIFEST = """\
+name: __NAME__
+version: __VERSION__
+description: Plugin de teste com um conector, um agente e uma base de conhecimento.
+config:
+  CALC_URL:
+    description: Endereço do servidor MCP de cálculo
+  RISCO_URL:
+    description: Endereço do agente A2A de risco
+  RISCO_TOKEN:
+    description: Token do agente de risco
+    sensitive: true
+    required: false
+connectors:
+  - name: calc
+    description: Calculadora de testes.
+    url: ${config.CALC_URL}
+    allowed_tools: [somar]
+agents:
+  - name: risco
+    description: Avalia o risco de fraude de uma operação.
+    url: ${config.RISCO_URL}
+    auth_token: ${config.RISCO_TOKEN}
+knowledge_bases:
+  - name: faq
+    description: Perguntas frequentes do plugin.
+playbooks:
+  - skill: usar-calculo
+    applies_to: [calc]
+    triggers: [somar, soma]
+routing_examples:
+  calc/somar:
+    - Quanto é 2 mais 3?
+"""
+
+PLUGIN_SKILL = """\
+---
+name: usar-calculo
+description: Como usar a calculadora para somas e contas simples.
+---
+
+# Cálculo
+
+Use `calc/somar` quando o usuário pedir uma soma. Confirme os números antes de somar.
+"""
+
+PLUGIN_DOC = "# FAQ\n\nO prazo de entrega do pedido é de 5 dias úteis.\n"
+
+
+def make_plugin_files(
+    *,
+    name: str = "acme-teste",
+    version: str = "1.0.0",
+    manifest: str | None = None,
+    skill: str | None = None,
+    doc: str | None = None,
+    extra: dict[str, str | bytes] | None = None,
+    remove: tuple[str, ...] = (),
+) -> dict[str, bytes]:
+    """Os arquivos de um plugin válido (sem achados); ``extra``/``remove`` ajustam o pacote."""
+    text = (manifest if manifest is not None else PLUGIN_MANIFEST).replace("__NAME__", name)
+    files: dict[str, str | bytes] = {
+        "plugin.yaml": text.replace("__VERSION__", version),
+        "skills/usar-calculo/SKILL.md": skill if skill is not None else PLUGIN_SKILL,
+        "knowledge/faq.md": doc if doc is not None else PLUGIN_DOC,
+    }
+    files.update(extra or {})
+    for path in remove:
+        files.pop(path, None)
+    return {p: v.encode("utf-8") if isinstance(v, str) else v for p, v in files.items()}
+
+
+@pytest.fixture
+def plugin_files():
+    """Fábrica dos arquivos de um plugin de teste (``plugin_files(version="2.0.0", ...)``)."""
+    return make_plugin_files
+
+
+@pytest.fixture
+def plugin_zip():
+    """Fábrica dos bytes do ``.zip`` de um plugin de teste."""
+    return lambda **kw: pack(make_plugin_files(**kw))

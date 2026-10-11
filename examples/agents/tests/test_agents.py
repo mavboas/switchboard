@@ -1,9 +1,17 @@
 from __future__ import annotations
 
 import pytest
+from google.protobuf.json_format import MessageToDict
 from mcp import Client
 
-from switchboard_agents import chamados, credito
+from switchboard.a2a import AgentCard
+from switchboard.contracts import (
+    CONTRACT_EXTENSION_URI,
+    schema_hash,
+    skills_from_extension,
+    validate,
+)
+from switchboard_agents import analise, chamados, credito, risco
 
 
 def test_amortization_math():
@@ -49,3 +57,65 @@ async def test_chamados_lifecycle_over_mcp():
         assert "está aberto" in status.content[0].text
         missing = await client.call_tool("consultar_chamado", {"protocolo": "CH-9"})
         assert missing.is_error and "não encontrado" in missing.content[0].text
+
+
+# --------------------------------------------------------------------------
+# agentes A2A (lógica de negócio e termos de contrato publicados no card)
+
+
+def _analise(valor, prazo, renda, **kw):
+    dados = {"cliente": "Maria Souza", "valor": valor, "prazo_meses": prazo, "renda_mensal": renda}
+    return analise.analisar(dados, **kw)
+
+
+def test_credit_analysis_policy_and_output_contract():
+    ok = _analise(80_000, 24, 12_000, garantia=False)
+    assert ok["decisao"] == "aprovado" and ok["limite_aprovado"] == 80_000
+    assert ok["garantia"] == "sem garantia" and ok["taxa_mensal_percentual"] == 1.69
+    adjusted = _analise(300_000, 24, 10_000, garantia=False)
+    assert adjusted["decisao"] == "aprovado_com_ajuste" and adjusted["limite_aprovado"] < 300_000
+    assert adjusted["comprometimento_renda_percentual"] <= analise.COMPROMETIMENTO_MAXIMO
+    denied = _analise(900_000, 12, 3_000, garantia=False)
+    assert denied["decisao"] == "reprovado" and denied["limite_aprovado"] == 0
+    secured = _analise(800_000, 120, 60_000, garantia=True)
+    assert secured["taxa_mensal_percentual"] == 1.19 and secured["garantia"] == "imóvel"
+    for result in (ok, adjusted, denied, secured):
+        assert validate(result, analise.OUTPUT_SCHEMA) == []  # o agente cumpre o próprio contrato
+    assert (
+        analise._sim("Sim, com o apartamento")
+        and analise._sim("tem imóvel")
+        and analise._sim("não") is False
+    )
+
+
+def test_risk_score_is_deterministic_and_valid():
+    base = risco.avaliar({"cliente": "Maria Souza", "valor": 80_000})
+    assert base == risco.avaliar({"cliente": " maria souza ", "valor": 80_000.0})
+    phone = risco.avaliar({"cliente": "Maria Souza", "valor": 80_000, "canal": "telefone"})
+    assert (
+        phone["score"] == max(0, base["score"] - 60) and "engenharia social" in phone["sinais"][0]
+    )
+    big = risco.avaliar({"cliente": "Maria Souza", "valor": 250_000})
+    assert "valor acima do padrão do segmento" in big["sinais"]
+    for result in (base, phone, big):
+        assert validate(result, risco.OUTPUT_SCHEMA) == []
+
+
+@pytest.mark.parametrize(
+    ("module", "skill", "max_duration"),
+    [(analise, "analisar_proposta", 900), (risco, "avaliar_risco", 120)],
+)
+def test_cards_publish_complete_contract_terms(module, skill, max_duration):
+    card = AgentCard.parse(MessageToDict(module.build("http://localhost:8201").card()))
+    interface = card.jsonrpc_interface()
+    assert interface.url == "http://localhost:8201/" and interface.version == "1.0"
+    extension = card.extension(CONTRACT_EXTENSION_URI)
+    terms, problems = skills_from_extension(extension.get("params"))
+    assert problems == {}
+    declared = terms[skill]
+    assert declared.complete and declared.max_duration_s == max_duration
+    assert declared.input_schema["required"] == module.INPUT_SCHEMA["required"]
+    assert declared.input_hash == schema_hash(
+        module.INPUT_SCHEMA
+    )  # números do protobuf não mudam o hash
+    assert [s.id for s in card.skills] == [skill]

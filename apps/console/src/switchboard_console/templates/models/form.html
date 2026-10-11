@@ -6,7 +6,7 @@
   <div>
     <div class="crumbs"><a href="/models">Modelos</a> /</div>
     <h1>{{ values.name if values.id else 'Novo modelo' }}</h1>
-    <p>Escolha um atalho de provedor para preencher URL e cabeçalho da chave. Os nomes de modelo são exemplos; confira o catálogo do seu provedor.</p>
+    <p>Escolha um atalho de provedor para preencher URL e cabeçalho da chave. Os nomes de modelo são exemplos; confira o catálogo do seu provedor. Modelos de <strong>decisão</strong> (TypeSafe Jev) não geram texto: escolhem rotas e conferem parâmetros com probabilidades, e entram no roteador como “modelo de decisão”.</p>
   </div>
 </div>
 
@@ -29,6 +29,7 @@
         <option value="openai" {% if values.provider == 'openai' %}selected{% endif %}>Compatível com OpenAI (chat/completions)</option>
         <option value="anthropic" {% if values.provider == 'anthropic' %}selected{% endif %}>Anthropic (Messages API)</option>
         <option value="offline" {% if values.provider == 'offline' %}selected{% endif %}>Offline (heurístico, sem LLM)</option>
+        <option value="typesafe" {% if values.provider == 'typesafe' %}selected{% endif %}>TypeSafe Jev (modelo de decisão)</option>
       </select>
     </div>
     {{ field("model", "Modelo", values.model, placeholder="ex.: gpt-5-mini", help="Nome do modelo no provedor (no Azure, o nome do deployment).") }}

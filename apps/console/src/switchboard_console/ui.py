@@ -1,30 +1,57 @@
-"""Páginas do console (HTML renderizado no servidor)."""
+"""Páginas de configuração do console (HTML renderizado no servidor).
+
+Painel, modelos, conectores MCP, agentes A2A, bases de conhecimento e
+roteadores. Os plugins ficam em :mod:`.plugins` e as páginas de operação
+(playground, execuções e contratos) em :mod:`.ops`.
+
+Conectores, agentes e bases que vieram de um plugin são somente leitura aqui: a página
+mostra de qual plugin vêm e a mudança é feita no plugin (configuração ou nova versão).
+"""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import time
+from collections.abc import Mapping
 from typing import Any
 
 import anyio.to_thread
 import httpx
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import JSONResponse, Response
 from sqlalchemy import select
 
 from switchboard.config import DEFAULT_SYSTEM_PROMPT
+from switchboard.contracts import states
 from switchboard.errors import SwitchboardError
+from switchboard.jev import build_decision_model, noul
 from switchboard.llm import PRESETS, Message, build_chat_model
 from switchboard.rag import SUPPORTED_EXTENSIONS, extract_text, guess_title
 from switchboard.secrets import MASK
+from switchboard.storage import plugins as plugin_repo
 from switchboard.storage import repo
-from switchboard.storage.orm import Agent, Document, KnowledgeBase, LlmModel, RouterProfile, Trace
+from switchboard.storage.orm import (
+    Agent,
+    Connector,
+    Contract,
+    Document,
+    KnowledgeBase,
+    LlmModel,
+    Plugin,
+    RouterProfile,
+    Trace,
+)
 
 from . import forms
-from .state import Console, get_console, redirect
+from .ops import trace_row
+from .state import KB_FROM_PLUGIN, Console, get_console, redirect
 
 router = APIRouter()
+
+FROM_PLUGIN = (
+    "Este {kind} vem de um plugin: para mudá-lo, ajuste a configuração do plugin, "
+    "envie uma nova versão ou remova o plugin."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -55,10 +82,12 @@ def _model_dict(row: LlmModel, used_by: list[str] | None = None) -> dict[str, An
     }
 
 
-def _agent_dict(row: Agent) -> dict[str, Any]:
+def _connector_dict(row: Connector, plugins: Mapping[int, str] | None = None) -> dict[str, Any]:
     return {
         "id": row.id,
         "name": row.name,
+        "plugin_id": row.plugin_id,
+        "plugin": (plugins or {}).get(row.plugin_id),
         "description": row.description,
         "url": row.url,
         "transport": row.transport,
@@ -69,10 +98,34 @@ def _agent_dict(row: Agent) -> dict[str, Any]:
     }
 
 
-def _kb_dict(row: KnowledgeBase, stats: dict[str, int] | None = None) -> dict[str, Any]:
+def _agent_dict(row: Agent, plugins: Mapping[int, str] | None = None) -> dict[str, Any]:
     return {
         "id": row.id,
         "name": row.name,
+        "plugin_id": row.plugin_id,
+        "plugin": (plugins or {}).get(row.plugin_id),
+        "description": row.description,
+        "url": row.url,
+        "auth_token": row.auth_token,
+        "allowed_skills": ", ".join(row.allowed_skills or []),
+        "enabled": row.enabled,
+        "timeout_s": row.timeout_s,
+        "deadline_s": row.deadline_s,
+        "push": True if row.push is None else row.push,
+        "allow_cross_origin": bool(row.allow_cross_origin),
+    }
+
+
+def _kb_dict(
+    row: KnowledgeBase,
+    stats: dict[str, int] | None = None,
+    plugins: Mapping[int, str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "name": row.name,
+        "plugin_id": row.plugin_id,
+        "plugin": (plugins or {}).get(row.plugin_id),
         "description": row.description,
         "embedder_kind": row.embedder_kind,
         "embedder_dim": row.embedder_dim,
@@ -86,6 +139,7 @@ def _kb_dict(row: KnowledgeBase, stats: dict[str, int] | None = None) -> dict[st
 
 
 def _profile_dict(row: RouterProfile) -> dict[str, Any]:
+    spec = repo.profile_to_spec(row, only_enabled=False)
     return {
         "id": row.id,
         "name": row.name,
@@ -93,23 +147,27 @@ def _profile_dict(row: RouterProfile) -> dict[str, Any]:
         "model_id": row.model_id,
         "model_name": row.model.name,
         "model_label": f"{row.model.provider}:{row.model.model or row.model.name}",
+        "decision_model_id": row.decision_model_id,
+        "decision_model_name": row.decision_model.name if row.decision_model else None,
+        "decision_threshold": spec.decision_threshold,
         "system_prompt": row.system_prompt,
+        "connector_ids": [c.id for c in row.connectors],
+        "connectors": [c.name for c in row.connectors],
         "agent_ids": [a.id for a in row.agents],
         "agents": [a.name for a in row.agents],
         "kb_ids": [k.id for k in row.knowledge_bases],
         "kbs": [k.name for k in row.knowledge_bases],
+        "plugin_ids": [p.id for p in row.plugins],
+        "plugins": [p.name for p in row.plugins],
         "top_k": row.top_k,
         "min_score": row.min_score,
         "synthesize": row.synthesize,
         "allow_clarify": row.allow_clarify,
+        "wait_s": spec.wait_s,
+        "max_parallel": spec.max_parallel,
+        "deadline_s": spec.deadline_s,
         "enabled": row.enabled,
     }
-
-
-def _trace_row(row: Trace) -> dict[str, Any]:
-    data = repo.trace_to_dict(row)
-    data["created"] = row.created_at
-    return data
 
 
 # ---------------------------------------------------------------------------
@@ -134,40 +192,74 @@ async def dashboard(request: Request, console: Console = Depends(get_console)):
         return {
             "counts": {
                 "models": repo.count(s, LlmModel),
+                "connectors": repo.count(s, Connector),
                 "agents": repo.count(s, Agent),
                 "kbs": repo.count(s, KnowledgeBase),
+                "plugins": repo.count(s, Plugin),
                 "profiles": repo.count(s, RouterProfile),
                 "traces": repo.count(s, Trace),
+                "contracts": repo.count(s, Contract),
                 "documents": sum(v["documents"] for v in stats.values()),
                 "chunks": sum(v["chunks"] for v in stats.values()),
             },
             "routes": repo.route_counts(s),
-            "recent": [_trace_row(t) for t in repo.query_traces(s, limit=8)],
+            "contract_states": repo.contract_state_counts(s),
+            "open_runs": [
+                trace_row(t)
+                for status in ("needs_input", "pending", "consolidating")
+                for t in repo.query_traces(s, status=status, limit=8)
+            ],
+            "recent": [trace_row(t) for t in repo.query_traces(s, limit=8)],
             "profiles": [_profile_dict(p) for p in repo.list_profiles(s)],
+            "plugins": [
+                {
+                    "id": p.id,
+                    "name": p.name,
+                    "version": p.version,
+                    "state": plugin_repo.plugin_state(p),
+                    "state_label": plugin_repo.STATE_LABELS[plugin_repo.plugin_state(p)],
+                }
+                for p in plugin_repo.list_plugins(s)
+            ],
+            "connector_specs": [
+                repo.connector_to_spec(c)
+                for c in s.scalars(select(Connector).order_by(Connector.name))
+            ],
             "agent_specs": [
                 repo.agent_to_spec(a) for a in s.scalars(select(Agent).order_by(Agent.name))
             ],
         }
 
     data = await console.run_db(load)
-    health, infos = await asyncio.gather(
-        _router_health(console), console.catalog.discover(data["agent_specs"])
+    health, connectors, agents = await asyncio.gather(
+        _router_health(console),
+        console.connectors.discover(data["connector_specs"]),
+        console.agents.discover(data["agent_specs"]),
     )
     counts = data["counts"]
     steps = [
         ("Cadastre um modelo (LLM)", counts["models"] > 0, "/models/new"),
-        ("Registre os agentes MCP", counts["agents"] > 0, "/agents/new"),
+        ("Registre conectores MCP (tools rápidas)", counts["connectors"] > 0, "/connectors/new"),
+        ("Registre agentes A2A (tarefas delegadas)", counts["agents"] > 0, "/agents/new"),
         ("Crie uma base de conhecimento", counts["documents"] > 0, "/knowledge/new"),
+        (
+            "Suba um plugin (opcional): conectores, agentes e playbooks prontos",
+            counts["plugins"] > 0,
+            "/plugins/new",
+        ),
         ("Monte um roteador", counts["profiles"] > 0, "/profiles/new"),
         ("Teste no playground", counts["traces"] > 0, "/playground"),
     ]
+    open_contracts = sum(n for st, n in data["contract_states"].items() if st in states.OPEN)
     return console.render(
         request,
         "dashboard.html",
         nav="dashboard",
         data=data,
         health=health,
-        agents=infos,
+        connectors=connectors,
+        agents=agents,
+        open_contracts=open_contracts,
         steps=steps,
         db_info={
             "dialect": console.db.dialect,
@@ -187,6 +279,8 @@ async def models_list(request: Request, console: Console = Depends(get_console))
         usage: dict[int, list[str]] = {}
         for p in s.scalars(select(RouterProfile)):
             usage.setdefault(p.model_id, []).append(p.name)
+            if p.decision_model_id:
+                usage.setdefault(p.decision_model_id, []).append(f"{p.name} (decisão)")
         rows = s.scalars(select(LlmModel).order_by(LlmModel.name))
         return [_model_dict(m, usage.get(m.id)) for m in rows]
 
@@ -214,15 +308,17 @@ async def models_new(
     request: Request, preset: str = "openai", console: Console = Depends(get_console)
 ):
     p = PRESETS.get(preset) or PRESETS["openai"]
+    decision = p.provider == "typesafe"
     values = {
         "preset": p.key,
         "provider": p.provider,
         "base_url": p.base_url,
         "api_key_header": p.api_key_header,
-        "temperature": 0.2,
-        "max_tokens": 4096,
-        "timeout_s": 60,
-        "json_mode": True,
+        "model": p.model_hint if decision else "",
+        "temperature": None if decision else 0.2,
+        "max_tokens": None if decision else 4096,
+        "timeout_s": 10 if decision else 60,
+        "json_mode": not decision,
     }
     return _model_form(console, request, values)
 
@@ -281,6 +377,8 @@ async def models_test(model_id: int, console: Console = Depends(get_console)):
     )
     if spec is None:
         return redirect("/models", erro="Modelo não encontrado.")
+    if spec.is_decision_model:
+        return await _test_decision_model(console, spec)
     try:
         chat = build_chat_model(spec, resolve_secret=console.box.open)
         try:
@@ -296,23 +394,227 @@ async def models_test(model_id: int, console: Console = Depends(get_console)):
     return redirect("/models", ok=f"'{spec.name}' respondeu em {result.latency_ms:.0f} ms: {reply}")
 
 
+async def _test_decision_model(console: Console, spec) -> Any:
+    """Uma pergunta sim/não óbvia ao Jev: confere URL, chave, modelo e formato da resposta."""
+    try:
+        client = build_decision_model(
+            spec, resolve_secret=console.box.open, transport=console.jev_transport
+        )
+        try:
+            result = await client.evaluate(
+                {"message": "Hi! I would like to check my account balance, please."},
+                {
+                    "greets": noul(
+                        "Does the message contain a greeting?",
+                        true="the message greets someone",
+                        false="there is no greeting in the message",
+                    )
+                },
+            )
+        finally:
+            await client.aclose()
+    except SwitchboardError as exc:
+        return redirect("/models", erro=f"Falha no teste de '{spec.name}': {exc}")
+    answer = result.get("greets")
+    value = f"{answer.noul:.2f}" if answer and answer.noul is not None else "?"
+    return redirect(
+        "/models",
+        ok=(
+            f"'{spec.name}' ({result.model}) respondeu em {result.latency_ms:.0f} ms: "
+            f"noul = {value} para uma saudação óbvia (quanto mais perto de 1, melhor)."
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
-# agentes
+# conectores MCP
+
+
+def _connector_row(s, connector_id: int):
+    row = s.get(Connector, connector_id)
+    if row is None:
+        return None
+    return _connector_dict(row, plugin_repo.plugin_names_by_id(s)), repo.connector_to_spec(row)
+
+
+@router.get("/connectors")
+async def connectors_list(request: Request, console: Console = Depends(get_console)):
+    def load(s):
+        names = plugin_repo.plugin_names_by_id(s)
+        rows = s.scalars(select(Connector).order_by(Connector.name)).all()
+        return [(_connector_dict(c, names), repo.connector_to_spec(c)) for c in rows]
+
+    rows = await console.run_db(load)
+    infos = await asyncio.gather(
+        *(console.connectors.describe(spec) for _, spec in rows if spec.enabled)
+    )
+    by_name = {i.name: i for i in infos}
+    items = [{**data, "info": by_name.get(data["name"])} for data, _ in rows]
+    return console.render(request, "connectors/list.html", nav="connectors", connectors=items)
+
+
+def _connector_form(
+    console: Console, request: Request, values: dict[str, Any], error: str | None = None
+):
+    return console.render(
+        request,
+        "connectors/form.html",
+        nav="connectors",
+        values=values,
+        error=error,
+        secrets_enabled=console.box.enabled,
+    )
+
+
+@router.get("/connectors/new")
+async def connectors_new(request: Request, console: Console = Depends(get_console)):
+    return _connector_form(
+        console, request, {"transport": "streamable-http", "enabled": True, "timeout_s": 30}
+    )
+
+
+@router.post("/connectors")
+async def connectors_create(request: Request, console: Console = Depends(get_console)):
+    data = forms.connector_data(await request.form())
+    try:
+        connector_id = await console.run_db(
+            lambda s: repo.save_connector(s, data, box=console.box).id
+        )
+    except SwitchboardError as exc:
+        return _connector_form(console, request, {**data, "auth_token": None}, str(exc))
+    return redirect(
+        f"/connectors/{connector_id}",
+        ok="Conector registrado. Veja abaixo as tools que a descoberta via MCP encontrou.",
+    )
+
+
+async def _connector_detail(
+    console: Console,
+    request: Request,
+    connector_id: int,
+    *,
+    refresh: bool = False,
+    call: dict | None = None,
+):
+    row = await console.run_db(_connector_row, connector_id)
+    if row is None:
+        return redirect("/connectors", erro="Conector não encontrado.")
+    data, spec = row
+    info = await console.connectors.describe(spec, refresh=refresh)
+    return console.render(
+        request, "connectors/detail.html", nav="connectors", connector=data, info=info, call=call
+    )
+
+
+@router.get("/connectors/{connector_id}")
+async def connectors_detail(
+    request: Request,
+    connector_id: int,
+    refresh: bool = False,
+    console: Console = Depends(get_console),
+):
+    return await _connector_detail(console, request, connector_id, refresh=refresh)
+
+
+@router.get("/connectors/{connector_id}/edit")
+async def connectors_edit(
+    request: Request, connector_id: int, console: Console = Depends(get_console)
+):
+    row = await console.run_db(
+        lambda s: (c := s.get(Connector, connector_id)) and _connector_dict(c)
+    )
+    if row is None:
+        return redirect("/connectors", erro="Conector não encontrado.")
+    if row["plugin_id"] is not None:
+        return redirect(f"/connectors/{connector_id}", erro=FROM_PLUGIN.format(kind="conector"))
+    return _connector_form(console, request, row)
+
+
+@router.post("/connectors/{connector_id}")
+async def connectors_update(
+    request: Request, connector_id: int, console: Console = Depends(get_console)
+):
+    data = forms.connector_data(await request.form())
+    try:
+        await console.run_db(
+            lambda s: repo.save_connector(s, data, box=console.box, connector_id=connector_id)
+        )
+    except SwitchboardError as exc:
+        current = await console.run_db(
+            lambda s: (c := s.get(Connector, connector_id)) and _connector_dict(c)
+        )
+        return _connector_form(
+            console,
+            request,
+            {**data, "id": connector_id, "auth_token": (current or {}).get("auth_token")},
+            str(exc),
+        )
+    console.connectors.invalidate(data["name"])
+    return redirect(f"/connectors/{connector_id}", ok="Conector atualizado.")
+
+
+@router.post("/connectors/{connector_id}/delete")
+async def connectors_delete(connector_id: int, console: Console = Depends(get_console)):
+    try:
+        await console.run_db(lambda s: repo.delete_connector(s, connector_id))
+    except SwitchboardError as exc:
+        return redirect("/connectors", erro=str(exc))
+    return redirect("/connectors", ok="Conector removido.")
+
+
+@router.post("/connectors/{connector_id}/call")
+async def connectors_call(
+    request: Request, connector_id: int, console: Console = Depends(get_console)
+):
+    form = await request.form()
+    tool = forms.text(form, "tool")
+    raw = forms.text(form, "arguments") or "{}"
+    call: dict[str, Any] = {"tool": tool, "arguments": raw}
+    row = await console.run_db(_connector_row, connector_id)
+    if row is None:
+        return redirect("/connectors", erro="Conector não encontrado.")
+    _, spec = row
+    try:
+        arguments = json.loads(raw)
+        if not isinstance(arguments, dict):
+            raise ValueError("os argumentos precisam ser um objeto JSON")
+        outcome = await console.connectors.call(spec, tool, arguments)
+        call.update(result=outcome.text, is_error=outcome.is_error, ms=outcome.latency_ms)
+    except (ValueError, SwitchboardError) as exc:
+        call.update(result=str(exc), is_error=True, ms=0)
+    return await _connector_detail(console, request, connector_id, call=call)
+
+
+# ---------------------------------------------------------------------------
+# agentes A2A
+
+
+def _agent_row(s, agent_id: int):
+    row = s.get(Agent, agent_id)
+    if row is None:
+        return None
+    return _agent_dict(row, plugin_repo.plugin_names_by_id(s)), repo.agent_to_spec(row)
 
 
 @router.get("/agents")
 async def agents_list(request: Request, console: Console = Depends(get_console)):
     def load(s):
+        names = plugin_repo.plugin_names_by_id(s)
         rows = s.scalars(select(Agent).order_by(Agent.name)).all()
-        return [(_agent_dict(a), repo.agent_to_spec(a)) for a in rows]
+        return [
+            (_agent_dict(a, names), repo.agent_to_spec(a)) for a in rows
+        ], repo.contract_agent_counts(s)
 
-    rows = await console.run_db(load)
+    rows, counts = await console.run_db(load)
     infos = await asyncio.gather(
-        *(console.catalog.describe(spec) for _, spec in rows if spec.enabled)
+        *(console.agents.describe(spec) for _, spec in rows if spec.enabled)
     )
     by_name = {i.name: i for i in infos}
-    agents = [{**data, "info": by_name.get(data["name"])} for data, _ in rows]
-    return console.render(request, "agents/list.html", nav="agents", agents=agents)
+    items = [
+        {**data, "info": by_name.get(data["name"]), "contracts": counts.get(data["name"], {})}
+        for data, _ in rows
+    ]
+    return console.render(request, "agents/list.html", nav="agents", agents=items)
 
 
 def _agent_form(
@@ -330,9 +632,7 @@ def _agent_form(
 
 @router.get("/agents/new")
 async def agents_new(request: Request, console: Console = Depends(get_console)):
-    return _agent_form(
-        console, request, {"transport": "streamable-http", "enabled": True, "timeout_s": 30}
-    )
+    return _agent_form(console, request, {"enabled": True, "timeout_s": 15, "push": True})
 
 
 @router.post("/agents")
@@ -344,27 +644,7 @@ async def agents_create(request: Request, console: Console = Depends(get_console
         return _agent_form(console, request, {**data, "auth_token": None}, str(exc))
     return redirect(
         f"/agents/{agent_id}",
-        ok="Agente registrado. Veja abaixo o que a descoberta via MCP encontrou.",
-    )
-
-
-async def _agent_detail(
-    console: Console,
-    request: Request,
-    agent_id: int,
-    *,
-    refresh: bool = False,
-    call: dict | None = None,
-):
-    row = await console.run_db(
-        lambda s: (a := s.get(Agent, agent_id)) and (_agent_dict(a), repo.agent_to_spec(a))
-    )
-    if row is None:
-        return redirect("/agents", erro="Agente não encontrado.")
-    data, spec = row
-    info = await console.catalog.describe(spec, refresh=refresh)
-    return console.render(
-        request, "agents/detail.html", nav="agents", agent=data, info=info, call=call
+        ok="Agente registrado. Veja abaixo o Agent Card e os termos de contrato de cada skill.",
     )
 
 
@@ -372,7 +652,21 @@ async def _agent_detail(
 async def agents_detail(
     request: Request, agent_id: int, refresh: bool = False, console: Console = Depends(get_console)
 ):
-    return await _agent_detail(console, request, agent_id, refresh=refresh)
+    def load(s):
+        row = _agent_row(s, agent_id)
+        if row is None:
+            return None
+        recent = repo.query_contracts(s, agent=row[0]["name"], limit=10)
+        return row, recent
+
+    loaded = await console.run_db(load)
+    if loaded is None:
+        return redirect("/agents", erro="Agente não encontrado.")
+    (data, spec), recent = loaded
+    info = await console.agents.describe(spec, refresh=refresh)
+    return console.render(
+        request, "agents/detail.html", nav="agents", agent=data, info=info, contracts=recent
+    )
 
 
 @router.get("/agents/{agent_id}/edit")
@@ -380,6 +674,8 @@ async def agents_edit(request: Request, agent_id: int, console: Console = Depend
     row = await console.run_db(lambda s: (a := s.get(Agent, agent_id)) and _agent_dict(a))
     if row is None:
         return redirect("/agents", erro="Agente não encontrado.")
+    if row["plugin_id"] is not None:
+        return redirect(f"/agents/{agent_id}", erro=FROM_PLUGIN.format(kind="agente"))
     return _agent_form(console, request, row)
 
 
@@ -396,7 +692,7 @@ async def agents_update(request: Request, agent_id: int, console: Console = Depe
             {**data, "id": agent_id, "auth_token": (current or {}).get("auth_token")},
             str(exc),
         )
-    console.catalog.invalidate(data["name"])
+    console.agents.invalidate(data["name"])
     return redirect(f"/agents/{agent_id}", ok="Agente atualizado.")
 
 
@@ -406,27 +702,9 @@ async def agents_delete(agent_id: int, console: Console = Depends(get_console)):
         await console.run_db(lambda s: repo.delete_agent(s, agent_id))
     except SwitchboardError as exc:
         return redirect("/agents", erro=str(exc))
-    return redirect("/agents", ok="Agente removido.")
-
-
-@router.post("/agents/{agent_id}/call")
-async def agents_call(request: Request, agent_id: int, console: Console = Depends(get_console)):
-    form = await request.form()
-    tool = forms.text(form, "tool")
-    raw = forms.text(form, "arguments") or "{}"
-    call: dict[str, Any] = {"tool": tool, "arguments": raw}
-    spec = await console.run_db(lambda s: (a := s.get(Agent, agent_id)) and repo.agent_to_spec(a))
-    if spec is None:
-        return redirect("/agents", erro="Agente não encontrado.")
-    try:
-        arguments = json.loads(raw)
-        if not isinstance(arguments, dict):
-            raise ValueError("os argumentos precisam ser um objeto JSON")
-        outcome = await console.catalog.call(spec, tool, arguments)
-        call.update(result=outcome.text, is_error=outcome.is_error, ms=outcome.latency_ms)
-    except (ValueError, SwitchboardError) as exc:
-        call.update(result=str(exc), is_error=True, ms=0)
-    return await _agent_detail(console, request, agent_id, call=call)
+    return redirect(
+        "/agents", ok="Agente removido (o histórico de contratos continua em Contratos)."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -442,8 +720,9 @@ def _connections(s) -> list[dict[str, Any]]:
 async def knowledge_list(request: Request, console: Console = Depends(get_console)):
     def load(s):
         stats = repo.kb_stats(s)
+        names = plugin_repo.plugin_names_by_id(s)
         rows = s.scalars(select(KnowledgeBase).order_by(KnowledgeBase.name))
-        return [_kb_dict(k, stats.get(k.id)) for k in rows]
+        return [_kb_dict(k, stats.get(k.id), names) for k in rows]
 
     return console.render(
         request, "knowledge/list.html", nav="knowledge", kbs=await console.run_db(load)
@@ -505,7 +784,8 @@ async def _kb_detail(console: Console, request: Request, kb_id: int, *, search: 
         profiles = [
             p.name for p in repo.list_profiles(s) if kb_id in [k.id for k in p.knowledge_bases]
         ]
-        return _kb_dict(kb, repo.kb_stats(s, [kb_id]).get(kb_id)), documents, profiles
+        names = plugin_repo.plugin_names_by_id(s)
+        return _kb_dict(kb, repo.kb_stats(s, [kb_id]).get(kb_id), names), documents, profiles
 
     loaded = await console.run_db(load)
     if loaded is None:
@@ -557,6 +837,8 @@ async def knowledge_delete(kb_id: int, console: Console = Depends(get_console)):
 
 @router.post("/knowledge/{kb_id}/documents")
 async def knowledge_add(request: Request, kb_id: int, console: Console = Depends(get_console)):
+    if owner := await console.kb_plugin(kb_id):
+        return redirect(f"/knowledge/{kb_id}", erro=KB_FROM_PLUGIN.format(plugin=owner))
     form = await request.form()
     items: list[tuple[str, str, str]] = []
     errors: list[str] = []
@@ -603,6 +885,8 @@ async def knowledge_add(request: Request, kb_id: int, console: Console = Depends
 
 @router.post("/knowledge/{kb_id}/documents/{doc_id}/delete")
 async def knowledge_doc_delete(kb_id: int, doc_id: int, console: Console = Depends(get_console)):
+    if owner := await console.kb_plugin(kb_id):
+        return redirect(f"/knowledge/{kb_id}", erro=KB_FROM_PLUGIN.format(plugin=owner))
     try:
         await console.knowledge.delete_document(kb_id, doc_id)
     except SwitchboardError as exc:
@@ -649,22 +933,53 @@ async def _profile_form(
     console: Console, request: Request, values: dict[str, Any], error: str | None = None
 ):
     def load(s):
+        models = [
+            {
+                "id": m.id,
+                "name": m.name,
+                "label": f"{m.provider}:{m.model or m.name}",
+                "decision": m.provider == "typesafe",
+            }
+            for m in s.scalars(select(LlmModel).order_by(LlmModel.name))
+        ]
         return (
+            [m for m in models if not m["decision"]],
+            [m for m in models if m["decision"]],
+            # itens de plugin não se escolhem um a um: liga-se o plugin (seção "Plugins")
             [
-                {"id": m.id, "name": m.name, "label": f"{m.provider}:{m.model or m.name}"}
-                for m in s.scalars(select(LlmModel).order_by(LlmModel.name))
+                {"id": c.id, "name": c.name, "description": c.description, "enabled": c.enabled}
+                for c in s.scalars(
+                    select(Connector).where(Connector.plugin_id.is_(None)).order_by(Connector.name)
+                )
             ],
             [
                 {"id": a.id, "name": a.name, "description": a.description, "enabled": a.enabled}
-                for a in s.scalars(select(Agent).order_by(Agent.name))
+                for a in s.scalars(
+                    select(Agent).where(Agent.plugin_id.is_(None)).order_by(Agent.name)
+                )
             ],
             [
                 {"id": k.id, "name": k.name, "description": k.description}
-                for k in s.scalars(select(KnowledgeBase).order_by(KnowledgeBase.name))
+                for k in s.scalars(
+                    select(KnowledgeBase)
+                    .where(KnowledgeBase.plugin_id.is_(None))
+                    .order_by(KnowledgeBase.name)
+                )
+            ],
+            [
+                {
+                    "id": p.id,
+                    "name": p.name,
+                    "version": p.version,
+                    "description": p.description,
+                    "state": plugin_repo.plugin_state(p),
+                    "counts": plugin_repo.plugin_to_dict(s, p)["component_counts"],
+                }
+                for p in plugin_repo.list_plugins(s)
             ],
         )
 
-    models, agents, kbs = await console.run_db(load)
+    models, deciders, connectors, agents, kbs, plugins = await console.run_db(load)
     return console.render(
         request,
         "profiles/form.html",
@@ -672,8 +987,11 @@ async def _profile_form(
         values=values,
         error=error,
         models=models,
+        deciders=deciders,
+        connectors=connectors,
         agents=agents,
         kbs=kbs,
+        plugins=plugins,
     )
 
 
@@ -681,13 +999,19 @@ async def _profile_form(
 async def profiles_new(request: Request, console: Console = Depends(get_console)):
     values = {
         "system_prompt": DEFAULT_SYSTEM_PROMPT,
+        "decision_threshold": 0.6,
         "top_k": 4,
         "min_score": 0.2,
         "synthesize": True,
         "allow_clarify": True,
+        "wait_s": 8,
+        "max_parallel": 3,
+        "deadline_s": 600,
         "enabled": True,
+        "connector_ids": [],
         "agent_ids": [],
         "kb_ids": [],
+        "plugin_ids": [],
     }
     return await _profile_form(console, request, values)
 
@@ -737,90 +1061,3 @@ async def profiles_delete(profile_id: int, console: Console = Depends(get_consol
     except SwitchboardError as exc:
         return redirect("/profiles", erro=str(exc))
     return redirect("/profiles", ok="Roteador removido.")
-
-
-# ---------------------------------------------------------------------------
-# playground
-
-
-@router.get("/playground")
-async def playground(
-    request: Request, profile: str | None = None, console: Console = Depends(get_console)
-):
-    names = await console.run_db(repo.enabled_profile_names)
-    selected = profile if profile in names else (names[0] if names else None)
-    return console.render(
-        request, "playground.html", nav="playground", profiles=names, selected=selected
-    )
-
-
-@router.post("/playground/send")
-async def playground_send(request: Request, console: Console = Depends(get_console)) -> Response:
-    try:
-        body = await request.json()
-    except ValueError:
-        return JSONResponse({"error": "JSON inválido"}, status_code=400)
-    payload = {"profile": body.get("profile"), "messages": body.get("messages") or []}
-    try:
-        resp = await console.router_request("POST", "/v1/chat", json=payload)
-    except httpx.HTTPError as exc:
-        return JSONResponse(
-            {
-                "error": f"router inacessível em {console.settings.router_url} ({exc.__class__.__name__})"
-            },
-            status_code=502,
-        )
-    try:
-        data = resp.json()
-    except ValueError:
-        data = {"error": resp.text[:500]}
-    if resp.status_code >= 400:
-        detail = data.get("detail") if isinstance(data, dict) else None
-        return JSONResponse({"error": detail or data}, status_code=resp.status_code)
-    return JSONResponse(data)
-
-
-# ---------------------------------------------------------------------------
-# execuções
-
-
-@router.get("/traces")
-async def traces_list(
-    request: Request,
-    profile: str | None = None,
-    route: str | None = None,
-    page: int = 1,
-    console: Console = Depends(get_console),
-):
-    page = max(page, 1)
-    size = 25
-
-    def load(s):
-        rows = repo.query_traces(
-            s,
-            profile=profile or None,
-            route=route or None,
-            limit=size + 1,
-            offset=(page - 1) * size,
-        )
-        return [_trace_row(t) for t in rows], repo.enabled_profile_names(s)
-
-    rows, names = await console.run_db(load)
-    return console.render(
-        request,
-        "traces/list.html",
-        nav="traces",
-        traces=rows[:size],
-        has_next=len(rows) > size,
-        page=page,
-        profiles=names,
-        filters={"profile": profile or "", "route": route or ""},
-    )
-
-
-@router.get("/traces/{trace_id}")
-async def traces_detail(request: Request, trace_id: str, console: Console = Depends(get_console)):
-    row = await console.run_db(lambda s: (t := s.get(Trace, trace_id)) and _trace_row(t))
-    if row is None:
-        return redirect("/traces", erro="Execução não encontrada.")
-    return console.render(request, "traces/detail.html", nav="traces", trace=row)

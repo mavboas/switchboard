@@ -1,0 +1,23 @@
+[project]
+name = "switchboard-agentkit"
+version = "0.2.0"
+description = "Kit para construir agentes A2A com o contrato fechado do Switchboard (sobre o a2a-sdk oficial)"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = [
+    "switchboard-core",
+    "a2a-sdk[http-server]>=1.1,<2",
+    "httpx>=0.27",
+    "uvicorn>=0.30",
+]
+
+[tool.uv.sources]
+switchboard-core = { workspace = true }
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/switchboard_agentkit"]
