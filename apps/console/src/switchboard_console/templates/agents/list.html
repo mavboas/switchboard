@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import status_badge, kind_badge, delete_button, empty %}
+{% from "_macros.html" import status_badge, kind_badge, delete_button, empty, plugin_badge %}
 {% block title %}Agentes A2A{% endblock %}
 {% block content %}
 <div class="page-head">
@@ -19,7 +19,7 @@
       {% set total = a.contracts.values()|sum %}
       {% set open = namespace(n=0) %}{% for st, n in a.contracts.items() %}{% if st in open_states %}{% set open.n = open.n + n %}{% endif %}{% endfor %}
       <tr>
-        <td><a href="/agents/{{ a.id }}"><strong>{{ a.name }}</strong></a>
+        <td><a href="/agents/{{ a.id }}"><strong>{{ a.name }}</strong></a> {{ plugin_badge(a.plugin, a.plugin_id) }}
           <span class="sub">{{ a.description or (a.info.description if a.info else '') }}</span>
           <span class="sub mono">{{ a.url }}</span></td>
         <td>{% if a.enabled %}{{ status_badge(a.info) }}{% else %}<span class="badge">desabilitado</span>{% endif %}
@@ -43,8 +43,9 @@
         <td class="small nowrap">{% if total %}<a href="/contracts?agent={{ a.name }}">{{ total }} no total</a>{% if open.n %}<span class="sub"><span class="badge info">{{ open.n }} em aberto</span></span>{% endif %}{% else %}<span class="muted">nenhum</span>{% endif %}</td>
         <td class="right nowrap">
           <a class="btn small" href="/agents/{{ a.id }}?refresh=1">Ler card</a>
-          <a class="btn small" href="/agents/{{ a.id }}/edit">Editar</a>
-          {{ delete_button("/agents/" ~ a.id ~ "/delete", confirm="Remover o agente " ~ a.name ~ "?") }}
+          {% if a.plugin_id %}<a class="btn small" href="/plugins/{{ a.plugin_id }}#config" title="o agente muda com a configuração do plugin">Config. do plugin</a>
+          {% else %}<a class="btn small" href="/agents/{{ a.id }}/edit">Editar</a>
+          {{ delete_button("/agents/" ~ a.id ~ "/delete", confirm="Remover o agente " ~ a.name ~ "?") }}{% endif %}
         </td>
       </tr>
     {% endfor %}

@@ -36,6 +36,8 @@ from .embeddings import build_embedder
 from .jev import JevClient, build_decision_model
 from .llm.base import ChatModel, Message
 from .llm.factory import build_chat_model
+from .plugins import LoadedPlugin, load_plugins
+from .rag.loaders import guess_title
 from .rag.retriever import MemoryRetriever
 from .routing.engine import RouterEngine
 from .routing.types import ResolvedProfile, RouterResult
@@ -53,6 +55,8 @@ class Switchboard:
     ):
         self.spec = spec
         self.base_dir = Path(base_dir) if base_dir else Path.cwd()
+        # plugins do YAML: lidos, validados e varridos já aqui (falha cedo, com a causa)
+        self.plugins: list[LoadedPlugin] = load_plugins(spec.plugins, self.base_dir)
         self.connectors = connectors or ConnectorCatalog()
         self.agents = agents or AgentDirectory()
         self.contracts = contracts or ContractManager(
@@ -90,21 +94,67 @@ class Switchboard:
                 self.retriever.register(kb, build_embedder(kb.embedder, connection))
                 if kb.paths:
                     await self.retriever.load_paths(kb.name, self.base_dir)
-            if self.spec.agents:
+            for plugin in self.plugins:
+                for kb in plugin.expanded.knowledge_bases:
+                    self.retriever.register(kb, build_embedder(kb.embedder, None))
+                    for path, text in plugin.expanded.documents.get(kb.name, {}).items():
+                        await self.retriever.add_text(kb.name, guess_title(path, text), text)
+            if self.spec.agents or any(p.expanded.agents for p in self.plugins):
                 self.contracts.start()
             self._loaded = True
 
+    def _all_agents(self) -> list[AgentSpec]:
+        return [*self.spec.agents, *(a for p in self.plugins for a in p.expanded.agents)]
+
     async def _agent_spec(self, name: str) -> AgentSpec | None:
-        return next((a for a in self.spec.agents if a.name == name), None)
+        return next((a for a in self._all_agents() if a.name == name), None)
 
     def resolve(self, profile: str | None = None) -> ResolvedProfile:
+        """O perfil do YAML com o que os plugins ligados a ele trazem (nomes ``plugin.item``)."""
         spec = self.spec.profile(profile)
+        connectors = [c for c in self.spec.connectors if c.name in spec.connectors]
+        agents = [a for a in self.spec.agents if a.name in spec.agents]
+        kb_names = list(spec.knowledge_bases)
+        plugins: dict[str, str] = {}
+        playbooks = []
+        examples: dict[str, list[str]] = {}
+        loaded = {p.name: p for p in self.plugins}
+        warnings = [
+            f"plugin {ref.name} está desativado (enabled: false)"
+            for ref in self.spec.plugins
+            if ref.name in spec.plugins and ref.name not in loaded
+        ]
+        for name in spec.plugins:
+            plugin = loaded.get(name)
+            if plugin is None:
+                continue
+            expanded = plugin.expanded
+            connectors += expanded.connectors
+            agents += expanded.agents
+            kb_names += [k.name for k in expanded.knowledge_bases]
+            plugins[name] = plugin.version
+            playbooks += expanded.playbooks
+            for key, phrases in expanded.examples.items():
+                examples.setdefault(key, []).extend(phrases)
+        if plugins or warnings:
+            spec = spec.model_copy(
+                update={
+                    "connectors": [c.name for c in connectors],
+                    "agents": [a.name for a in agents],
+                    "knowledge_bases": kb_names,
+                    "plugins": list(plugins),
+                }
+            )
         return ResolvedProfile(
             spec=spec,
             model=self.spec.model(spec.model),
-            connectors=[c for c in self.spec.connectors if c.name in spec.connectors],
-            agents=[a for a in self.spec.agents if a.name in spec.agents],
+            connectors=connectors,
+            agents=agents,
             decision_model=self.spec.model(spec.decision_model) if spec.decision_model else None,
+            plugins=plugins,
+            playbooks=playbooks,
+            examples=examples,
+            warnings=warnings,
         )
 
     def engine(self, profile: str | None = None) -> RouterEngine:

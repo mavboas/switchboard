@@ -12,6 +12,10 @@ partir da v0.2:
    antigas com rota ``delegated`` (tool MCP na v0.1) passam a ``tool``;
 4. a versão do schema fica em ``switchboard_meta``.
 
+A v3 acrescenta os plugins (tabelas ``plugins``, ``plugin_events``, ``plugin_usage`` e
+``profile_plugins``, mais a coluna ``plugin_id`` em conectores, agentes e bases): só
+tabelas e colunas novas, sem mexer em dados existentes.
+
 Tudo roda na mesma transação do ``Database.init`` (no PostgreSQL, sob o
 advisory lock que já protege a subida simultânea de console e router).
 """
@@ -28,7 +32,7 @@ from .orm import Base
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # valores padrão para as colunas novas em linhas que já existiam
 _BACKFILL = {

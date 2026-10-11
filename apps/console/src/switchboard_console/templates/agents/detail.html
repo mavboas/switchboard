@@ -1,18 +1,19 @@
 {% extends "base.html" %}
-{% from "_macros.html" import status_badge, kind_badge, state_badge, delete_button, schema_table %}
+{% from "_macros.html" import status_badge, kind_badge, state_badge, delete_button, schema_table, plugin_badge %}
 {% block title %}{{ agent.name }}{% endblock %}
 {% block content %}
 <div class="page-head">
   <div>
     <div class="crumbs"><a href="/agents">Agentes A2A</a> /</div>
-    <h1>{{ agent.name }} {% if agent.enabled %}{{ status_badge(info) }}{% else %}<span class="badge">desabilitado</span>{% endif %}</h1>
+    <h1>{{ agent.name }} {% if agent.enabled %}{{ status_badge(info) }}{% else %}<span class="badge">desabilitado</span>{% endif %} {{ plugin_badge(agent.plugin, agent.plugin_id) }}</h1>
     <p>{{ agent.description or info.description or 'Sem descrição.' }}</p>
   </div>
   <div class="actions">
     <a class="btn" href="/agents/{{ agent.id }}?refresh=1">Ler o card de novo</a>
     <a class="btn" href="/contracts?agent={{ agent.name }}">Contratos</a>
-    <a class="btn" href="/agents/{{ agent.id }}/edit">Editar</a>
-    {{ delete_button("/agents/" ~ agent.id ~ "/delete", confirm="Remover o agente " ~ agent.name ~ "?") }}
+    {% if agent.plugin_id %}<a class="btn" href="/plugins/{{ agent.plugin_id }}#config">Configuração do plugin</a>
+    {% else %}<a class="btn" href="/agents/{{ agent.id }}/edit">Editar</a>
+    {{ delete_button("/agents/" ~ agent.id ~ "/delete", confirm="Remover o agente " ~ agent.name ~ "?") }}{% endif %}
   </div>
 </div>
 

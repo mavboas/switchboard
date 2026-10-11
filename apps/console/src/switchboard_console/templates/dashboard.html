@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import route_badge, run_badge, status_badge, empty %}
+{% from "_macros.html" import route_badge, run_badge, status_badge, plugin_state_badge, empty %}
 {% block title %}Painel{% endblock %}
 {% block content %}
 <div class="page-head">
@@ -18,6 +18,7 @@
   <div class="stat"><div class="label">Conectores MCP</div><div class="value">{{ connectors|selectattr('status', 'equalto', 'online')|list|length }}/{{ data.counts.connectors }}</div><div class="hint">online agora</div></div>
   <div class="stat"><div class="label">Agentes A2A</div><div class="value">{{ agents|selectattr('status', 'equalto', 'online')|list|length }}/{{ data.counts.agents }}</div><div class="hint">online agora</div></div>
   <div class="stat"><div class="label">Contratos</div><div class="value">{{ data.counts.contracts }}</div><div class="hint">{% if open_contracts %}<a href="/contracts?state=abertos">{{ open_contracts }} em aberto</a>{% else %}nenhum em aberto{% endif %}</div></div>
+  <div class="stat"><div class="label">Plugins</div><div class="value">{{ data.plugins|selectattr('state', 'equalto', 'pronto')|list|length }}/{{ data.counts.plugins }}</div><div class="hint">{% set waiting = data.plugins|selectattr('state', 'equalto', 'aguardando_aprovacao')|list|length %}{% if waiting %}<a href="/plugins">{{ waiting }} aguardando aprovação</a>{% else %}ativos agora{% endif %}</div></div>
   <div class="stat"><div class="label">Conhecimento</div><div class="value">{{ data.counts.documents }}</div><div class="hint">{{ data.counts.chunks }} trechos em {{ data.counts.kbs }} base(s)</div></div>
   <div class="stat"><div class="label">Execuções</div><div class="value">{{ data.counts.traces }}</div>
     <div class="hint">{% for r, n in data.routes.items() %}{{ route_labels.get(r, r)|lower }}: {{ n }}{% if not loop.last %} · {% endif %}{% else %}nenhuma ainda{% endfor %}</div></div>
@@ -72,6 +73,11 @@
       <dd>
         {% for a in agents %}<div>{{ status_badge(a) }} <a href="/agents">{{ a.name }}</a> <span class="muted small">{{ a.skills|length }} skill(s){% if a.push %} · push{% endif %}</span></div>
         {% else %}<span class="muted">nenhum agente habilitado</span>{% endfor %}
+      </dd>
+      <dt>Plugins</dt>
+      <dd>
+        {% for p in data.plugins %}<div>{{ plugin_state_badge(p.state, p.state_label) }} <a href="/plugins/{{ p.id }}">{{ p.name }}</a> <span class="muted small">v{{ p.version }}</span></div>
+        {% else %}<span class="muted">nenhum plugin instalado</span>{% endfor %}
       </dd>
     </dl>
   </div>

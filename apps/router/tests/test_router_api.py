@@ -10,8 +10,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from switchboard.connectors import ConnectorCatalog
+from switchboard.plugins import load_plugin, pack
 from switchboard.secrets import SecretBox
-from switchboard.storage import Database, repo, seed_demo
+from switchboard.storage import Database, KnowledgeService, PluginService, repo, seed_demo
+from switchboard.storage import plugins as plugin_repo
 from switchboard.storage.orm import LlmModel, RouterProfile
 from switchboard.testing import HostRoutingTransport, inproc_connector
 from switchboard_agents import analise, chamados, credito, risco
@@ -20,7 +22,13 @@ from switchboard_router.runtime import DbRuntime
 from switchboard_router.settings import Settings
 
 KNOWLEDGE_DIR = Path(__file__).resolve().parents[3] / "examples" / "knowledge"
-SERVERS = {"credito": credito.server, "chamados": chamados.server}
+EXAMPLE_PLUGIN = Path(__file__).resolve().parents[3] / "examples" / "plugins" / "acme-credito"
+# o conector do plugin de exemplo (nome qualificado) fala com o mesmo servidor em processo
+SERVERS = {
+    "credito": credito.server,
+    "chamados": chamados.server,
+    "acme-credito.credito": credito.server,
+}
 
 
 @pytest.fixture
@@ -521,3 +529,173 @@ def test_open_api_only_answers_known_hosts(database):
             headers={"Host": "api.empresa.com", "Authorization": "Bearer k1"},
         )
         assert ok.status_code == 200
+
+
+# --------------------------------------------------------------------------
+# plugins
+
+
+PLUGIN_CONFIG = {"CREDITO_URL": "http://credito/mcp", "ANALISE_URL": "http://analise.test"}
+
+
+def install_example_plugin(db: Database, source=EXAMPLE_PLUGIN, config=None) -> None:
+    """Instala o plugin (com os documentos das bases indexados), como o console faz."""
+    service = PluginService(db, KnowledgeService(db), SecretBox(None))
+    anyio.run(
+        lambda: service.install(
+            load_plugin(source).pack(), config=PLUGIN_CONFIG if config is None else config
+        )
+    )
+
+
+def attach_plugin(db: Database, name: str, *, only_plugin: bool = False) -> None:
+    """Liga o plugin ao roteador 'default'; com ``only_plugin``, tira o que foi cadastrado à mão."""
+    with db.session() as s:
+        profile = s.query(RouterProfile).one()
+        if only_plugin:
+            profile.connectors, profile.agents, profile.knowledge_bases = [], [], []
+        plugin_repo.set_profile_plugins(s, profile, [plugin_repo.require_plugin(s, name).id])
+
+
+def test_plugin_components_and_playbook_serve_the_chat_and_usage_is_kept_per_version(database):
+    install_example_plugin(database)
+    attach_plugin(database, "acme-credito", only_plugin=True)
+    with make_client(database) as client:
+        listing = client.get("/v1/plugins").json()
+        assert listing["profile"] == "default" and listing["warnings"] == []
+        [info] = listing["plugins"]
+        assert (info["name"], info["version"]) == ("acme-credito", "1.0.0")
+        assert info["connectors"] == ["acme-credito.credito"]
+        assert info["agents"] == ["acme-credito.analise-credito"]
+        assert info["knowledge_bases"] == ["acme-credito.politicas"]
+        [playbook] = info["playbooks"]
+        assert playbook["skill"] == "politica-de-credito" and "body" not in playbook
+        assert client.get("/v1/plugins?profile=outro").status_code == 404
+
+        # ação síncrona: a tool do conector do plugin, orientada pelo playbook
+        tool = client.post(
+            "/v1/chat",
+            json={"message": "Simule um empréstimo de R$ 30 mil em 12 meses a 2% ao mês"},
+        ).json()
+        assert (tool["route"], tool["agent"], tool["tool"]) == (
+            "tool",
+            "acme-credito.credito",
+            "simular_financiamento",
+        )
+        assert "Parcela mensal: R$ 2.836,79" in tool["answer"]
+        used = {(u["kind"], u["component"], u["ok"]) for u in tool["plugins"]}
+        assert {
+            ("playbook", "politica-de-credito", None),
+            ("tool", "acme-credito.credito/simular_financiamento", True),
+        } <= used
+        assert {(u["plugin"], u["version"]) for u in tool["plugins"]} == {("acme-credito", "1.0.0")}
+        assert any(s["kind"] == "playbooks" for s in tool["spans"])
+
+        # resposta direta: o RAG vem da base do plugin
+        direct = client.post(
+            "/v1/chat",
+            json={"message": "Em quanto tempo o dinheiro é liberado depois da assinatura digital?"},
+        ).json()
+        assert direct["route"] == "direct" and "1 dia útil" in direct["answer"]
+        assert {s["kb"] for s in direct["sources"]} == {"acme-credito.politicas"}
+        assert ("knowledge", "acme-credito.politicas") in {
+            (u["kind"], u["component"]) for u in direct["plugins"]
+        }
+
+        # a execução guardada traz os plugins que participaram
+        assert client.get(f"/v1/runs/{tool['run_id']}").json()["plugins"] == tool["plugins"]
+
+        # a compatibilidade com a API da OpenAI também informa
+        completion = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "default",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Simule um empréstimo de R$ 30 mil em 12 meses a 2% ao mês",
+                    }
+                ],
+            },
+        ).json()
+        assert {u["plugin"] for u in completion["switchboard"]["plugins"]} == {"acme-credito"}
+
+    with database.session() as s:
+        [row] = plugin_repo.usage_by_version(s, "acme-credito")
+        assert (row["version"], row["requests"], row["errors"]) == ("1.0.0", 3, 0)
+        assert row["kinds"]["playbook"] >= 2 and row["kinds"]["tool"] == 2
+        assert row["kinds"]["knowledge"] == 1
+
+
+def test_plugin_waiting_for_approval_stays_out_until_it_is_approved(database):
+    files = {
+        "plugin.yaml": (
+            "name: acme-fila\nversion: 1.0.0\ndescription: Playbook sempre ativo.\n"
+            "playbooks:\n  - skill: atender\n    always: true\n"
+        ),
+        "skills/atender/SKILL.md": (
+            "---\nname: atender\ndescription: Como atender o cliente.\n---\n\n"
+            "Seja cordial e objetivo.\n"
+        ),
+    }
+    install_example_plugin(database, pack({k: v.encode() for k, v in files.items()}), config={})
+    attach_plugin(database, "acme-fila")
+    with make_client(database) as client:
+        listing = client.get("/v1/plugins").json()
+        assert listing["plugins"] == []
+        [warning] = listing["warnings"]
+        assert "acme-fila" in warning and "aguardando aprovação" in warning
+        body = client.post("/v1/chat", json={"message": "Qual o horário de atendimento?"}).json()
+        assert body["plugins"] == [] and any("aguardando aprovação" in w for w in body["warnings"])
+
+        with database.session() as s:  # o operador aprova no console
+            plugin_repo.approve_plugin(s, "acme-fila", actor="admin")
+        [info] = client.get("/v1/plugins").json()["plugins"]  # sem reiniciar o router
+        assert info["name"] == "acme-fila" and info["playbooks"][0]["always"] is True
+        body = client.post("/v1/chat", json={"message": "Qual o horário de atendimento?"}).json()
+        assert [(u["kind"], u["component"]) for u in body["plugins"]] == [("playbook", "atender")]
+        assert not any("aguardando" in w for w in body["warnings"])
+
+        with database.session() as s:  # e desativa: sai do roteamento na hora
+            plugin_repo.set_plugin_enabled(s, "acme-fila", False)
+        assert client.get("/v1/plugins").json()["plugins"] == []
+
+
+def test_plugin_endpoint_follows_the_api_keys(database):
+    with make_client(database, api_keys="k1") as client:
+        assert client.get("/v1/plugins").status_code == 401
+        ok = client.get("/v1/plugins", headers={"Authorization": "Bearer k1"})
+        assert ok.status_code == 200 and ok.json()["plugins"] == []
+
+
+def test_yaml_mode_with_a_plugin(tmp_path):
+    config = tmp_path / "switchboard.yaml"
+    config.write_text(
+        f"""
+models: [{{name: offline, provider: offline}}]
+plugins:
+  - name: acme-credito
+    path: "{EXAMPLE_PLUGIN.as_posix()}"
+    config:
+      CREDITO_URL: http://127.0.0.1:9/mcp
+      ANALISE_URL: http://127.0.0.1:9
+profiles:
+  - {{name: default, model: offline, plugins: [acme-credito], min_score: 0.1}}
+""",
+        encoding="utf-8",
+    )
+    with TestClient(
+        create_app(Settings(config_file=str(config), allowed_hosts="testserver"))
+    ) as client:
+        [info] = client.get("/v1/plugins").json()["plugins"]
+        assert (info["name"], info["version"]) == ("acme-credito", "1.0.0")
+        assert info["connectors"] == ["acme-credito.credito"]
+        assert info["agents"] == ["acme-credito.analise-credito"]
+        body = client.post(
+            "/v1/chat",
+            json={"message": "Em quanto tempo o dinheiro é liberado depois da assinatura digital?"},
+        ).json()
+        assert body["route"] == "direct" and "1 dia útil" in body["answer"]
+        assert ("knowledge", "acme-credito.politicas") in {
+            (u["kind"], u["component"]) for u in body["plugins"]
+        }

@@ -8,7 +8,7 @@ nas opções do Jev.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -69,9 +69,20 @@ class Capability:
         return text
 
 
+def _examples(
+    extra: Mapping[str, Sequence[str]] | None, owner: str, name: str, own: Sequence[str] = ()
+) -> tuple[str, ...]:
+    """Frases de exemplo: as do plugin (curadas para o roteamento) e depois as do próprio agente."""
+    merged = [*(extra or {}).get(f"{owner}/{name}", ()), *own]
+    return tuple(dict.fromkeys(e for e in merged if e))
+
+
 def capabilities(
-    connectors: Sequence[ConnectorInfo], agents: Sequence[AgentInfo]
+    connectors: Sequence[ConnectorInfo],
+    agents: Sequence[AgentInfo],
+    examples: Mapping[str, Sequence[str]] | None = None,
 ) -> list[Capability]:
+    """Capacidades no ar; ``examples`` ('dono/nome' -> frases) vem dos plugins do perfil."""
     out: list[Capability] = []
     for connector in connectors:
         if connector.status != "online":
@@ -86,6 +97,7 @@ def capabilities(
                     description=tool.description,
                     owner_description=connector.description,
                     input_schema=tool.input_schema,
+                    examples=_examples(examples, connector.name, tool.name),
                     tool=tool,
                 )
             )
@@ -105,7 +117,7 @@ def capabilities(
                     owner_description=agent.description,
                     input_schema=skill.terms.input_schema if skill.terms else None,
                     output_schema=skill.terms.output_schema if skill.terms else None,
-                    examples=skill.examples,
+                    examples=_examples(examples, agent.name, skill.id, skill.examples),
                     contract=skill.contract,
                     skill=skill,
                 )

@@ -61,7 +61,7 @@ class _KBInfo:
     connection: ModelSpec | None
 
 
-def _content_hash(text_value: str) -> str:
+def content_hash(text_value: str) -> str:
     return hashlib.sha256(text_value.strip().encode("utf-8")).hexdigest()
 
 
@@ -167,7 +167,7 @@ class KnowledgeService:
         content = content.strip()
         if not content:
             raise IngestError("o documento está vazio")
-        digest = _content_hash(content)
+        digest = content_hash(content)
 
         def prepare():
             with self.db.session() as session:

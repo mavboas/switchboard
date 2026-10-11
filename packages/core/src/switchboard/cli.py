@@ -1,4 +1,4 @@
-"""CLI do modo framework: ``switchboard ask | connectors | agents | check``."""
+"""CLI do modo framework: ``switchboard ask | connectors | agents | check | plugin``."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from pathlib import Path
 from .app import Switchboard
 from .config import load_yaml
 from .errors import SwitchboardError
+from .plugins import LEVELS, PluginBundle, format_findings, load_plugin, load_plugins
 
 ROUTE_LABELS = {
     "direct": "resposta direta",
@@ -122,17 +123,168 @@ async def _agents(args: argparse.Namespace) -> int:
 
 
 def _check(args: argparse.Namespace) -> int:
-    spec = load_yaml(_config_path(args.config))
+    path = _config_path(args.config)
+    spec = load_yaml(path)
     print(
         f"ok: {len(spec.models)} modelo(s), {len(spec.connectors)} conector(es) MCP, "
         f"{len(spec.agents)} agente(s) A2A, {len(spec.knowledge_bases)} base(s), "
-        f"{len(spec.profiles)} perfil(is)"
+        f"{len(spec.plugins)} plugin(s), {len(spec.profiles)} perfil(is)"
     )
     for p in spec.profiles:
         decision = f" decisão={p.decision_model}" if p.decision_model else ""
+        plugins = f" plugins={p.plugins}" if p.plugins else ""
         print(
             f"  - {p.name}: modelo={p.model}{decision} conectores={p.connectors} "
-            f"agentes={p.agents} bases={p.knowledge_bases}"
+            f"agentes={p.agents} bases={p.knowledge_bases}{plugins}"
+        )
+    # os plugins são lidos e varridos aqui também: quem faz o check vê o que a subida veria
+    loaded = {p.name: p for p in load_plugins(spec.plugins, path.parent)}
+    for ref in spec.plugins:
+        plugin = loaded.get(ref.name)
+        if plugin is None:
+            print(f"  plugin {ref.name}: desativado (enabled: false)")
+            continue
+        parts = _components(plugin.bundle)
+        accepted = f"; aceitos por allow: {', '.join(sorted({f.code for f in plugin.accepted}))}"
+        print(f"  plugin {ref.name} {plugin.version}: {parts}{accepted if plugin.accepted else ''}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# plugin: validate | inspect | pack
+
+
+def _components(bundle: PluginBundle) -> str:
+    m = bundle.manifest
+    if m is None:
+        return "sem manifesto válido"
+    documents = sum(len(docs) for docs in bundle.documents.values())
+    return (
+        f"{len(m.connectors)} conector(es), {len(m.agents)} agente(s), "
+        f"{len(m.knowledge_bases)} base(s) ({documents} documento(s)), "
+        f"{len(bundle.playbooks)} playbook(s)"
+    )
+
+
+COUNT_LABELS = {
+    "block": "bloqueio(s)",
+    "held": "exige(m) aprovação",
+    "warning": "aviso(s)",
+    "note": "informação(ões)",
+}
+
+
+def _count_line(bundle: PluginBundle) -> str:
+    counts = dict.fromkeys(LEVELS, 0)
+    for f in bundle.findings:
+        counts[f.level] += 1
+    return ", ".join(f"{counts[level]} {COUNT_LABELS[level]}" for level in LEVELS)
+
+
+def _plugin_validate(args: argparse.Namespace) -> int:
+    bundle = load_plugin(Path(args.path))
+    held = bundle.held
+    failed = (not bundle.ok) or (args.strict and bool(held))
+    if args.json:
+        print(
+            json.dumps(
+                {**bundle.summary(), "strict": args.strict, "passed": not failed},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 1 if failed else 0
+    if bundle.manifest is None:
+        print(f"plugin inválido ({args.path}):")
+    else:
+        print(f"plugin {bundle.name} {bundle.version} ({bundle.format}): {_components(bundle)}")
+    print(f"achados: {_count_line(bundle)}")
+    if bundle.findings:
+        print(format_findings(bundle.findings))
+    if not bundle.ok:
+        print("\nrecusado: corrija os achados que bloqueiam a instalação")
+    elif held and args.strict:
+        print("\nrecusado (--strict): há achados que exigiriam aprovação de quem instala")
+    elif held:
+        print("\nok, com ressalvas: quem instala terá de aprovar os achados 'exige aprovação'")
+    else:
+        print("\nok")
+    return 1 if failed else 0
+
+
+def _plugin_inspect(args: argparse.Namespace) -> int:
+    bundle = load_plugin(Path(args.path))
+    info = bundle.summary()
+    if args.json:
+        print(json.dumps(info, ensure_ascii=False, indent=2))
+        return 0 if bundle.ok else 1
+    if bundle.manifest is None:
+        print(f"plugin inválido ({args.path}):")
+        print(format_findings(bundle.findings))
+        return 1
+    print(f"{info['name']} {info['version']}  ({info['format']}, sha256 {info['digest'][:12]})")
+    if info.get("description"):
+        print(f"  {info['description']}")
+    meta = []
+    if info.get("author"):
+        meta.append(f"autor: {info['author'].get('name', '')}")
+    if info.get("license"):
+        meta.append(f"licença: {info['license']}")
+    if info.get("requires", {}).get("switchboard"):
+        meta.append(f"requer switchboard {info['requires']['switchboard']}")
+    if meta:
+        print("  " + " · ".join(meta))
+    if info["config"]:
+        print("\nconfiguração (quem instala informa):")
+        for c in info["config"]:
+            flags = ["obrigatória" if c["required"] and c["default"] is None else "opcional"]
+            if c["sensitive"]:
+                flags.append("sensível")
+            if c["default"] is not None:
+                flags.append(f"padrão: {c['default']}")
+            print(f"  {c['key']}  ({', '.join(flags)})  {c['description']}")
+    if info["connectors"]:
+        print("\nconectores MCP:")
+        for c in info["connectors"]:
+            tools = f"  tools: {', '.join(c['allowed_tools'])}" if c["allowed_tools"] else ""
+            print(f"  {c['name']} → {c['url']}{tools}")
+    if info["agents"]:
+        print("\nagentes A2A:")
+        for a in info["agents"]:
+            skills = f"  skills: {', '.join(a['allowed_skills'])}" if a["allowed_skills"] else ""
+            print(f"  {a['name']} → {a['url']}{skills}")
+    if info["knowledge_bases"]:
+        print("\nbases de conhecimento:")
+        for k in info["knowledge_bases"]:
+            print(f"  {k['name']}  ({k['documents']} documento(s))")
+    if info["playbooks"]:
+        print("\nplaybooks (skills que orientam o roteador):")
+        for pb in info["playbooks"]:
+            when = "sempre" if pb["always"] else f"gatilhos: {', '.join(pb['triggers']) or '—'}"
+            scope = f"  aplica-se a: {', '.join(pb['applies_to'])}" if pb["applies_to"] else ""
+            print(f"  {pb['skill']}  ({pb['chars']} caracteres; {when}){scope}")
+    print(f"\nachados: {_count_line(bundle)}")
+    if bundle.findings:
+        print(format_findings(bundle.findings))
+    return 0 if bundle.ok else 1
+
+
+def _plugin_pack(args: argparse.Namespace) -> int:
+    source = Path(args.path)
+    bundle = load_plugin(source)
+    bundle.require_ok()
+    out = Path(args.output or f"{bundle.name}-{bundle.version}.zip")
+    if source.is_dir() and out.resolve().is_relative_to(source.resolve()):
+        print("erro: escolha um destino fora do diretório do plugin", file=sys.stderr)
+        return 2
+    data = bundle.pack()
+    out.write_bytes(data)
+    print(f"ok: {out} ({len(data)} bytes, sha256 {bundle.digest[:12]})")
+    if bundle.held:
+        print(
+            f"aviso: {len(bundle.held)} achado(s) exigem aprovação de quem instalar; "
+            f"veja: switchboard plugin validate {args.path}",
+            file=sys.stderr,
         )
     return 0
 
@@ -163,7 +315,30 @@ def build_parser() -> argparse.ArgumentParser:
     agents = sub.add_parser("agents", help="descobre os agentes A2A (Agent Card) e lista as skills")
     agents.add_argument("-p", "--profile")
 
-    sub.add_parser("check", help="valida o YAML")
+    sub.add_parser("check", help="valida o YAML (e lê e varre os plugins ligados)")
+
+    plugin = sub.add_parser("plugin", help="valida, inspeciona e empacota plugins")
+    plugin_sub = plugin.add_subparsers(dest="plugin_command", required=True)
+    validate = plugin_sub.add_parser(
+        "validate", help="valida o manifesto e varre o conteúdo (diretório ou .zip)"
+    )
+    validate.add_argument("path", help="diretório ou .zip do plugin")
+    validate.add_argument(
+        "--strict",
+        action="store_true",
+        help="falha também com achados que exigem aprovação (instalável sem revisão humana)",
+    )
+    validate.add_argument("--json", action="store_true", help="resultado completo em JSON")
+    inspect_ = plugin_sub.add_parser(
+        "inspect", help="mostra o que o plugin traz: configuração, componentes e playbooks"
+    )
+    inspect_.add_argument("path", help="diretório ou .zip do plugin")
+    inspect_.add_argument("--json", action="store_true", help="resumo completo em JSON")
+    pack_ = plugin_sub.add_parser(
+        "pack", help="gera o .zip normalizado (o mesmo conteúdo, sempre os mesmos bytes)"
+    )
+    pack_.add_argument("path", help="diretório do plugin")
+    pack_.add_argument("-o", "--output", help="arquivo de saída (padrão: <nome>-<versão>.zip)")
     return parser
 
 
@@ -176,6 +351,12 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(_connectors(args))
         if args.command == "agents":
             return asyncio.run(_agents(args))
+        if args.command == "plugin":
+            return {
+                "validate": _plugin_validate,
+                "inspect": _plugin_inspect,
+                "pack": _plugin_pack,
+            }[args.plugin_command](args)
         return _check(args)
     except SwitchboardError as exc:
         print(f"erro: {exc}", file=sys.stderr)

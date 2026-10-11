@@ -24,11 +24,13 @@ from ..config import (
     ModelSpec,
     ProfileSpec,
     format_validation_error,
+    reject_reserved_name,
 )
-from ..errors import ConfigError
+from ..errors import ConfigError, PluginOwnedError
 from ..routing.types import ResolvedProfile, RouterResult
 from ..secrets import ENC_PREFIX, ENV_PREFIX, MASK, SecretBox
 from ..tracing import Span
+from . import plugins as plugin_repo
 from .contracts import aware, row_to_contract, row_to_event, row_to_span, span_rows
 from .orm import (
     Agent,
@@ -127,6 +129,7 @@ def profile_to_spec(row: RouterProfile, *, only_enabled: bool = True) -> Profile
         connectors=[c.name for c in row.connectors if c.enabled or not only_enabled],
         agents=[a.name for a in row.agents if a.enabled or not only_enabled],
         knowledge_bases=[k.name for k in row.knowledge_bases],
+        plugins=[p.name for p in row.plugins if p.enabled or not only_enabled],
         top_k=row.top_k,
         min_score=row.min_score,
         synthesize=row.synthesize,
@@ -142,19 +145,80 @@ def _profile_query():
         selectinload(RouterProfile.connectors),
         selectinload(RouterProfile.agents),
         selectinload(RouterProfile.knowledge_bases),
+        selectinload(RouterProfile.plugins),
     )
 
 
 def resolve_profile(session: Session, name: str) -> ResolvedProfile | None:
+    """O perfil pronto para o motor: o que foi cadastrado nele mais o dos plugins prontos.
+
+    Plugins ligados ao perfil que não estão prontos (desativados, aguardando aprovação ou
+    com configuração incompleta) ficam de fora, e o motivo vira um aviso em cada atendimento.
+    """
     row = session.scalars(_profile_query().where(RouterProfile.name == name)).first()
     if row is None or not row.enabled:
         return None
+    spec = profile_to_spec(row)
+    connectors = [connector_to_spec(c) for c in row.connectors if c.enabled]
+    agents = [agent_to_spec(a) for a in row.agents if a.enabled]
+    kb_names = list(spec.knowledge_bases)
+    plugins: dict[str, str] = {}
+    playbooks = []
+    examples: dict[str, list[str]] = {}
+    warnings: list[str] = []
+    ready = []
+    for plugin in row.plugins:
+        state = plugin_repo.plugin_state(plugin)
+        if state == plugin_repo.STATE_READY:
+            ready.append(plugin)
+        else:
+            warnings.append(
+                f"plugin {plugin.name} {plugin.version} não está ativo: "
+                f"{plugin_repo.STATE_LABELS[state].lower()}"
+            )
+    if ready:
+        by_id = {p.id: p for p in ready}
+        for c in session.scalars(
+            select(Connector)
+            .where(Connector.plugin_id.in_(by_id), Connector.enabled.is_(True))
+            .order_by(Connector.name)
+        ):
+            connectors.append(connector_to_spec(c))
+        for a in session.scalars(
+            select(Agent)
+            .where(Agent.plugin_id.in_(by_id), Agent.enabled.is_(True))
+            .order_by(Agent.name)
+        ):
+            agents.append(agent_to_spec(a))
+        for k in session.scalars(
+            select(KnowledgeBase)
+            .where(KnowledgeBase.plugin_id.in_(by_id))
+            .order_by(KnowledgeBase.name)
+        ):
+            kb_names.append(k.name)
+        for plugin in ready:
+            plugins[plugin.name] = plugin.version
+            playbooks.extend(plugin_repo.playbooks_of(plugin))
+            for key, phrases in (plugin.examples or {}).items():
+                examples.setdefault(key, []).extend(phrases)
+    spec = spec.model_copy(
+        update={
+            "connectors": [c.name for c in connectors],
+            "agents": [a.name for a in agents],
+            "knowledge_bases": kb_names,
+            "plugins": list(plugins),
+        }
+    )
     return ResolvedProfile(
-        spec=profile_to_spec(row),
+        spec=spec,
         model=model_to_spec(row.model),
-        connectors=[connector_to_spec(c) for c in row.connectors if c.enabled],
-        agents=[agent_to_spec(a) for a in row.agents if a.enabled],
+        connectors=connectors,
+        agents=agents,
         decision_model=model_to_spec(row.decision_model) if row.decision_model else None,
+        plugins=plugins,
+        playbooks=playbooks,
+        examples=examples,
+        warnings=warnings,
     )
 
 
@@ -196,6 +260,23 @@ def _ensure_unique(session: Session, cls, name: str, current_id: int | None) -> 
     existing = session.scalars(select(cls).where(cls.name == name)).first()
     if existing is not None and existing.id != current_id:
         raise ConfigError(f"já existe um registro chamado '{name}'")
+
+
+def _manual_name(kind: str, name: str) -> None:
+    """Cadastro manual não usa nomes com ponto (reservados aos componentes de plugins)."""
+    try:
+        reject_reserved_name(name, kind)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+
+
+def _not_plugin_owned(row: Any, kind: str, action: str = "alterar") -> None:
+    """Componentes de plugin só mudam com o plugin (configuração ou nova versão)."""
+    if getattr(row, "plugin_id", None) is not None:
+        raise PluginOwnedError(
+            f"{kind} '{row.name}' vem de um plugin: para {action}, mude a configuração do "
+            "plugin, envie uma nova versão ou remova o plugin"
+        )
 
 
 def _secret(box: SecretBox, new_value: str | None, current: str | None, clear: bool) -> str | None:
@@ -309,6 +390,7 @@ def save_connector(
     row = session.get(Connector, connector_id) if connector_id else Connector()
     if row is None:
         raise ConfigError("conector não encontrado")
+    _not_plugin_owned(row, "o conector")
     token = _secret(box, data.get("auth_token"), row.auth_token, bool(data.get("clear_auth_token")))
     fields = {
         "name": str(data.get("name") or "").strip(),
@@ -321,6 +403,7 @@ def save_connector(
         "timeout_s": data.get("timeout_s") or 30.0,
     }
     spec = _validate(ConnectorSpec, fields)
+    _manual_name("conector", spec.name)
     _ensure_unique(session, Connector, spec.name, row.id)
     for key, value in spec.model_dump().items():
         setattr(row, key, value)
@@ -333,6 +416,7 @@ def delete_connector(session: Session, connector_id: int) -> None:
     row = session.get(Connector, connector_id)
     if row is None:
         raise ConfigError("conector não encontrado")
+    _not_plugin_owned(row, "o conector", "remover")
     session.delete(row)
 
 
@@ -342,6 +426,7 @@ def save_agent(
     row = session.get(Agent, agent_id) if agent_id else Agent()
     if row is None:
         raise ConfigError("agente não encontrado")
+    _not_plugin_owned(row, "o agente")
     token = _secret(box, data.get("auth_token"), row.auth_token, bool(data.get("clear_auth_token")))
     fields = {
         "name": str(data.get("name") or "").strip(),
@@ -356,6 +441,7 @@ def save_agent(
         "allow_cross_origin": bool(data.get("allow_cross_origin", False)),
     }
     spec = _validate(AgentSpec, fields)
+    _manual_name("agente", spec.name)
     _ensure_unique(session, Agent, spec.name, row.id)
     for key, value in spec.model_dump().items():
         setattr(row, key, value)
@@ -368,6 +454,7 @@ def delete_agent(session: Session, agent_id: int) -> None:
     row = session.get(Agent, agent_id)
     if row is None:
         raise ConfigError("agente não encontrado")
+    _not_plugin_owned(row, "o agente", "remover")
     session.delete(row)
 
 
@@ -377,6 +464,15 @@ def save_knowledge_base(
     row = session.get(KnowledgeBase, kb_id) if kb_id else KnowledgeBase()
     if row is None:
         raise ConfigError("base de conhecimento não encontrada")
+    if row.plugin_id is not None:
+        # numa base de plugin só o embedder é escolha de quem opera; o resto vem do pacote
+        data = {
+            **data,
+            "name": row.name,
+            "description": row.description,
+            "chunk_size": row.chunk_size,
+            "chunk_overlap": row.chunk_overlap,
+        }
     kind = data.get("embedder_kind") or "hashing"
     connection: LlmModel | None = None
     if kind == "model":
@@ -401,6 +497,8 @@ def save_knowledge_base(
             else 120,
         },
     )
+    if row.plugin_id is None:
+        _manual_name("base", spec.name)
     _ensure_unique(session, KnowledgeBase, spec.name, row.id)
     row.name, row.description = spec.name, spec.description
     row.embedder_kind, row.embedder_dim = spec.embedder.kind, spec.embedder.dim
@@ -417,6 +515,7 @@ def delete_knowledge_base(session: Session, kb_id: int) -> None:
     row = session.get(KnowledgeBase, kb_id)
     if row is None:
         raise ConfigError("base de conhecimento não encontrada")
+    _not_plugin_owned(row, "a base", "remover")
     session.delete(row)
 
 
@@ -452,7 +551,11 @@ def _number(data: dict[str, Any], key: str, default: Any) -> Any:
 
 
 def save_profile(
-    session: Session, data: dict[str, Any], profile_id: int | None = None
+    session: Session,
+    data: dict[str, Any],
+    profile_id: int | None = None,
+    *,
+    actor: str = "console",
 ) -> RouterProfile:
     row = get_profile(session, profile_id) if profile_id else RouterProfile()
     if row is None:
@@ -468,6 +571,9 @@ def save_profile(
     connector_ids = [int(x) for x in data.get("connector_ids") or []]
     agent_ids = [int(x) for x in data.get("agent_ids") or []]
     kb_ids = [int(x) for x in data.get("kb_ids") or []]
+    # sem ``plugin_ids`` (cliente da API anterior aos plugins), os plugins do roteador ficam
+    raw_plugins = data.get("plugin_ids")
+    plugin_ids = None if raw_plugins is None else [int(x) for x in raw_plugins]
     connectors = (
         list(session.scalars(select(Connector).where(Connector.id.in_(connector_ids))))
         if connector_ids
@@ -481,6 +587,13 @@ def save_profile(
         if kb_ids
         else []
     )
+    for kind, owned in (("o conector", connectors), ("o agente", agents), ("a base", kbs)):
+        for item in owned:
+            if item.plugin_id is not None:
+                raise ConfigError(
+                    f"{kind} '{item.name}' vem de um plugin: ligue o plugin ao roteador "
+                    "em vez de escolher o item"
+                )
     if model.provider == "typesafe":
         raise ConfigError(
             f"'{model.name}' é um modelo de decisão; escolha-o em 'modelo de decisão' e use um LLM como modelo principal"
@@ -518,6 +631,8 @@ def save_profile(
     row.decision_model_id, row.decision_model = (decision.id if decision else None), decision
     row.decision_threshold = spec.decision_threshold
     row.connectors, row.agents, row.knowledge_bases = connectors, agents, kbs
+    if plugin_ids is not None or row.id is None:
+        plugin_repo.set_profile_plugins(session, row, plugin_ids or [], actor=actor)
     row.top_k, row.min_score = spec.top_k, spec.min_score
     row.synthesize, row.allow_clarify = spec.synthesize, spec.allow_clarify
     row.wait_s, row.max_parallel, row.deadline_s = spec.wait_s, spec.max_parallel, spec.deadline_s
@@ -592,6 +707,8 @@ def save_trace(session: Session, result: RouterResult) -> Trace:
     session.flush()
     if spans:
         session.add_all(span_rows(spans))
+    if result.plugin_uses:
+        plugin_repo.record_usage(session, result.trace_id, result.profile, result.plugin_uses)
     return row
 
 
@@ -729,6 +846,7 @@ def run_details(session: Session, run_id: str) -> dict[str, Any] | None:
     spans.sort(key=lambda s: s.started_at)
     data["contracts"] = contracts
     data["spans"] = [s.to_dict() for s in spans]
+    data["plugins"] = plugin_repo.trace_plugins(session, run_id)
     return data
 
 

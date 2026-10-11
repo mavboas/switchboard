@@ -13,10 +13,14 @@ from .orm import (
     Document,
     KnowledgeBase,
     LlmModel,
+    Plugin,
+    PluginEvent,
+    PluginUse,
     RouterProfile,
     SpanRow,
     Trace,
 )
+from .plugin_service import PluginService
 from .seed import seed_demo
 
 __all__ = [
@@ -32,6 +36,10 @@ __all__ = [
     "KnowledgeBase",
     "KnowledgeService",
     "LlmModel",
+    "Plugin",
+    "PluginEvent",
+    "PluginService",
+    "PluginUse",
     "RouterProfile",
     "SpanRow",
     "SqlContractStore",

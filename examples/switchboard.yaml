@@ -6,6 +6,8 @@
 #   uv run switchboard -c examples/switchboard.yaml ask "Qual o horário de atendimento aos sábados?"
 #   uv run switchboard -c examples/switchboard.yaml ask "Simule um empréstimo de R$ 30 mil em 12 meses a 2% ao mês"
 #   uv run switchboard -c examples/switchboard.yaml ask "Analise a proposta de crédito de Maria Souza: renda de 8 mil, pede 40 mil em 24 meses"
+#   uv run switchboard plugin inspect examples/plugins/acme-credito           # o que o plugin traz
+#   uv run switchboard -c examples/switchboard.yaml ask -p credito-pack "Simule um empréstimo de R$ 80 mil em 48 meses a 1,5% ao mês"
 #
 # Os exemplos precisam dos servidores de demonstração no ar (ver scripts/dev.sh):
 #   uv run switchboard-agent credito --port 8101           # conector MCP
@@ -77,6 +79,20 @@ knowledge_bases:
     embedder:
       kind: hashing             # ou: kind: model, connection: openai, model: text-embedding-3-small
 
+# Plugins: pacotes declarativos (conectores MCP, agentes A2A, bases de conhecimento e playbooks
+# no formato Agent Skills) que o roteador recebe prontos. Um plugin é só dado: nada dele é
+# executado. O pacote nunca traz endereços nem tokens; quem instala informa em `config`
+# (valem ${VAR} e env:NOME). Um perfil só usa o plugin que listar em `plugins`.
+# Guia: docs/plugins.md. Valide um pacote com `switchboard plugin validate <pasta ou .zip>`.
+plugins:
+  - name: acme-credito
+    path: plugins/acme-credito          # pasta ou .zip, relativo a este arquivo
+    config:
+      CREDITO_URL: ${CREDITO_URL:-http://localhost:8101/mcp}
+      ANALISE_URL: ${ANALISE_URL:-http://localhost:8201}
+      # ANALISE_TOKEN: env:ANALISE_TOKEN  # opcional: token do agente de análise (segredo)
+    # allow: [inj.override]               # só se você revisou e aceita um achado que exige aprovação
+
 profiles:
   - name: default
     model: offline              # troque por openai, claude ou ollama
@@ -96,3 +112,11 @@ profiles:
     connectors: [credito, chamados]
     agents: [analise-credito, risco]
     knowledge_bases: [manual]
+
+  # Tudo de crédito vem do plugin: conectores, agente de análise, política de crédito (base de
+  # conhecimento) e o playbook que ensina o roteador a atender. Os nomes ganham o prefixo do
+  # plugin (acme-credito.credito). Sem LLM: o roteador decide pelas regras locais.
+  - name: credito-pack
+    model: offline
+    plugins: [acme-credito]
+    min_score: 0.15

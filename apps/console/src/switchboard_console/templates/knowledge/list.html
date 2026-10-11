@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import delete_button, empty %}
+{% from "_macros.html" import delete_button, empty, plugin_badge %}
 {% block title %}Conhecimento{% endblock %}
 {% block content %}
 <div class="page-head">
@@ -17,14 +17,14 @@
     <tbody>
     {% for k in kbs %}
       <tr>
-        <td><a href="/knowledge/{{ k.id }}"><strong>{{ k.name }}</strong></a><span class="sub">{{ k.description }}</span></td>
+        <td><a href="/knowledge/{{ k.id }}"><strong>{{ k.name }}</strong></a> {{ plugin_badge(k.plugin, k.plugin_id) }}<span class="sub">{{ k.description }}</span></td>
         <td><span class="badge">{{ k.label }}</span>{% if k.stats.stale %}<span class="sub"><span class="badge warn">reindexar {{ k.stats.stale }}</span></span>{% endif %}</td>
         <td>{{ k.stats.documents }}</td>
         <td>{{ k.stats.chunks }}</td>
         <td class="right nowrap">
           <a class="btn small" href="/knowledge/{{ k.id }}">Abrir</a>
-          <a class="btn small" href="/knowledge/{{ k.id }}/edit">Editar</a>
-          {{ delete_button("/knowledge/" ~ k.id ~ "/delete", confirm="Remover a base " ~ k.name ~ " e todos os documentos?") }}
+          <a class="btn small" href="/knowledge/{{ k.id }}/edit">{{ 'Embedder' if k.plugin_id else 'Editar' }}</a>
+          {% if not k.plugin_id %}{{ delete_button("/knowledge/" ~ k.id ~ "/delete", confirm="Remover a base " ~ k.name ~ " e todos os documentos?") }}{% endif %}
         </td>
       </tr>
     {% endfor %}

@@ -1,17 +1,18 @@
 {% extends "base.html" %}
-{% from "_macros.html" import status_badge, delete_button, schema_table %}
+{% from "_macros.html" import status_badge, delete_button, schema_table, plugin_badge %}
 {% block title %}{{ connector.name }}{% endblock %}
 {% block content %}
 <div class="page-head">
   <div>
     <div class="crumbs"><a href="/connectors">Conectores MCP</a> /</div>
-    <h1>{{ connector.name }} {% if connector.enabled %}{{ status_badge(info) }}{% else %}<span class="badge">desabilitado</span>{% endif %}</h1>
+    <h1>{{ connector.name }} {% if connector.enabled %}{{ status_badge(info) }}{% else %}<span class="badge">desabilitado</span>{% endif %} {{ plugin_badge(connector.plugin, connector.plugin_id) }}</h1>
     <p>{{ connector.description or info.description or 'Sem descrição.' }}</p>
   </div>
   <div class="actions">
     <a class="btn" href="/connectors/{{ connector.id }}?refresh=1">Descobrir de novo</a>
-    <a class="btn" href="/connectors/{{ connector.id }}/edit">Editar</a>
-    {{ delete_button("/connectors/" ~ connector.id ~ "/delete", confirm="Remover o conector " ~ connector.name ~ "?") }}
+    {% if connector.plugin_id %}<a class="btn" href="/plugins/{{ connector.plugin_id }}#config">Configuração do plugin</a>
+    {% else %}<a class="btn" href="/connectors/{{ connector.id }}/edit">Editar</a>
+    {{ delete_button("/connectors/" ~ connector.id ~ "/delete", confirm="Remover o conector " ~ connector.name ~ "?") }}{% endif %}
   </div>
 </div>
 

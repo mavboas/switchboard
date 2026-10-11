@@ -23,6 +23,8 @@ from switchboard.storage import seed_demo
 
 from .api import api
 from .ops import router as ops_router
+from .plugins import api as plugins_api
+from .plugins import router as plugins_router
 from .settings import Settings
 from .state import STATIC_DIR, Console
 from .ui import router as ui_router
@@ -101,8 +103,8 @@ def create_app(
         title="Switchboard Console",
         version=__version__,
         description=(
-            "Configuração de modelos, conectores MCP, agentes A2A, bases de conhecimento e "
-            "roteadores; execuções, spans e contratos."
+            "Configuração de modelos, conectores MCP, agentes A2A, bases de conhecimento, "
+            "plugins e roteadores; execuções, spans e contratos."
         ),
         lifespan=lifespan,
     )
@@ -140,6 +142,8 @@ def create_app(
 
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     app.include_router(api)
+    app.include_router(plugins_api)
     app.include_router(ui_router)
+    app.include_router(plugins_router)
     app.include_router(ops_router)
     return app

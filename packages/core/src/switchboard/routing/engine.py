@@ -29,6 +29,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from ..a2a.directory import AgentDirectory, AgentInfo
+from ..config import ProfileSpec
 from ..connectors.catalog import ConnectorCatalog, ConnectorInfo, ToolCallResult
 from ..contracts import (
     RUN_COMPLETED,
@@ -65,6 +66,7 @@ from .deciders import (
 )
 from .decision import DecisionError
 from .jev_decider import DecisionContext, JevDecider
+from .playbooks import Pick, guided, plugin_uses, select_playbooks
 from .prompts import consolidation_messages
 from .types import Decision, ResolvedProfile, RouterResult, SourceRef
 
@@ -107,6 +109,19 @@ class _Clock:
 SORRY = "Desculpe, não consegui processar seu pedido agora. Tente novamente em instantes."
 
 
+def _skill_outcome(contracts: Sequence[dict[str, Any]], agent: str, skill: str) -> bool | None:
+    """Resultado de uma skill delegada até agora: ``False`` se o contrato nem abriu ou falhou,
+    ``True`` se concluiu, ``None`` enquanto está aberto (o desfecho fica no contrato)."""
+    mine = [c for c in contracts if c.get("agent") == agent and c.get("skill") == skill]
+    if not mine:
+        return False
+    if any(c.get("state") in states.FAILURES for c in mine):
+        return False
+    if all(c.get("state") == states.COMPLETED for c in mine):
+        return True
+    return None
+
+
 class RouterEngine:
     def __init__(
         self,
@@ -123,7 +138,7 @@ class RouterEngine:
         warnings: Sequence[str] = (),
     ):
         self.profile = profile
-        self.static_warnings = list(warnings)
+        self.static_warnings = [*profile.warnings, *warnings]
         self.chat = chat
         self.connectors = connectors
         self.agents = agents
@@ -207,14 +222,16 @@ class RouterEngine:
         hits, (connectors, agents) = await asyncio.gather(
             self._rag(msgs, result, recorder), self._discover(result, recorder)
         )
-        caps = capabilities(connectors, agents)
-        decision = await self._decide(msgs, caps, hits, result, recorder)
+        caps = capabilities(connectors, agents, self.profile.examples)
+        spec, picks = self._guide(msgs, caps, recorder)
+        decision = await self._decide(msgs, caps, hits, result, recorder, spec)
         if decision is None:
             return
         result.reason = decision.reason
         result.decided_by = decision.decided_by
         result.confidence = decision.confidence
         result.tasks = [t.to_dict() for t in decision.tasks]
+        tool_failed: bool | None = None
         if decision.action == "answer":
             result.route = "direct"
             result.answer = decision.answer or ""
@@ -228,11 +245,68 @@ class RouterEngine:
                 result.agent, result.tool = decision.task.owner, decision.task.name
                 result.arguments = decision.task.arguments or None
         elif decision.action == "tool":
-            await self._call_tool(decision, question, result, recorder)
+            tool_failed = await self._call_tool(decision, question, result, recorder, spec)
         else:
             await self._delegate(
                 decision, msgs, question, agents, result, recorder, wait_s, callback_url
             )
+        self._attribute(decision, picks, tool_failed, result)
+
+    # ---------------------------------------------------------------- plugins
+
+    def _guide(
+        self, msgs: list[Message], caps: list[Capability], recorder: SpanRecorder
+    ) -> tuple[ProfileSpec, list[Pick]]:
+        """Playbooks dos plugins para este pedido: o perfil com eles anexados e o que foi escolhido."""
+        spec = self.profile.spec
+        playbooks = self.profile.playbooks
+        if not playbooks:
+            return spec, []
+        picks = select_playbooks(playbooks, msgs, owners={c.owner for c in caps})
+        with recorder.span(
+            "playbooks",
+            "playbooks",
+            disponiveis=len(playbooks),
+            escolhidos=[p.to_dict() for p in picks],
+        ):
+            pass
+        return guided(spec, playbooks, [p.playbook.key for p in picks]), picks
+
+    def _attribute(
+        self,
+        decision: Decision,
+        picks: list[Pick],
+        tool_failed: bool | None,
+        result: RouterResult,
+    ) -> None:
+        """Registra quais plugins (e versões) participaram: playbooks, tools, skills e bases."""
+        if not self.profile.plugins:
+            return
+        executed = decision.action in ("tool", "delegate")
+        tasks = [
+            (
+                t.kind,
+                t.owner,
+                t.name,
+                (not tool_failed)
+                if t.kind == "tool" and tool_failed is not None
+                else _skill_outcome(result.contracts, t.owner, t.name)
+                if t.kind == "skill"
+                else None,
+            )
+            for t in decision.tasks
+            if executed
+        ]
+        used = {p.playbook.key: p.playbook for p in picks}
+        for pb in self.profile.playbooks:
+            if any(pb.covers(t.owner) for t in decision.tasks if executed):
+                used.setdefault(pb.key, pb)
+        result.plugin_uses = plugin_uses(
+            self.profile.plugins,
+            picks=used.values(),
+            tasks=tasks,
+            knowledge=[s.kb for s in result.sources],
+        )
 
     # -------------------------------------------------------------------- etapas
 
@@ -304,8 +378,8 @@ class RouterEngine:
         hits: list[Hit],
         result: RouterResult,
         recorder: SpanRecorder,
+        spec: ProfileSpec,
     ) -> Decision | None:
-        spec = self.profile.spec
         with recorder.span("decisao", "decisao", capacidades=len(caps)) as span:
             ctx = DecisionContext(recorder, parent=span)
             try:
@@ -354,9 +428,14 @@ class RouterEngine:
         return decision
 
     async def _call_tool(
-        self, decision: Decision, question: str, result: RouterResult, recorder: SpanRecorder
-    ) -> None:
-        spec = self.profile.spec
+        self,
+        decision: Decision,
+        question: str,
+        result: RouterResult,
+        recorder: SpanRecorder,
+        spec: ProfileSpec,
+    ) -> bool:
+        """Chama a tool e redige a resposta; devolve ``True`` se a tool retornou erro."""
         task = decision.task
         assert task is not None
         result.route = "tool"
@@ -389,7 +468,7 @@ class RouterEngine:
                 if not outcome.is_error
                 else f"A ferramenta retornou erro: {outcome.text}"
             )
-            return
+            return outcome.is_error
         with recorder.span("sintese", "sintese") as span:
             try:
                 answer, call = await self.composer.compose(
@@ -416,6 +495,7 @@ class RouterEngine:
         if call is not None:
             result.usage.add(call.usage)
         result.answer = answer
+        return outcome.is_error
 
     # ---------------------------------------------------------------- delegação
 
@@ -602,7 +682,7 @@ class RouterEngine:
     # -------------------------------------------------------------- consolidação
 
     async def consolidate(self, run: RunRecord, contracts: list[ContractRecord]) -> Consolidation:
-        spec = self.profile.spec
+        spec = guided(self.profile.spec, self.profile.playbooks)
         parent = next((c.parent_span_id for c in contracts if c.parent_span_id), None)
         span = Span(
             id=new_span_id(),
@@ -613,6 +693,11 @@ class RouterEngine:
             started_at=utcnow(),
             attributes={"contratos": {c.id: c.state for c in contracts}},
         )
+        covering = [
+            pb.key for pb in self.profile.playbooks if any(pb.covers(c.agent) for c in contracts)
+        ]
+        if covering:
+            span.attributes["playbooks"] = covering
         results = [
             {
                 "agente": c.agent,

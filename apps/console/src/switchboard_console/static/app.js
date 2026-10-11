@@ -63,6 +63,13 @@
 
   const OPEN_RUN = ["pending", "consolidating"];
 
+  // o que um plugin pode ter feito numa execução (mesmos nomes da página da execução)
+  const USE_KINDS = { playbook: "playbook", tool: "tool MCP", skill: "skill A2A", knowledge: "base" };
+
+  function pluginNames(data) {
+    return [...new Set((data.plugins || []).map((u) => u.plugin))];
+  }
+
   function routeBadge(route) {
     return el("span", { class: "badge route-" + route }, [el("span", { class: "dot" }), ROUTES[route] || route]);
   }
@@ -275,6 +282,8 @@
       if (tasks.length) tasks.forEach((t) => box.appendChild(el("span", { class: "badge", text: t.owner + "/" + t.name })));
       else if (data.agent) box.appendChild(el("span", { class: "badge", text: data.agent + "/" + data.tool }));
       if (data.sources && data.sources.length) box.appendChild(el("span", { class: "badge", text: data.sources.length + " fonte(s)" }));
+      const plugins = pluginNames(data);
+      if (plugins.length) box.appendChild(el("span", { class: "badge plugin", text: "plugin " + plugins.join(", ") }));
       if (typeof data.latency_ms === "number") box.appendChild(el("span", { class: "badge", text: ms(data.latency_ms) }));
       return box;
     }
@@ -358,6 +367,33 @@
                 toneBadge(CONTRACT_STATES, c.state),
               ]),
               el("div", { class: "small", text: c.error || c.last_message || "—" }),
+            ])
+          );
+        });
+      }
+      const uses = result.plugins || [];
+      if (uses.length) {
+        tracePanel.appendChild(el("h2", { text: "Plugins", style: "margin-top:16px" }));
+        const groups = new Map(); // "plugin vX" -> usos
+        uses.forEach((u) => {
+          const key = u.plugin + " v" + u.version;
+          if (!groups.has(key)) groups.set(key, []);
+          groups.get(key).push(u);
+        });
+        groups.forEach((items, key) => {
+          tracePanel.appendChild(
+            el("div", { class: "source" }, [
+              el("div", { class: "head" }, [el("strong", { text: key })]),
+              el(
+                "div",
+                { class: "pill-list" },
+                items.map((u) =>
+                  el("span", {
+                    class: "pill mono",
+                    text: (USE_KINDS[u.kind] || u.kind) + " · " + u.component + (u.ok === false ? " ✗" : ""),
+                  })
+                )
+              ),
             ])
           );
         });
@@ -548,5 +584,49 @@
     input.focus();
   }
 
-  window.SwitchboardUI = { modelForm: modelForm, playground: playground };
+  // --- upload de plugin: valida o pacote sem sair da página ---------------------------
+
+  function pluginUpload() {
+    const form = document.getElementById("plugin-form");
+    const slot = document.getElementById("plugin-preview");
+    const validate = document.getElementById("plugin-validate");
+    const file = document.getElementById("f-file");
+    if (!form || !slot || !validate || !file) return;
+
+    // outro arquivo, outra prévia
+    file.addEventListener("change", () => slot.replaceChildren());
+
+    validate.addEventListener("click", async (event) => {
+      if (!file.files.length) return; // sem arquivo, o navegador avisa que o campo é obrigatório
+      event.preventDefault();
+      const label = validate.textContent;
+      validate.disabled = true;
+      validate.textContent = "Validando…";
+      try {
+        const body = new FormData();
+        body.append("file", file.files[0]);
+        const resp = await fetch("/plugins/validate", { method: "POST", body: body });
+        if (!resp.ok) throw new Error("HTTP " + resp.status);
+        const page = new DOMParser().parseFromString(await resp.text(), "text/html");
+        const preview = page.querySelector("#plugin-preview .preview");
+        const error = page.querySelector("main .flash.error");
+        slot.replaceChildren();
+        if (preview) {
+          const hint = preview.querySelector("#plugin-reselect"); // o arquivo continua escolhido
+          if (hint) hint.remove();
+          slot.appendChild(document.importNode(preview, true));
+          slot.scrollIntoView({ behavior: "smooth", block: "start" });
+        } else {
+          slot.appendChild(el("div", { class: "flash error", text: error ? error.textContent.trim() : "Não consegui validar o pacote." }));
+        }
+      } catch (err) {
+        slot.replaceChildren(el("div", { class: "flash error", text: "Erro ao validar: " + err.message }));
+      } finally {
+        validate.disabled = false;
+        validate.textContent = label;
+      }
+    });
+  }
+
+  window.SwitchboardUI = { modelForm: modelForm, playground: playground, pluginUpload: pluginUpload };
 })();

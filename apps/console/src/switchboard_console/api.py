@@ -4,12 +4,17 @@ Os segredos (chave de API, token) são só de escrita: as respostas mostram
 apenas se há valor e de que tipo (``env:NOME`` ou cifrado).
 
 Recursos: ``/api/models``, ``/api/connectors`` (servidores MCP),
-``/api/agents`` (agentes A2A), ``/api/knowledge-bases``, ``/api/profiles``,
-``/api/traces`` (execuções, com spans e contratos) e ``/api/contracts``.
+``/api/agents`` (agentes A2A), ``/api/knowledge-bases``, ``/api/plugins`` (pacotes
+declarativos; veja :mod:`.plugins`), ``/api/profiles``, ``/api/traces`` (execuções, com
+spans e contratos) e ``/api/contracts``.
+
+Conectores, agentes e bases que vieram de um plugin aparecem com ``plugin`` preenchido e só
+mudam com o plugin (configuração ou nova versão).
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 import anyio.to_thread
@@ -17,10 +22,11 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
-from switchboard.errors import SwitchboardError
+from switchboard.errors import PluginOwnedError, SwitchboardError
 from switchboard.llm import PRESETS
 from switchboard.rag import extract_text, guess_title
 from switchboard.secrets import SecretBox
+from switchboard.storage import plugins as plugin_repo
 from switchboard.storage import repo
 from switchboard.storage.orm import (
     Agent,
@@ -28,15 +34,18 @@ from switchboard.storage.orm import (
     Document,
     KnowledgeBase,
     LlmModel,
+    Plugin,
     RouterProfile,
 )
 
-from .state import Console, get_console
+from .state import KB_FROM_PLUGIN, Console, get_console
 
 api = APIRouter(prefix="/api", tags=["admin"])
 
 
 def _fail(exc: Exception, status: int = 400) -> HTTPException:
+    if isinstance(exc, PluginOwnedError):
+        status = 409  # existe, mas pertence a um plugin: só ele o altera ou remove
     return HTTPException(status_code=status, detail=str(exc))
 
 
@@ -58,10 +67,11 @@ def _model_out(m: LlmModel) -> dict[str, Any]:
     }
 
 
-def _connector_out(c: Connector) -> dict[str, Any]:
+def _connector_out(c: Connector, plugins: Mapping[int, str] | None = None) -> dict[str, Any]:
     return {
         "id": c.id,
         "name": c.name,
+        "plugin": (plugins or {}).get(c.plugin_id),
         "description": c.description,
         "url": c.url,
         "transport": c.transport,
@@ -72,10 +82,11 @@ def _connector_out(c: Connector) -> dict[str, Any]:
     }
 
 
-def _agent_out(a: Agent) -> dict[str, Any]:
+def _agent_out(a: Agent, plugins: Mapping[int, str] | None = None) -> dict[str, Any]:
     return {
         "id": a.id,
         "name": a.name,
+        "plugin": (plugins or {}).get(a.plugin_id),
         "description": a.description,
         "url": a.url,
         "auth_token": SecretBox.describe(a.auth_token) if a.auth_token else None,
@@ -88,10 +99,15 @@ def _agent_out(a: Agent) -> dict[str, Any]:
     }
 
 
-def _kb_out(k: KnowledgeBase, stats: dict[str, int] | None = None) -> dict[str, Any]:
+def _kb_out(
+    k: KnowledgeBase,
+    stats: dict[str, int] | None = None,
+    plugins: Mapping[int, str] | None = None,
+) -> dict[str, Any]:
     return {
         "id": k.id,
         "name": k.name,
+        "plugin": (plugins or {}).get(k.plugin_id),
         "description": k.description,
         "embedder": repo.kb_label(k),
         "embedder_kind": k.embedder_kind,
@@ -117,6 +133,7 @@ def _profile_out(p: RouterProfile) -> dict[str, Any]:
         "connectors": [c.name for c in p.connectors],
         "agents": [a.name for a in p.agents],
         "knowledge_bases": [k.name for k in p.knowledge_bases],
+        "plugins": [pl.name for pl in p.plugins],
         "top_k": p.top_k,
         "min_score": p.min_score,
         "synthesize": p.synthesize,
@@ -218,9 +235,13 @@ def _connector_spec(s, connector_id: int):
 
 @api.get("/connectors")
 async def list_connectors(console: Console = Depends(get_console)):
-    return await console.run_db(
-        lambda s: [_connector_out(c) for c in s.scalars(select(Connector).order_by(Connector.name))]
-    )
+    def load(s):
+        names = plugin_repo.plugin_names_by_id(s)
+        return [
+            _connector_out(c, names) for c in s.scalars(select(Connector).order_by(Connector.name))
+        ]
+
+    return await console.run_db(load)
 
 
 @api.post("/connectors", status_code=201)
@@ -324,9 +345,11 @@ def _agent_spec(s, agent_id: int):
 
 @api.get("/agents")
 async def list_agents(console: Console = Depends(get_console)):
-    return await console.run_db(
-        lambda s: [_agent_out(a) for a in s.scalars(select(Agent).order_by(Agent.name))]
-    )
+    def load(s):
+        names = plugin_repo.plugin_names_by_id(s)
+        return [_agent_out(a, names) for a in s.scalars(select(Agent).order_by(Agent.name))]
+
+    return await console.run_db(load)
 
 
 @api.post("/agents", status_code=201)
@@ -409,12 +432,19 @@ def _kb_payload(s, body: KnowledgeIn) -> dict[str, Any]:
     return data
 
 
+async def _manual_kb(console: Console, kb_id: int) -> None:
+    """Os documentos de uma base de plugin vêm do pacote: não se mexe neles à mão."""
+    if owner := await console.kb_plugin(kb_id):
+        raise HTTPException(status_code=409, detail=KB_FROM_PLUGIN.format(plugin=owner))
+
+
 @api.get("/knowledge-bases")
 async def list_kbs(console: Console = Depends(get_console)):
     def load(s):
         stats = repo.kb_stats(s)
+        names = plugin_repo.plugin_names_by_id(s)
         return [
-            _kb_out(k, stats.get(k.id))
+            _kb_out(k, stats.get(k.id), names)
             for k in s.scalars(select(KnowledgeBase).order_by(KnowledgeBase.name))
         ]
 
@@ -471,6 +501,7 @@ async def list_documents(kb_id: int, console: Console = Depends(get_console)):
 
 @api.post("/knowledge-bases/{kb_id}/documents", status_code=201)
 async def add_document(kb_id: int, body: DocumentIn, console: Console = Depends(get_console)):
+    await _manual_kb(console, kb_id)
     try:
         doc_id, created = await console.knowledge.add_document(
             kb_id, title=body.title, content=body.content, source=body.source
@@ -484,6 +515,7 @@ async def add_document(kb_id: int, body: DocumentIn, console: Console = Depends(
 async def upload_file(
     kb_id: int, file: UploadFile = File(...), console: Console = Depends(get_console)
 ):
+    await _manual_kb(console, kb_id)
     limit = console.settings.max_upload_mb * 1024 * 1024
     data = await file.read(limit + 1)
     if (file.size or 0) > limit or len(data) > limit:
@@ -505,6 +537,7 @@ async def upload_file(
 
 @api.delete("/knowledge-bases/{kb_id}/documents/{doc_id}", status_code=204)
 async def delete_document(kb_id: int, doc_id: int, console: Console = Depends(get_console)):
+    await _manual_kb(console, kb_id)
     try:
         await console.knowledge.delete_document(kb_id, doc_id)
     except SwitchboardError as exc:
@@ -553,6 +586,13 @@ class ProfileIn(BaseModel):
     connectors: list[str] = Field(default_factory=list, description="conectores MCP")
     agents: list[str] = Field(default_factory=list, description="agentes A2A")
     knowledge_bases: list[str] = Field(default_factory=list)
+    plugins: list[str] | None = Field(
+        default=None,
+        description=(
+            "plugins ligados ao roteador (pelo nome); trazem conectores, agentes, bases e "
+            "playbooks. Omitido num PUT: os plugins atuais continuam ligados"
+        ),
+    )
     top_k: int = 4
     min_score: float = 0.2
     synthesize: bool = True
@@ -580,7 +620,7 @@ def _profile_payload(s, body: ProfileIn) -> dict[str, Any]:
         ids(LlmModel, [body.decision_model], "modelo de decisão") if body.decision_model else []
     )
     data = body.model_dump(
-        exclude={"model", "decision_model", "connectors", "agents", "knowledge_bases"}
+        exclude={"model", "decision_model", "connectors", "agents", "knowledge_bases", "plugins"}
     )
     data.update(
         model_id=model_id,
@@ -588,6 +628,7 @@ def _profile_payload(s, body: ProfileIn) -> dict[str, Any]:
         connector_ids=ids(Connector, body.connectors, "conector"),
         agent_ids=ids(Agent, body.agents, "agente"),
         kb_ids=ids(KnowledgeBase, body.knowledge_bases, "base"),
+        plugin_ids=None if body.plugins is None else ids(Plugin, body.plugins, "plugin"),
     )
     return data
 

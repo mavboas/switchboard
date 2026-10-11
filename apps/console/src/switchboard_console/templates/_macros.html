@@ -12,6 +12,8 @@
 <path d="M6 3.5h8.5l3.5 3.5v13.5H6z"/><path d="M14.5 3.5V7H18"/><path d="M9 11h6M9 14.5h6M9 18h3.5"/>
 {%- elif name == "knowledge" -%}
 <path d="M5 4.5h9.5a3 3 0 0 1 3 3V20H8a3 3 0 0 1-3-3z"/><path d="M5 17a3 3 0 0 1 3-3h9.5"/><path d="M9 8.5h5"/>
+{%- elif name == "plugins" -%}
+<path d="M12 3.2l7.5 4.2v9.2L12 20.8l-7.5-4.2V7.4z"/><path d="M4.5 7.4L12 11.6l7.5-4.2M12 11.6v9.2"/>
 {%- elif name == "profiles" -%}
 <circle cx="6" cy="6" r="2.2"/><circle cx="6" cy="18" r="2.2"/><circle cx="18" cy="12" r="2.2"/><path d="M8.2 6h2.3a3 3 0 0 1 3 3v0a3 3 0 0 0 3 3h-.3M8.2 18h2.3a3 3 0 0 0 3-3v0a3 3 0 0 1 3-3"/>
 {%- elif name == "playground" -%}
@@ -54,6 +56,46 @@
 {% if info is none %}<span class="badge">desabilitado</span>
 {% elif info.status == "online" %}<span class="badge ok"><span class="dot"></span>online</span>
 {% else %}<span class="badge danger" title="{{ info.error }}"><span class="dot"></span>offline</span>{% endif %}
+{%- endmacro %}
+
+{% macro plugin_badge(name, id) -%}
+{% if name %}<a class="badge plugin" href="/plugins/{{ id }}" title="este item vem do plugin {{ name }} e só muda com ele">plugin {{ name }}</a>{% endif %}
+{%- endmacro %}
+
+{% macro plugin_state_badge(state, label="") -%}
+<span class="badge {{ plugin_tones.get(state, '') }}"><span class="dot"></span>{{ label or plugin_labels.get(state, state) }}</span>
+{%- endmacro %}
+
+{% macro finding_badge(level) -%}
+<span class="badge {{ finding_tones.get(level, '') }}" title="{{ finding_levels.get(level, level) }}">{{ finding_labels.get(level, level) }}</span>
+{%- endmacro %}
+
+{% macro findings_table(findings, empty_text="Nenhum achado: a varredura não encontrou nada a registrar.") -%}
+<div class="table-wrap"><table class="findings">
+  <thead><tr><th>Nível</th><th>Código</th><th>O que foi achado</th><th>Onde</th></tr></thead>
+  <tbody>
+  {% for f in findings %}
+    <tr>
+      <td class="nowrap">{{ finding_badge(f.level) }}
+        {% if f.level == "held" %}<span class="sub">{% if f.approved %}<span class="badge ok">aprovado</span>{% else %}<span class="badge warn">pendente</span>{% endif %}</span>{% endif %}</td>
+      <td class="mono small">{{ f.code }}</td>
+      <td class="small">{{ f.message }}{% if f.evidence %}<span class="sub mono">«{{ f.evidence }}»</span>{% endif %}</td>
+      <td class="mono small">{{ f.where or '—' }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="4" class="muted">{{ empty_text }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table></div>
+{%- endmacro %}
+
+{% macro component_counts(counts) -%}
+{% set parts = [] %}
+{% if counts.connectors %}{% set _ = parts.append(counts.connectors ~ (" conector MCP" if counts.connectors == 1 else " conectores MCP")) %}{% endif %}
+{% if counts.agents %}{% set _ = parts.append(counts.agents ~ (" agente A2A" if counts.agents == 1 else " agentes A2A")) %}{% endif %}
+{% if counts.knowledge_bases %}{% set _ = parts.append(counts.knowledge_bases ~ (" base" if counts.knowledge_bases == 1 else " bases")) %}{% endif %}
+{% if counts.playbooks %}{% set _ = parts.append(counts.playbooks ~ (" playbook" if counts.playbooks == 1 else " playbooks")) %}{% endif %}
+{{ parts|join(" · ") if parts else "nenhum componente" }}
 {%- endmacro %}
 
 {% macro field(name, label, value="", type="text", help="", placeholder="", required=false, cls="", attrs="") -%}

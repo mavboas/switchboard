@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 from ..config import AgentSpec, ConnectorSpec, ModelSpec, ProfileSpec
 from ..llm.base import Usage
+from ..plugins.playbook import Playbook
 
 Action = Literal["answer", "tool", "delegate", "clarify"]
 Route = Literal["direct", "tool", "delegated", "clarify", "error"]
@@ -132,6 +133,8 @@ class RouterResult:
     usage: Usage = field(default_factory=Usage)
     warnings: list[str] = field(default_factory=list)
     error: str | None = None
+    # plugins que participaram: playbooks, tools, skills e bases (uma linha por componente)
+    plugin_uses: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def run_id(self) -> str:
@@ -171,18 +174,28 @@ class RouterResult:
             "usage": self.usage.to_dict(),
             "warnings": self.warnings,
             "error": self.error,
+            "plugins": self.plugin_uses,
         }
 
 
 @dataclass
 class ResolvedProfile:
-    """Perfil pronto para uso: a spec mais modelos, conectores e agentes resolvidos."""
+    """Perfil pronto para uso: a spec mais modelos, conectores e agentes resolvidos.
+
+    Os conectores, agentes e bases dos plugins ativos já estão misturados aos do perfil
+    (com nomes ``plugin.componente``); ``plugins`` diz quais são e em que versão, e
+    ``playbooks``/``examples`` trazem o know-how deles.
+    """
 
     spec: ProfileSpec
     model: ModelSpec
     connectors: list[ConnectorSpec] = field(default_factory=list)
     agents: list[AgentSpec] = field(default_factory=list)
     decision_model: ModelSpec | None = None
+    plugins: dict[str, str] = field(default_factory=dict)  # plugin -> versão
+    playbooks: list[Playbook] = field(default_factory=list)
+    examples: dict[str, list[str]] = field(default_factory=dict)  # 'dono/capacidade' -> frases
+    warnings: list[str] = field(default_factory=list)  # ex.: plugin ligado mas ainda não aprovado
 
     @property
     def name(self) -> str:
@@ -193,3 +206,32 @@ class ResolvedProfile:
 
     def agent(self, name: str) -> AgentSpec | None:
         return next((a for a in self.agents if a.name == name), None)
+
+    def plugin_summary(self) -> list[dict[str, Any]]:
+        """O que cada plugin ativo traz para este perfil (sem o texto dos playbooks)."""
+        out = []
+        for name, version in self.plugins.items():
+            prefix = f"{name}."
+            out.append(
+                {
+                    "name": name,
+                    "version": version,
+                    "connectors": [c.name for c in self.connectors if c.name.startswith(prefix)],
+                    "agents": [a.name for a in self.agents if a.name.startswith(prefix)],
+                    "knowledge_bases": [
+                        k for k in self.spec.knowledge_bases if k.startswith(prefix)
+                    ],
+                    "playbooks": [
+                        {
+                            "skill": p.skill,
+                            "description": p.description,
+                            "applies_to": list(p.applies_to),
+                            "triggers": list(p.triggers),
+                            "always": p.always,
+                        }
+                        for p in self.playbooks
+                        if p.plugin == name
+                    ],
+                }
+            )
+        return out

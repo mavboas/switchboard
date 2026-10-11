@@ -11,6 +11,7 @@ from ..llm.base import Message
 from ..rag.retriever import Hit
 from ..text import truncate
 from .capabilities import Capability
+from .playbooks import guidance_for, with_guidance
 
 HISTORY_LIMIT = 12
 SNIPPET_LIMIT = 900
@@ -61,15 +62,17 @@ def catalog_text(caps: Sequence[Capability]) -> str:
     skills = [c for c in caps if c.kind == "skill"]
     sections = []
     if tools:
-        items = [
-            {
+        items = []
+        for c in tools:
+            tool: dict[str, Any] = {
                 "connector": c.owner,
                 "tool": c.name,
                 "description": c.summary(),
                 "arguments": compact_schema(c.arguments_schema),
             }
-            for c in tools
-        ]
+            if c.examples:
+                tool["examples"] = list(c.examples[:3])
+            items.append(tool)
         sections.append(
             "### TOOLS (conectores MCP: ações rápidas, executadas na hora)\n"
             + json.dumps(items, ensure_ascii=False, indent=1)
@@ -169,9 +172,15 @@ def decision_system_prompt(
         + _formats(has_tools, has_agents, profile.allow_clarify, profile.max_parallel)
         + "\n\n## CAPACIDADES DISPONÍVEIS\n"
         + catalog_text(caps)
+        + _guidance_block(profile)
         + "\n\n## TRECHOS DE CONHECIMENTO\n"
         + knowledge_text(hits)
     )
+
+
+def _guidance_block(profile: ProfileSpec, owners: Sequence[str] = ()) -> str:
+    text = guidance_for(profile, owners)
+    return f"\n\n{text}" if text else ""
 
 
 def history(messages: Sequence[Message], limit: int = HISTORY_LIMIT) -> list[Message]:
@@ -212,6 +221,7 @@ def answer_messages(
     system = (
         f"{profile.system_prompt.strip()}\n\n## Regras\n"
         + "\n".join(f"- {r}" for r in rules)
+        + _guidance_block(profile)
         + "\n\n## TRECHOS DE CONHECIMENTO\n"
         + knowledge_text(hits)
     )
@@ -235,7 +245,7 @@ def arguments_messages(
         '- Se o schema tiver o campo "instrucao", escreva a tarefa de forma autocontida, com todos os dados que o usuário já deu.\n'
         '- Responda SOMENTE com um objeto JSON: {"arguments": {...}}'
     )
-    return [Message("system", system), *history(messages)]
+    return [Message("system", with_guidance(system, profile, [cap.owner])), *history(messages)]
 
 
 def synthesis_messages(
@@ -253,6 +263,7 @@ def synthesis_messages(
         "não esteja no resultado e não mencione JSON, tools ou detalhes internos. Se a ferramenta "
         "retornou erro, explique de forma simples o que deu errado ou o que falta e sugira o próximo passo."
     )
+    system = with_guidance(system, profile, [capability.partition("/")[0]])
     status = "ERRO" if is_error else "OK"
     user = (
         f"Pedido do usuário:\n{question}\n\n"
@@ -280,6 +291,7 @@ def consolidation_messages(
         "- não mencione JSON, contratos, ids ou detalhes internos;\n"
         "- responda em português do Brasil."
     )
+    system = with_guidance(system, profile, [str(r.get("agente", "")) for r in results])
     convo = "\n".join(
         f"{m.get('role', 'user')}: {truncate(str(m.get('content', '')), 500)}" for m in context[-6:]
     )

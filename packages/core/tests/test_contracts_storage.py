@@ -167,6 +167,11 @@ def test_mvp_database_is_migrated(empty_db_url):
         tables = set(inspect(db.engine).get_table_names())
         assert "agents" not in tables and "profile_agents" not in tables
         assert {"mcp_connectors", "a2a_agents", "contracts", "contract_events", "spans"} <= tables
+        # v3: plugins (tabelas novas e a coluna plugin_id nas tabelas que já existiam)
+        assert {"plugins", "plugin_events", "plugin_usage", "profile_plugins"} <= tables
+        inspector = inspect(db.engine)
+        for table in ("mcp_connectors", "a2a_agents", "knowledge_bases"):
+            assert "plugin_id" in {c["name"] for c in inspector.get_columns(table)}
         with db.session() as s:  # delegação A2A da v0.2 não é relabelada em subidas seguintes
             s.execute(
                 text(
@@ -194,7 +199,8 @@ def test_mvp_database_is_migrated(empty_db_url):
             version = s.execute(
                 text("SELECT value FROM switchboard_meta WHERE key = 'schema_version'")
             ).scalar()
-            assert version == "2"
+            assert version == "3"
+            assert resolved.plugins == {} and resolved.playbooks == []
     finally:
         db.dispose()
 

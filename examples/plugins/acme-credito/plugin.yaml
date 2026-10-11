@@ -1,0 +1,61 @@
+# Plugin de exemplo: crédito da Acme (fictícia). É só dado: o router não executa nada daqui.
+#
+#   uv run switchboard plugin validate examples/plugins/acme-credito
+#   uv run switchboard plugin pack examples/plugins/acme-credito -o acme-credito.zip
+#
+# Endereços e tokens não vêm no pacote: quem instala informa em `config`.
+name: acme-credito
+version: 1.0.0
+description: Simulação e análise de crédito da Acme, com a política de crédito e o jeito de atender.
+author:
+  name: Acme Serviços Financeiros
+  url: https://example.com/acme
+license: MIT
+keywords: [credito, financiamento, simulacao]
+requires:
+  switchboard: ">=0.2"
+
+config:
+  CREDITO_URL:
+    description: Endereço do servidor MCP de simulação de crédito (termina em /mcp)
+  ANALISE_URL:
+    description: Endereço do agente A2A de análise de crédito
+  ANALISE_TOKEN:
+    description: Token do agente de análise (opcional, quando o agente exige autenticação)
+    sensitive: true
+    required: false
+
+connectors:
+  - name: credito
+    description: Simulações de financiamento e empréstimo (tabela Price e SAC).
+    url: ${config.CREDITO_URL}
+    allowed_tools: [simular_financiamento, comparar_sistemas]
+
+agents:
+  - name: analise-credito
+    description: Análise de propostas de crédito (política, capacidade de pagamento e limite).
+    url: ${config.ANALISE_URL}
+    auth_token: ${config.ANALISE_TOKEN}
+    deadline_s: 300
+
+knowledge_bases:
+  - name: politicas
+    description: Política de crédito da Acme (produtos, taxas, prazos e documentos).
+    paths: [knowledge]
+
+# As skills de skills/ viram playbooks: o roteador junta o texto ao prompt quando o pedido
+# tem a ver. Aqui só se ajusta o que a skill sozinha não diz.
+playbooks:
+  - skill: politica-de-credito
+    applies_to: [credito, analise-credito]
+    triggers: [financiamento, emprestimo, empréstimo, parcela, simulacao, simulação, limite de crédito]
+
+# Frases de exemplo por capacidade ("componente/capacidade"): ajudam o roteador (e o Jev) a decidir.
+routing_examples:
+  credito/simular_financiamento:
+    - Simule um empréstimo de R$ 30 mil em 12 meses a 2% ao mês
+    - Quanto fica a parcela de um financiamento de 80 mil em 48 vezes?
+  credito/comparar_sistemas:
+    - Compare Price e SAC para 50 mil em 24 meses a 1,8% ao mês
+  analise-credito/analisar_proposta:
+    - Analise a proposta de crédito da Maria Souza, renda de 8 mil, pede 40 mil em 24 meses

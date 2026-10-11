@@ -1,8 +1,11 @@
 """Páginas de configuração do console (HTML renderizado no servidor).
 
 Painel, modelos, conectores MCP, agentes A2A, bases de conhecimento e
-roteadores. As páginas de operação (playground, execuções e contratos) ficam
-em :mod:`.ops`.
+roteadores. Os plugins ficam em :mod:`.plugins` e as páginas de operação
+(playground, execuções e contratos) em :mod:`.ops`.
+
+Conectores, agentes e bases que vieram de um plugin são somente leitura aqui: a página
+mostra de qual plugin vêm e a mudança é feita no plugin (configuração ou nova versão).
 """
 
 from __future__ import annotations
@@ -10,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections.abc import Mapping
 from typing import Any
 
 import anyio.to_thread
@@ -24,6 +28,7 @@ from switchboard.jev import build_decision_model, noul
 from switchboard.llm import PRESETS, Message, build_chat_model
 from switchboard.rag import SUPPORTED_EXTENSIONS, extract_text, guess_title
 from switchboard.secrets import MASK
+from switchboard.storage import plugins as plugin_repo
 from switchboard.storage import repo
 from switchboard.storage.orm import (
     Agent,
@@ -32,15 +37,21 @@ from switchboard.storage.orm import (
     Document,
     KnowledgeBase,
     LlmModel,
+    Plugin,
     RouterProfile,
     Trace,
 )
 
 from . import forms
 from .ops import trace_row
-from .state import Console, get_console, redirect
+from .state import KB_FROM_PLUGIN, Console, get_console, redirect
 
 router = APIRouter()
+
+FROM_PLUGIN = (
+    "Este {kind} vem de um plugin: para mudá-lo, ajuste a configuração do plugin, "
+    "envie uma nova versão ou remova o plugin."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -71,10 +82,12 @@ def _model_dict(row: LlmModel, used_by: list[str] | None = None) -> dict[str, An
     }
 
 
-def _connector_dict(row: Connector) -> dict[str, Any]:
+def _connector_dict(row: Connector, plugins: Mapping[int, str] | None = None) -> dict[str, Any]:
     return {
         "id": row.id,
         "name": row.name,
+        "plugin_id": row.plugin_id,
+        "plugin": (plugins or {}).get(row.plugin_id),
         "description": row.description,
         "url": row.url,
         "transport": row.transport,
@@ -85,10 +98,12 @@ def _connector_dict(row: Connector) -> dict[str, Any]:
     }
 
 
-def _agent_dict(row: Agent) -> dict[str, Any]:
+def _agent_dict(row: Agent, plugins: Mapping[int, str] | None = None) -> dict[str, Any]:
     return {
         "id": row.id,
         "name": row.name,
+        "plugin_id": row.plugin_id,
+        "plugin": (plugins or {}).get(row.plugin_id),
         "description": row.description,
         "url": row.url,
         "auth_token": row.auth_token,
@@ -101,10 +116,16 @@ def _agent_dict(row: Agent) -> dict[str, Any]:
     }
 
 
-def _kb_dict(row: KnowledgeBase, stats: dict[str, int] | None = None) -> dict[str, Any]:
+def _kb_dict(
+    row: KnowledgeBase,
+    stats: dict[str, int] | None = None,
+    plugins: Mapping[int, str] | None = None,
+) -> dict[str, Any]:
     return {
         "id": row.id,
         "name": row.name,
+        "plugin_id": row.plugin_id,
+        "plugin": (plugins or {}).get(row.plugin_id),
         "description": row.description,
         "embedder_kind": row.embedder_kind,
         "embedder_dim": row.embedder_dim,
@@ -136,6 +157,8 @@ def _profile_dict(row: RouterProfile) -> dict[str, Any]:
         "agents": [a.name for a in row.agents],
         "kb_ids": [k.id for k in row.knowledge_bases],
         "kbs": [k.name for k in row.knowledge_bases],
+        "plugin_ids": [p.id for p in row.plugins],
+        "plugins": [p.name for p in row.plugins],
         "top_k": row.top_k,
         "min_score": row.min_score,
         "synthesize": row.synthesize,
@@ -172,6 +195,7 @@ async def dashboard(request: Request, console: Console = Depends(get_console)):
                 "connectors": repo.count(s, Connector),
                 "agents": repo.count(s, Agent),
                 "kbs": repo.count(s, KnowledgeBase),
+                "plugins": repo.count(s, Plugin),
                 "profiles": repo.count(s, RouterProfile),
                 "traces": repo.count(s, Trace),
                 "contracts": repo.count(s, Contract),
@@ -187,6 +211,16 @@ async def dashboard(request: Request, console: Console = Depends(get_console)):
             ],
             "recent": [trace_row(t) for t in repo.query_traces(s, limit=8)],
             "profiles": [_profile_dict(p) for p in repo.list_profiles(s)],
+            "plugins": [
+                {
+                    "id": p.id,
+                    "name": p.name,
+                    "version": p.version,
+                    "state": plugin_repo.plugin_state(p),
+                    "state_label": plugin_repo.STATE_LABELS[plugin_repo.plugin_state(p)],
+                }
+                for p in plugin_repo.list_plugins(s)
+            ],
             "connector_specs": [
                 repo.connector_to_spec(c)
                 for c in s.scalars(select(Connector).order_by(Connector.name))
@@ -208,6 +242,11 @@ async def dashboard(request: Request, console: Console = Depends(get_console)):
         ("Registre conectores MCP (tools rápidas)", counts["connectors"] > 0, "/connectors/new"),
         ("Registre agentes A2A (tarefas delegadas)", counts["agents"] > 0, "/agents/new"),
         ("Crie uma base de conhecimento", counts["documents"] > 0, "/knowledge/new"),
+        (
+            "Suba um plugin (opcional): conectores, agentes e playbooks prontos",
+            counts["plugins"] > 0,
+            "/plugins/new",
+        ),
         ("Monte um roteador", counts["profiles"] > 0, "/profiles/new"),
         ("Teste no playground", counts["traces"] > 0, "/playground"),
     ]
@@ -393,14 +432,17 @@ async def _test_decision_model(console: Console, spec) -> Any:
 
 def _connector_row(s, connector_id: int):
     row = s.get(Connector, connector_id)
-    return (_connector_dict(row), repo.connector_to_spec(row)) if row is not None else None
+    if row is None:
+        return None
+    return _connector_dict(row, plugin_repo.plugin_names_by_id(s)), repo.connector_to_spec(row)
 
 
 @router.get("/connectors")
 async def connectors_list(request: Request, console: Console = Depends(get_console)):
     def load(s):
+        names = plugin_repo.plugin_names_by_id(s)
         rows = s.scalars(select(Connector).order_by(Connector.name)).all()
-        return [(_connector_dict(c), repo.connector_to_spec(c)) for c in rows]
+        return [(_connector_dict(c, names), repo.connector_to_spec(c)) for c in rows]
 
     rows = await console.run_db(load)
     infos = await asyncio.gather(
@@ -483,6 +525,8 @@ async def connectors_edit(
     )
     if row is None:
         return redirect("/connectors", erro="Conector não encontrado.")
+    if row["plugin_id"] is not None:
+        return redirect(f"/connectors/{connector_id}", erro=FROM_PLUGIN.format(kind="conector"))
     return _connector_form(console, request, row)
 
 
@@ -547,16 +591,19 @@ async def connectors_call(
 
 def _agent_row(s, agent_id: int):
     row = s.get(Agent, agent_id)
-    return (_agent_dict(row), repo.agent_to_spec(row)) if row is not None else None
+    if row is None:
+        return None
+    return _agent_dict(row, plugin_repo.plugin_names_by_id(s)), repo.agent_to_spec(row)
 
 
 @router.get("/agents")
 async def agents_list(request: Request, console: Console = Depends(get_console)):
     def load(s):
+        names = plugin_repo.plugin_names_by_id(s)
         rows = s.scalars(select(Agent).order_by(Agent.name)).all()
-        return [(_agent_dict(a), repo.agent_to_spec(a)) for a in rows], repo.contract_agent_counts(
-            s
-        )
+        return [
+            (_agent_dict(a, names), repo.agent_to_spec(a)) for a in rows
+        ], repo.contract_agent_counts(s)
 
     rows, counts = await console.run_db(load)
     infos = await asyncio.gather(
@@ -627,6 +674,8 @@ async def agents_edit(request: Request, agent_id: int, console: Console = Depend
     row = await console.run_db(lambda s: (a := s.get(Agent, agent_id)) and _agent_dict(a))
     if row is None:
         return redirect("/agents", erro="Agente não encontrado.")
+    if row["plugin_id"] is not None:
+        return redirect(f"/agents/{agent_id}", erro=FROM_PLUGIN.format(kind="agente"))
     return _agent_form(console, request, row)
 
 
@@ -671,8 +720,9 @@ def _connections(s) -> list[dict[str, Any]]:
 async def knowledge_list(request: Request, console: Console = Depends(get_console)):
     def load(s):
         stats = repo.kb_stats(s)
+        names = plugin_repo.plugin_names_by_id(s)
         rows = s.scalars(select(KnowledgeBase).order_by(KnowledgeBase.name))
-        return [_kb_dict(k, stats.get(k.id)) for k in rows]
+        return [_kb_dict(k, stats.get(k.id), names) for k in rows]
 
     return console.render(
         request, "knowledge/list.html", nav="knowledge", kbs=await console.run_db(load)
@@ -734,7 +784,8 @@ async def _kb_detail(console: Console, request: Request, kb_id: int, *, search: 
         profiles = [
             p.name for p in repo.list_profiles(s) if kb_id in [k.id for k in p.knowledge_bases]
         ]
-        return _kb_dict(kb, repo.kb_stats(s, [kb_id]).get(kb_id)), documents, profiles
+        names = plugin_repo.plugin_names_by_id(s)
+        return _kb_dict(kb, repo.kb_stats(s, [kb_id]).get(kb_id), names), documents, profiles
 
     loaded = await console.run_db(load)
     if loaded is None:
@@ -786,6 +837,8 @@ async def knowledge_delete(kb_id: int, console: Console = Depends(get_console)):
 
 @router.post("/knowledge/{kb_id}/documents")
 async def knowledge_add(request: Request, kb_id: int, console: Console = Depends(get_console)):
+    if owner := await console.kb_plugin(kb_id):
+        return redirect(f"/knowledge/{kb_id}", erro=KB_FROM_PLUGIN.format(plugin=owner))
     form = await request.form()
     items: list[tuple[str, str, str]] = []
     errors: list[str] = []
@@ -832,6 +885,8 @@ async def knowledge_add(request: Request, kb_id: int, console: Console = Depends
 
 @router.post("/knowledge/{kb_id}/documents/{doc_id}/delete")
 async def knowledge_doc_delete(kb_id: int, doc_id: int, console: Console = Depends(get_console)):
+    if owner := await console.kb_plugin(kb_id):
+        return redirect(f"/knowledge/{kb_id}", erro=KB_FROM_PLUGIN.format(plugin=owner))
     try:
         await console.knowledge.delete_document(kb_id, doc_id)
     except SwitchboardError as exc:
@@ -890,21 +945,41 @@ async def _profile_form(
         return (
             [m for m in models if not m["decision"]],
             [m for m in models if m["decision"]],
+            # itens de plugin não se escolhem um a um: liga-se o plugin (seção "Plugins")
             [
                 {"id": c.id, "name": c.name, "description": c.description, "enabled": c.enabled}
-                for c in s.scalars(select(Connector).order_by(Connector.name))
+                for c in s.scalars(
+                    select(Connector).where(Connector.plugin_id.is_(None)).order_by(Connector.name)
+                )
             ],
             [
                 {"id": a.id, "name": a.name, "description": a.description, "enabled": a.enabled}
-                for a in s.scalars(select(Agent).order_by(Agent.name))
+                for a in s.scalars(
+                    select(Agent).where(Agent.plugin_id.is_(None)).order_by(Agent.name)
+                )
             ],
             [
                 {"id": k.id, "name": k.name, "description": k.description}
-                for k in s.scalars(select(KnowledgeBase).order_by(KnowledgeBase.name))
+                for k in s.scalars(
+                    select(KnowledgeBase)
+                    .where(KnowledgeBase.plugin_id.is_(None))
+                    .order_by(KnowledgeBase.name)
+                )
+            ],
+            [
+                {
+                    "id": p.id,
+                    "name": p.name,
+                    "version": p.version,
+                    "description": p.description,
+                    "state": plugin_repo.plugin_state(p),
+                    "counts": plugin_repo.plugin_to_dict(s, p)["component_counts"],
+                }
+                for p in plugin_repo.list_plugins(s)
             ],
         )
 
-    models, deciders, connectors, agents, kbs = await console.run_db(load)
+    models, deciders, connectors, agents, kbs, plugins = await console.run_db(load)
     return console.render(
         request,
         "profiles/form.html",
@@ -916,6 +991,7 @@ async def _profile_form(
         connectors=connectors,
         agents=agents,
         kbs=kbs,
+        plugins=plugins,
     )
 
 
@@ -935,6 +1011,7 @@ async def profiles_new(request: Request, console: Console = Depends(get_console)
         "connector_ids": [],
         "agent_ids": [],
         "kb_ids": [],
+        "plugin_ids": [],
     }
     return await _profile_form(console, request, values)
 

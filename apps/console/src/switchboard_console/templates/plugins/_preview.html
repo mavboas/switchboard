@@ -1,0 +1,97 @@
+{% from "_macros.html" import findings_table, component_counts %}
+{% set info = preview.preview %}
+{% set installed = info.installed %}
+{% set installed_config = installed.config if installed else {} %}
+<div class="preview">
+  <div class="card-head">
+    <h2>{{ preview.name or 'Pacote sem manifesto válido' }}{% if preview.version %} <span class="muted mono">v{{ preview.version }}</span>{% endif %}</h2>
+    <div>
+      {% if preview.format == 'claude' %}<span class="badge" title="as partes declarativas do plugin do Claude foram convertidas">importado do formato Claude</span>{% else %}<span class="badge">pacote Switchboard</span>{% endif %}
+      <span class="muted small mono">{{ preview.origin }}</span>
+    </div>
+  </div>
+  {% if preview.description %}<p class="muted">{{ preview.description }}</p>{% endif %}
+  {% if preview.author or preview.license or preview.requires %}
+  <p class="small muted">
+    {% if preview.author %}autor: {{ preview.author.name }}{% if preview.license %} · {% endif %}{% endif %}
+    {% if preview.license %}licença: {{ preview.license }}{% endif %}
+    {% if preview.requires and preview.requires.switchboard %} · requer switchboard {{ preview.requires.switchboard }}{% endif %}
+    · conteúdo <span class="mono">{{ preview.digest[:12] }}</span>
+  </p>
+  {% endif %}
+
+  {% if not preview.ok %}
+    <div class="flash error">Este pacote não pode ser instalado: {{ preview.counts.block }} achado(s) bloqueiam a instalação (veja a varredura abaixo). Corrija o pacote e valide de novo.</div>
+  {% elif info.action == 'install' %}
+    <div class="flash info">Primeira instalação deste plugin.</div>
+  {% elif info.action == 'unchanged' %}
+    <div class="flash info">Este mesmo pacote já está instalado (versão {{ installed.version }}, {{ installed.state_label|lower }}). Enviar de novo só atualiza a configuração abaixo.</div>
+  {% elif info.action == 'upgrade' %}
+    <div class="flash info">Atualização: a versão instalada é a {{ installed.version }} ({{ installed.state_label|lower }}).
+      {% if info.carried %}{{ info.carried }} achado(s) que já tinham sido aprovados e não mudaram continuam aprovados.{% endif %}
+      {% if info.pending %}{{ info.pending|length }} achado(s) novo(s) ou alterado(s) vão precisar de aprovação.{% endif %}</div>
+  {% else %}
+    <div class="flash warn">Downgrade: a versão instalada ({{ installed.version }}) é mais nova que esta ({{ preview.version }}).
+      <label class="small"><input type="checkbox" name="allow_downgrade"> confirmo o downgrade</label></div>
+  {% endif %}
+  {% if preview.ok and info.action != 'unchanged' and info.pending %}
+    <div class="flash warn">{{ info.pending|length }} achado(s) <strong>exigem aprovação</strong>: o plugin é instalado, mas só entra em uso depois que você aprovar na página dele.</div>
+  {% endif %}
+
+  <h2 style="margin-top:18px">O que o pacote traz <span class="muted small">{{ component_counts({'connectors': preview.connectors|length, 'agents': preview.agents|length, 'knowledge_bases': preview.knowledge_bases|length, 'playbooks': preview.playbooks|length}) }}</span></h2>
+  {% if preview.connectors or preview.agents or preview.knowledge_bases or preview.playbooks %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Tipo</th><th>Nome</th><th>Detalhe</th></tr></thead>
+    <tbody>
+    {% for c in preview.connectors %}
+      <tr><td><span class="badge route-tool">conector MCP</span></td><td class="mono small">{{ preview.name }}.{{ c.name }}</td>
+        <td class="small">{{ c.description or '—' }}<span class="sub mono">{{ c.url }}{% if c.allowed_tools %} · tools: {{ c.allowed_tools|join(', ') }}{% endif %}</span></td></tr>
+    {% endfor %}
+    {% for a in preview.agents %}
+      <tr><td><span class="badge route-delegated">agente A2A</span></td><td class="mono small">{{ preview.name }}.{{ a.name }}</td>
+        <td class="small">{{ a.description or '—' }}<span class="sub mono">{{ a.url }}{% if a.allowed_skills %} · skills: {{ a.allowed_skills|join(', ') }}{% endif %}</span></td></tr>
+    {% endfor %}
+    {% for k in preview.knowledge_bases %}
+      <tr><td><span class="badge route-direct">base de conhecimento</span></td><td class="mono small">{{ preview.name }}.{{ k.name }}</td>
+        <td class="small">{{ k.description or '—' }}<span class="sub">{{ k.documents }} documento(s) para indexar</span></td></tr>
+    {% endfor %}
+    {% for p in preview.playbooks %}
+      <tr><td><span class="badge route-clarify">playbook</span></td><td class="mono small">{{ p.skill }}</td>
+        <td class="small">{{ p.description or '—' }}
+          <span class="sub">{% if p.always %}vale para todo pedido{% else %}{% if p.applies_to %}vale para {{ p.applies_to|join(', ') }}{% endif %}{% if p.triggers %}{{ ' · ' if p.applies_to }}gatilhos: {{ p.triggers|join(', ') }}{% endif %}{% endif %} · {{ p.chars }} caracteres</span></td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}
+  <p class="muted">Nada que o roteador possa usar (ou o manifesto não pôde ser lido).</p>
+  {% endif %}
+
+  <h2 style="margin-top:18px">Varredura de segurança
+    <span class="muted small">{{ preview.counts.block }} bloqueio(s) · {{ preview.counts.held }} exige(m) aprovação · {{ preview.counts.warning }} aviso(s) · {{ preview.counts.note }} informação(ões)</span></h2>
+  <p class="muted small">É uma triagem automática por regras (texto que tenta dar ordens ao roteador, segredos no pacote, endereços suspeitos…). Ela não substitui a sua leitura: o que protege de verdade é o plugin ser só dado, sem código executado.</p>
+  {{ findings_table(preview.findings) }}
+
+  {% if preview.config %}
+  <h2 style="margin-top:18px">Configuração</h2>
+  <p class="muted small">Endereços e tokens não vêm no pacote. Preencha agora ou deixe para completar depois, na página do plugin; até lá ele fica como <em>configuração incompleta</em>. Segredos ficam cifrados{% if not secrets_enabled %} (aqui falta <code>SWITCHBOARD_SECRET_KEY</code>: use <code>env:NOME</code>){% endif %}.</p>
+  <div class="form-grid">
+    {% for c in preview.config %}
+    {% set current = installed_config.get(c.key) %}
+    <div class="field">
+      <label for="cfg-{{ c.key }}">{{ c.key }}{% if c.required %} *{% endif %}{% if c.sensitive %} <span class="badge warn">sensível</span>{% endif %}</label>
+      {% if c.sensitive %}
+      <input type="password" id="cfg-{{ c.key }}" name="config.{{ c.key }}" autocomplete="off" placeholder="{{ 'deixe em branco para manter o valor atual' if current and current.set else 'texto (fica cifrado) ou env:NOME' }}">
+      {% else %}
+      <input type="text" id="cfg-{{ c.key }}" name="config.{{ c.key }}" value="{{ current.value if current and current.value else '' }}" placeholder="{{ c.default or '' }}">
+      {% endif %}
+      <div class="help">{{ c.description or 'sem descrição' }}{% if c.default %} · padrão: <code>{{ c.default }}</code>{% endif %}</div>
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  <div class="form-actions">
+    <button class="btn primary" type="submit" {% if not preview.ok %}disabled{% endif %}>Instalar{% if info.action in ('upgrade', 'downgrade') %} esta versão{% endif %}</button>
+    <span class="muted small" id="plugin-reselect">Sem JavaScript, escolha o arquivo de novo antes de instalar.</span>
+  </div>
+</div>

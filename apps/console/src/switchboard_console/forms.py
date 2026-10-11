@@ -121,6 +121,7 @@ def profile_data(form: FormData) -> dict[str, Any]:
         "connector_ids": id_list(form, "connector_ids"),
         "agent_ids": id_list(form, "agent_ids"),
         "kb_ids": id_list(form, "kb_ids"),
+        "plugin_ids": id_list(form, "plugin_ids"),
         "top_k": number(form, "top_k", int) or 4,
         "min_score": number(form, "min_score"),
         "synthesize": checkbox(form, "synthesize"),

@@ -1,7 +1,7 @@
 """Exceções do Switchboard.
 
 Toda falha esperada (configuração inválida, provedor fora do ar, conector MCP
-ou agente A2A inalcançável, segredo ausente, contrato violado) vira uma
+ou agente A2A inalcançável, segredo ausente, contrato violado, plugin recusado) vira uma
 subclasse de ``SwitchboardError`` com mensagem em português, pronta para
 aparecer na UI ou no trace de execução.
 """
@@ -15,6 +15,10 @@ class SwitchboardError(Exception):
 
 class ConfigError(SwitchboardError):
     """Configuração inválida ou incompleta (YAML, banco ou formulário)."""
+
+
+class PluginOwnedError(ConfigError):
+    """O item vem de um plugin: só o plugin (configuração ou nova versão) o altera ou remove."""
 
 
 class SecretError(SwitchboardError):
@@ -57,3 +61,11 @@ class ContractError(SwitchboardError):
 
 class IngestError(SwitchboardError):
     """Falha ao extrair texto ou indexar um documento na base de conhecimento."""
+
+
+class PluginError(SwitchboardError):
+    """Plugin inválido, recusado pela varredura de segurança ou impossível de instalar."""
+
+
+class PluginConflict(PluginError):
+    """Outra operação mudou o mesmo plugin ao mesmo tempo (dois envios simultâneos)."""

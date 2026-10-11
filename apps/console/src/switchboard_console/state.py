@@ -19,8 +19,11 @@ from switchboard.a2a import A2AClient, AgentDirectory
 from switchboard.connectors import ConnectorCatalog
 from switchboard.contracts import states
 from switchboard.llm import PRESETS
+from switchboard.plugins import LEVEL_LABELS
 from switchboard.secrets import SecretBox, load_master_key
-from switchboard.storage import Database, EmbedderCache, KnowledgeService
+from switchboard.storage import Database, EmbedderCache, KnowledgeService, PluginService
+from switchboard.storage.orm import KnowledgeBase, Plugin
+from switchboard.storage.plugins import STATE_LABELS as PLUGIN_STATE_LABELS
 
 from .settings import Settings
 
@@ -59,6 +62,40 @@ STATE_TONES = {
     "needs_input": "warn",
     "consolidating": "info",
     "failed": "danger",
+}
+
+
+# estado de um plugin, nível de um achado da varredura e tipo de uso: cor (badge) e texto
+PLUGIN_TONES = {
+    "pronto": "ok",
+    "desativado": "",
+    "aguardando_aprovacao": "warn",
+    "config_incompleta": "warn",
+    "invalido": "danger",
+}
+FINDING_TONES = {"block": "danger", "held": "warn", "warning": "info", "note": ""}
+FINDING_LABELS = {
+    "block": "bloqueia",
+    "held": "exige aprovação",
+    "warning": "aviso",
+    "note": "informação",
+}
+USE_LABELS = {
+    "playbook": "playbook",
+    "tool": "tool MCP",
+    "skill": "skill A2A",
+    "knowledge": "base de conhecimento",
+}
+PLUGIN_EVENT_LABELS = {
+    "install": "instalado",
+    "upgrade": "atualizado",
+    "approve": "achados aprovados",
+    "config": "configuração alterada",
+    "enable": "ativado",
+    "disable": "desativado",
+    "rescan": "varredura refeita",
+    "profiles": "roteadores alterados",
+    "uninstall": "removido",
 }
 
 
@@ -111,6 +148,13 @@ def build_templates() -> Jinja2Templates:
         open_states=states.OPEN,
         tones=STATE_TONES,
         presets=PRESETS,
+        plugin_tones=PLUGIN_TONES,
+        plugin_labels=PLUGIN_STATE_LABELS,
+        finding_tones=FINDING_TONES,
+        finding_labels=FINDING_LABELS,
+        finding_levels=LEVEL_LABELS,
+        use_labels=USE_LABELS,
+        plugin_event_labels=PLUGIN_EVENT_LABELS,
     )
     env.filters["datetime"] = _fmt_datetime
     env.filters["ms"] = _fmt_ms
@@ -125,6 +169,7 @@ class Console:
     db: Database
     box: SecretBox
     knowledge: KnowledgeService
+    plugins: PluginService
     connectors: ConnectorCatalog
     agents: AgentDirectory
     templates: Jinja2Templates
@@ -148,11 +193,13 @@ class Console:
             load_master_key(settings.secret_key, settings.secret_key_file),
             settings.allowed_env_secrets,
         )
+        knowledge = KnowledgeService(db, EmbedderCache(box.open))
         return cls(
             settings=settings,
             db=db,
             box=box,
-            knowledge=KnowledgeService(db, EmbedderCache(box.open)),
+            knowledge=knowledge,
+            plugins=PluginService(db, knowledge, box),
             connectors=connectors or ConnectorCatalog(ttl_s=15.0, resolve_secret=box.open),
             agents=agents
             or AgentDirectory(client=A2AClient(), ttl_s=15.0, resolve_secret=box.open),
@@ -178,6 +225,19 @@ class Console:
 
         return await anyio.to_thread.run_sync(call)
 
+    async def kb_plugin(self, kb_id: int) -> str | None:
+        """Nome do plugin dono da base (``None`` para uma base comum ou inexistente).
+
+        Os documentos de uma base de plugin vêm do pacote: quem os troca é o plugin.
+        """
+
+        def look(session) -> str | None:
+            kb = session.get(KnowledgeBase, kb_id)
+            owner = session.get(Plugin, kb.plugin_id) if kb and kb.plugin_id else None
+            return owner.name if owner else None
+
+        return await self.run_db(look)
+
     def render(self, request: Request, name: str, **context: Any):
         context.setdefault("nav", "")
         context["flash_ok"] = request.query_params.get("ok")
@@ -191,6 +251,12 @@ class Console:
             headers["Authorization"] = f"Bearer {self.settings.router_api_key}"
         url = self.settings.router_url.rstrip("/") + path
         return await self.http.request(method, url, headers=headers, **kwargs)
+
+
+KB_FROM_PLUGIN = (
+    "Os documentos desta base vêm do plugin {plugin}: para mudá-los, envie uma nova versão do "
+    "plugin (ou use 'Sincronizar documentos' na página dele)."
+)
 
 
 def get_console(request: Request) -> Console:

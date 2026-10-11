@@ -1,16 +1,17 @@
 {% extends "base.html" %}
-{% from "_macros.html" import delete_button, empty %}
+{% from "_macros.html" import delete_button, empty, plugin_badge %}
 {% block title %}{{ kb.name }}{% endblock %}
 {% block content %}
 <div class="page-head">
   <div>
     <div class="crumbs"><a href="/knowledge">Conhecimento</a> /</div>
-    <h1>{{ kb.name }}</h1>
-    <p>{{ kb.description or 'Sem descrição.' }}</p>
+    <h1>{{ kb.name }} {{ plugin_badge(kb.plugin, kb.plugin_id) }}</h1>
+    <p>{{ kb.description or 'Sem descrição.' }}{% if kb.plugin_id %} Os documentos vêm do pacote do plugin; aqui só o embedder é escolha sua.{% endif %}</p>
   </div>
   <div class="actions">
     <a class="btn" href="/knowledge/{{ kb.id }}/edit">Configurar</a>
-    {{ delete_button("/knowledge/" ~ kb.id ~ "/delete", label="Remover base", confirm="Remover a base " ~ kb.name ~ " e todos os documentos?") }}
+    {% if kb.plugin_id %}<a class="btn" href="/plugins/{{ kb.plugin_id }}">Abrir o plugin</a>
+    {% else %}{{ delete_button("/knowledge/" ~ kb.id ~ "/delete", label="Remover base", confirm="Remover a base " ~ kb.name ~ " e todos os documentos?") }}{% endif %}
   </div>
 </div>
 
@@ -29,6 +30,13 @@
 </div>
 
 <div class="grid grid-2">
+  {% if kb.plugin_id %}
+  <div class="card">
+    <h2>Documentos do plugin</h2>
+    <p class="muted">Os documentos desta base vêm do pacote do plugin <a href="/plugins/{{ kb.plugin_id }}">{{ kb.plugin }}</a>: uma nova versão do plugin os substitui. Você escolhe só o embedder (<a href="/knowledge/{{ kb.id }}/edit">Configurar</a>); depois de trocá-lo, reindexe.</p>
+    <form class="inline" method="post" action="/knowledge/{{ kb.id }}/reindex"><button class="btn" type="submit">Reindexar</button></form>
+  </div>
+  {% else %}
   <div class="card">
     <h2>Adicionar documentos</h2>
     <form method="post" action="/knowledge/{{ kb.id }}/documents" enctype="multipart/form-data" class="stack">
@@ -45,6 +53,7 @@
       <button class="btn primary" type="submit">Indexar</button>
     </form>
   </div>
+  {% endif %}
 
   <div class="card">
     <h2>Testar a busca</h2>
@@ -82,7 +91,7 @@
         <td>{{ d.chunks }}</td>
         <td>{% if d.embedder == kb.label %}<span class="badge">{{ d.embedder }}</span>{% else %}<span class="badge warn">{{ d.embedder }}</span>{% endif %}</td>
         <td class="nowrap">{{ d.created|datetime }}</td>
-        <td class="right">{{ delete_button("/knowledge/" ~ kb.id ~ "/documents/" ~ d.id ~ "/delete", confirm="Remover " ~ d.title ~ "?") }}</td>
+        <td class="right">{% if not kb.plugin_id %}{{ delete_button("/knowledge/" ~ kb.id ~ "/documents/" ~ d.id ~ "/delete", confirm="Remover " ~ d.title ~ "?") }}{% endif %}</td>
       </tr>
     {% endfor %}
     </tbody>

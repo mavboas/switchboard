@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import time
+from dataclasses import asdict
 from typing import Any, Protocol
 
 import anyio.to_thread
@@ -43,6 +44,8 @@ from switchboard.storage import Database, EmbedderCache, KnowledgeService, SqlCo
 from switchboard.tracing import Span
 
 log = logging.getLogger("switchboard.router")
+
+MAX_REMEMBERED_RUNS = 500  # modo YAML: execuções cujo uso de plugins fica em memória
 
 
 class ProfileNotFound(ConfigError):
@@ -160,6 +163,10 @@ class DbRuntime:
                 else None,
                 [c.model_dump(mode="json") for c in resolved.connectors],
                 [a.model_dump(mode="json") for a in resolved.agents],
+                resolved.plugins,
+                [asdict(p) for p in resolved.playbooks],
+                resolved.examples,
+                resolved.warnings,
             ]
         )
         async with self._lock:
@@ -280,6 +287,8 @@ class FileRuntime:
         self.contracts = switchboard.contracts
         if public_url:
             self.contracts.public_url = public_url.rstrip("/")
+        # no modo YAML não há banco: o uso de plugins das execuções com agentes fica em memória
+        self._plugin_uses: dict[str, list[dict[str, Any]]] = {}
 
     async def engine(self, profile: str) -> RouterEngine:
         await self.switchboard.load()
@@ -295,6 +304,10 @@ class FileRuntime:
         # no modo YAML o trace sai no log; só as execuções com agentes guardam spans (em memória)
         if result.route == "delegated" and result.spans:
             await self.contracts.store.add_spans([Span.from_dict(s) for s in result.spans])
+        if result.route == "delegated" and result.plugin_uses:
+            self._plugin_uses[result.run_id] = result.plugin_uses
+            while len(self._plugin_uses) > MAX_REMEMBERED_RUNS:
+                self._plugin_uses.pop(next(iter(self._plugin_uses)))
 
     async def run_details(self, run_id: str) -> dict[str, Any] | None:
         store = self.contracts.store
@@ -313,6 +326,7 @@ class FileRuntime:
             "route": "delegated",
             "contracts": contracts,
             "spans": [s.to_dict() for s in all_spans],
+            "plugins": self._plugin_uses.get(run_id, []),
         }
 
     async def ready(self) -> bool:

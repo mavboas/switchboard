@@ -14,8 +14,8 @@ Endpoints:
 * ``POST /v1/runs/{id}/cancel`` — cancela os contratos abertos;
 * ``POST /a2a/push/{contract_id}`` — push notifications dos agentes A2A
   (autenticadas pelo token do contrato, não pela chave da API);
-* ``GET /v1/models``, ``GET /v1/connectors``, ``GET /v1/agents``,
-  ``GET /healthz`` e ``GET /readyz``.
+* ``GET /v1/models``, ``GET /v1/connectors``, ``GET /v1/agents``, ``GET /v1/plugins``
+  (o que os plugins ativos trazem para o roteador), ``GET /healthz`` e ``GET /readyz``.
 """
 
 from __future__ import annotations
@@ -230,6 +230,9 @@ def create_app(settings: Settings | None = None, runtime: Runtime | None = None)
                     "agente": result.agent,
                     "tool": result.tool,
                     "contratos": len(result.contracts),
+                    "plugins": sorted(
+                        {f"{u['plugin']}@{u['version']}" for u in result.plugin_uses}
+                    ),
                     "latencia_ms": round(result.latency_ms, 1),
                     "avisos": len(result.warnings),
                 },
@@ -307,6 +310,20 @@ def create_app(settings: Settings | None = None, runtime: Runtime | None = None)
         infos = await runtime.agents.discover(engine.profile.agents, refresh=refresh)
         return {"profile": engine.profile.name, "agents": [i.to_dict() for i in infos]}
 
+    @app.get("/v1/plugins", dependencies=[Depends(require_key)])
+    async def plugins(profile: str | None = None, runtime: Runtime = Depends(rt)):
+        """O que os plugins ativos trazem para o roteador: versão, componentes e playbooks.
+
+        Plugins ligados ao roteador que ainda não estão prontos (desativados, aguardando
+        aprovação ou com configuração incompleta) ficam de fora e aparecem em ``warnings``.
+        """
+        engine = await _engine_or_404(runtime, profile)
+        return {
+            "profile": engine.profile.name,
+            "plugins": engine.profile.plugin_summary(),
+            "warnings": list(engine.profile.warnings),
+        }
+
     @app.post("/v1/chat", dependencies=[Depends(require_key)])
     async def chat(
         body: ChatRequest, tasks: BackgroundTasks, runtime: Runtime = Depends(rt)
@@ -367,6 +384,7 @@ def create_app(settings: Settings | None = None, runtime: Runtime | None = None)
             "tool": result.tool,
             "sources": [s.to_dict() for s in result.sources],
             "contracts": result.contracts,
+            "plugins": result.plugin_uses,
         }
         if result.route == "delegated":
             extra_out["links"] = _links(result.run_id)

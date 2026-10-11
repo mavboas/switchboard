@@ -1,0 +1,258 @@
+{% extends "base.html" %}
+{% from "_macros.html" import plugin_state_badge, findings_table, component_counts, empty %}
+{% block title %}{{ plugin.name }}{% endblock %}
+{% block content %}
+{% set p = plugin %}
+{% set total_requests = p.usage|sum(attribute='requests') %}
+{% set total_uses = p.usage|sum(attribute='uses') %}
+{% set total_errors = p.usage|sum(attribute='errors') %}
+<div class="page-head">
+  <div>
+    <div class="crumbs"><a href="/plugins">Plugins</a> /</div>
+    <h1>{{ p.name }} <span class="mono muted">v{{ p.version }}</span> {{ plugin_state_badge(p.state, p.state_label) }}</h1>
+    <p>{{ p.description or 'Sem descrição.' }}</p>
+  </div>
+  <div class="actions">
+    <form class="inline" method="post" action="/plugins/{{ p.id }}/{{ 'disable' if p.enabled else 'enable' }}"><button class="btn" type="submit">{{ 'Desativar' if p.enabled else 'Ativar' }}</button></form>
+    <form class="inline" method="post" action="/plugins/{{ p.id }}/rescan"><button class="btn" type="submit" title="Refaz a varredura de segurança do pacote que está guardado">Refazer varredura</button></form>
+    <a class="btn" href="/plugins/{{ p.id }}/package.zip">Baixar pacote</a>
+    <a class="btn" href="/plugins/new">Enviar nova versão</a>
+    <form class="inline" method="post" action="/plugins/{{ p.id }}/delete"
+          onsubmit='return confirm({{ ("Remover o plugin " ~ p.name ~ " e os conectores, agentes e bases dele?" ~ (" Há " ~ p.open_contracts ~ " contrato(s) em aberto com agentes dele: o router deixa de acompanhá-los." if p.open_contracts else ""))|tojson }})'>
+      {% if p.open_contracts %}<input type="hidden" name="force" value="on">{% endif %}
+      <button class="btn danger" type="submit">Remover</button>
+    </form>
+  </div>
+</div>
+
+{% if p.open_contracts %}
+<div class="flash warn">Há {{ p.open_contracts }} contrato(s) em aberto com agentes deste plugin. Remover agora impede o router de acompanhá-los; <a href="/contracts?state=abertos">veja os contratos</a>.</div>
+{% endif %}
+
+<div class="card">
+  <h2>Para entrar em uso</h2>
+  <ul class="ready">
+    <li class="{{ 'ok' if p.enabled else 'todo' }}">
+      <span class="mark">{{ '✓' if p.enabled else '!' }}</span>
+      <div class="text"><strong>Ligado</strong><small>{{ 'O plugin está ligado.' if p.enabled else 'Desativado: nenhum roteador o usa enquanto estiver assim.' }}</small></div>
+      {% if not p.enabled %}<form class="inline" method="post" action="/plugins/{{ p.id }}/enable"><button class="btn small primary" type="submit">Ativar</button></form>{% endif %}
+    </li>
+    <li class="{{ 'ok' if not p.pending else 'todo' }}">
+      <span class="mark">{{ '✓' if not p.pending else '!' }}</span>
+      <div class="text"><strong>Achados aprovados</strong>
+        <small>{% if p.pending %}{{ p.pending }} achado(s) da varredura exigem a sua aprovação (veja abaixo). Enquanto isso o plugin não entra no roteamento.{% elif p.approved_by %}Aprovado por {{ p.approved_by }} em {{ p.approved_at|datetime }}.{% else %}Nada exige aprovação.{% endif %}</small></div>
+      {% if p.pending %}<form class="inline" method="post" action="/plugins/{{ p.id }}/approve" onsubmit="return confirm('Você revisou os achados e quer aprová-los?')"><input type="hidden" name="digest" value="{{ p.digest }}"><button class="btn small primary" type="submit">Aprovar achados</button></form>{% endif %}
+    </li>
+    <li class="{{ 'ok' if not p.missing else 'todo' }}">
+      <span class="mark">{{ '✓' if not p.missing else '!' }}</span>
+      <div class="text"><strong>Configuração completa</strong>
+        <small>{% if p.missing %}Falta informar: {{ p.missing|join(', ') }}.{% else %}Tudo o que é obrigatório está preenchido.{% endif %}</small></div>
+      {% if p.missing %}<a class="btn small primary" href="#config">Configurar</a>{% endif %}
+    </li>
+    <li class="{{ 'ok' if p.profiles else 'todo' }}">
+      <span class="mark">{{ '✓' if p.profiles else '!' }}</span>
+      <div class="text"><strong>Ligado a roteadores</strong>
+        <small>{% if p.profiles %}Usado por: {{ p.profiles|join(', ') }}.{% else %}Nenhum roteador usa este plugin ainda: escolha abaixo.{% endif %}</small></div>
+      {% if not p.profiles %}<a class="btn small primary" href="#roteadores">Escolher</a>{% endif %}
+    </li>
+  </ul>
+</div>
+
+<div class="stats">
+  <div class="stat"><div class="label">Pedidos atendidos</div><div class="value">{{ total_requests }}</div><div class="hint">em {{ p.usage|length }} versão(ões)</div></div>
+  <div class="stat"><div class="label">Usos</div><div class="value">{{ total_uses }}</div><div class="hint">playbooks, tools, skills e bases</div></div>
+  <div class="stat"><div class="label">Erros</div><div class="value">{{ total_errors }}</div><div class="hint">tools e skills deste plugin que falharam</div></div>
+  <div class="stat"><div class="label">Traz</div><div class="value" style="font-size:15px">{{ component_counts(p.component_counts) }}</div><div class="hint">{{ p.counts.block + p.counts.held + p.counts.warning + p.counts.note }} achado(s) na varredura</div></div>
+</div>
+
+<div class="grid grid-2">
+  <div class="card">
+    <h2>Pacote</h2>
+    <dl class="kv">
+      <dt>Versão</dt><dd>{{ p.version }}</dd>
+      <dt>Formato</dt><dd>{{ 'importado do formato Claude' if p.format == 'claude' else 'pacote Switchboard' }}</dd>
+      <dt>Origem</dt><dd class="mono small">{{ p.origin or '—' }}</dd>
+      <dt>Conteúdo</dt><dd class="mono small" title="{{ p.digest }}">{{ p.digest[:16] }}…</dd>
+      <dt>Autor</dt><dd>{% if p.author %}{{ p.author.name }}{% if p.author.url %} <span class="muted small mono">{{ p.author.url }}</span>{% endif %}{% else %}—{% endif %}</dd>
+      <dt>Licença</dt><dd>{{ p.license or '—' }}</dd>
+      <dt>Requer</dt><dd>{% if p.requires and p.requires.switchboard %}switchboard {{ p.requires.switchboard }}{% else %}—{% endif %}</dd>
+      <dt>Instalado</dt><dd>{{ p.installed_at|datetime }}</dd>
+      <dt>Atualizado</dt><dd>{{ p.updated_at|datetime }}</dd>
+    </dl>
+  </div>
+
+  <div class="card" id="roteadores">
+    <h2>Roteadores que usam este plugin</h2>
+    {% if profiles %}
+    <form method="post" action="/plugins/{{ p.id }}/profiles">
+      <div class="stack">
+      {% for r in profiles %}
+        <label class="check"><input type="checkbox" name="profile_ids" value="{{ r.id }}" {% if r.attached %}checked{% endif %}>
+          <div><strong>{{ r.name }}{% if not r.enabled %} (desativado){% endif %}</strong><span>{{ r.description or 'sem descrição' }}</span></div></label>
+      {% endfor %}
+      </div>
+      <div class="form-actions">
+        <button class="btn primary" type="submit">Salvar</button>
+        {% for r in profiles if r.attached and r.enabled %}{% if loop.first %}<span class="muted small">Testar:</span>{% endif %}<a class="btn small" href="/playground?profile={{ r.name }}">{{ r.name }}</a>{% endfor %}
+      </div>
+    </form>
+    <p class="muted small" style="margin-top:12px">Ligado a um roteador, o plugin traz para ele os conectores, agentes e bases e o texto dos playbooks que combinam com cada pedido. O router aplica a mudança em poucos segundos.</p>
+    {% else %}
+    {{ empty("Nenhum roteador ainda", "Crie um roteador para poder ligar o plugin a ele.", "/profiles/new", "Novo roteador") }}
+    {% endif %}
+  </div>
+</div>
+
+<div class="card" id="achados">
+  <div class="card-head">
+    <h2>Varredura de segurança
+      <span class="muted small">{{ p.counts.block }} bloqueio(s) · {{ p.counts.held }} exige(m) aprovação · {{ p.counts.warning }} aviso(s) · {{ p.counts.note }} informação(ões)</span></h2>
+    {% if p.pending %}<form class="inline" method="post" action="/plugins/{{ p.id }}/approve" onsubmit="return confirm('Você revisou os achados e quer aprová-los?')"><input type="hidden" name="digest" value="{{ p.digest }}"><button class="btn primary small" type="submit">Aprovar {{ p.pending }} achado(s)</button></form>{% endif %}
+  </div>
+  <p class="muted small">Triagem automática do pacote guardado (texto que tenta dar ordens ao roteador, segredos, endereços suspeitos…). Ao aprovar, fica registrado quem aprovou e quando; numa versão nova, só o que mudou volta a pedir aprovação.</p>
+  {{ findings_table(p.findings) }}
+</div>
+
+<div class="card" id="config">
+  <h2>Configuração</h2>
+  {% if p.config %}
+  <form method="post" action="/plugins/{{ p.id }}/config">
+    <div class="form-grid">
+      {% for c in p.config %}
+      <div class="field">
+        <label for="cfg-{{ c.key }}">{{ c.key }}{% if c.required %} *{% endif %}
+          {% if c.sensitive %}<span class="badge warn">sensível</span>{% endif %}
+          {% if c.required and not c.set and not c.default %}<span class="badge danger">falta</span>{% endif %}</label>
+        {% if c.sensitive %}
+        <input type="password" id="cfg-{{ c.key }}" name="config.{{ c.key }}" autocomplete="off" placeholder="{{ ('deixe em branco para manter: ' ~ c.display) if c.set else 'texto (fica cifrado) ou env:NOME' }}">
+        {% if c.set %}<label class="small"><input type="checkbox" name="clear.{{ c.key }}"> remover o valor atual</label>{% endif %}
+        {% else %}
+        <input type="text" id="cfg-{{ c.key }}" name="config.{{ c.key }}" value="{{ c.value or '' }}" placeholder="{{ c.default or '' }}">
+        {% endif %}
+        <div class="help">{{ c.description or 'sem descrição' }}{% if c.default %} · padrão: <code>{{ c.default }}</code>{% endif %}</div>
+      </div>
+      {% endfor %}
+    </div>
+    <div class="form-actions">
+      <button class="btn primary" type="submit">Salvar configuração</button>
+      <span class="muted small">Segredos ficam cifrados{% if not secrets_enabled %} (falta <code>SWITCHBOARD_SECRET_KEY</code>: use <code>env:NOME</code>){% endif %} e nunca voltam para a tela. Ao salvar, os conectores e agentes do plugin são refeitos com os novos valores.</span>
+    </div>
+  </form>
+  {% else %}
+  <p class="muted">Este plugin não tem nada a configurar.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Componentes</h2>
+  <p class="muted small">Cada componente tem o nome <code>plugin.componente</code> e fica somente leitura nas outras telas: ele muda com a configuração do plugin ou com uma nova versão.</p>
+
+  <h3 class="sub-title">Conectores MCP <span class="muted">({{ p.components.connectors|length }})</span></h3>
+  {% if p.components.connectors %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Conector</th><th>Endpoint</th><th>Tools liberadas</th></tr></thead>
+    <tbody>
+    {% for c in p.components.connectors %}
+      <tr><td><a href="/connectors/{{ c.id }}"><strong class="mono">{{ c.name }}</strong></a><span class="sub">{{ c.description or '—' }}</span></td>
+        <td class="mono small">{{ c.url }}</td>
+        <td class="small">{{ c.allowed_tools|join(', ') if c.allowed_tools else 'todas' }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}<p class="muted small">Nenhum{% if p.missing %} (falta configurar: {{ p.missing|join(', ') }}){% endif %}.</p>{% endif %}
+
+  <h3 class="sub-title">Agentes A2A <span class="muted">({{ p.components.agents|length }})</span></h3>
+  {% if p.components.agents %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Agente</th><th>Endpoint</th><th>Skills liberadas</th><th></th></tr></thead>
+    <tbody>
+    {% for a in p.components.agents %}
+      <tr><td><a href="/agents/{{ a.id }}"><strong class="mono">{{ a.name }}</strong></a><span class="sub">{{ a.description or '—' }}</span></td>
+        <td class="mono small">{{ a.url }}</td>
+        <td class="small">{{ a.allowed_skills|join(', ') if a.allowed_skills else 'todas' }}</td>
+        <td class="right"><a class="btn small" href="/contracts?agent={{ a.name }}">Contratos</a></td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}<p class="muted small">Nenhum{% if p.missing %} (falta configurar: {{ p.missing|join(', ') }}){% endif %}.</p>{% endif %}
+
+  <div class="card-head" style="margin-top:18px">
+    <h3 class="sub-title" style="margin:0">Bases de conhecimento <span class="muted">({{ p.components.knowledge_bases|length }})</span></h3>
+    {% if p.components.knowledge_bases %}<form class="inline" method="post" action="/plugins/{{ p.id }}/sync"><button class="btn small" type="submit" title="Deixa as bases com exatamente os documentos do pacote (use depois de uma falha de indexação)">Sincronizar documentos</button></form>{% endif %}
+  </div>
+  {% if p.components.knowledge_bases %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Base</th><th>Documentos</th><th>Trechos</th></tr></thead>
+    <tbody>
+    {% for k in p.components.knowledge_bases %}
+      <tr><td><a href="/knowledge/{{ k.id }}"><strong class="mono">{{ k.name }}</strong></a><span class="sub">{{ k.description or '—' }}</span></td>
+        <td>{{ k.stats.documents }}{% if not k.stats.documents %} <span class="badge warn" title="use 'Sincronizar documentos'">vazia</span>{% endif %}</td>
+        <td>{{ k.stats.chunks }}{% if k.stats.stale %} <span class="badge warn">reindexar {{ k.stats.stale }}</span>{% endif %}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}<p class="muted small">Nenhuma.</p>{% endif %}
+
+  <h3 class="sub-title">Playbooks <span class="muted">({{ p.playbooks|length }})</span></h3>
+  {% for pb in p.playbooks %}
+    <details class="skill">
+      <summary><strong class="mono">{{ pb.skill }}</strong> <span class="muted">— {{ pb.description or 'sem descrição' }}</span>
+        {% if pb.always %}<span class="badge info">vale para todo pedido</span>{% endif %}</summary>
+      <div class="small muted" style="margin:8px 0">
+        {% if pb.applies_to %}Vale para: {% for a in pb.applies_to %}<span class="pill mono">{{ a }}</span> {% endfor %}{% endif %}
+        {% if pb.triggers %}<br>Gatilhos: {% for t in pb.triggers %}<span class="pill">{{ t }}</span> {% endfor %}{% endif %}
+      </div>
+      <pre class="block">{{ pb.body }}</pre>
+    </details>
+  {% else %}
+    <p class="muted small">Nenhum. Um playbook é uma skill (<code>skills/…/SKILL.md</code>) que o roteador junta ao prompt quando o pedido tem a ver.</p>
+  {% endfor %}
+</div>
+
+<div class="card">
+  <h2>Uso por versão</h2>
+  {% if p.usage %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Versão</th><th>Pedidos</th><th>Usos</th><th>Erros</th><th>Último uso</th></tr></thead>
+    <tbody>
+    {% for v in p.usage %}
+      <tr>
+        <td class="mono">{{ v.version }}{% if v.version == p.version %} <span class="badge ok">atual</span>{% endif %}</td>
+        <td>{{ v.requests }}</td>
+        <td class="small">{% for kind, n in v.kinds.items() %}<span class="pill">{{ use_labels.get(kind, kind) }}: {{ n }}</span> {% endfor %}</td>
+        <td>{% if v.errors %}<span class="badge danger">{{ v.errors }}</span>{% else %}0{% endif %}</td>
+        <td class="small nowrap">{{ v.last_at|datetime }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% if p.components_usage %}
+  <h3 class="sub-title">Por componente</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Tipo</th><th>Componente</th><th>Usos</th><th>Erros</th><th>Último uso</th></tr></thead>
+    <tbody>
+    {% for u in p.components_usage %}
+      <tr><td class="small">{{ use_labels.get(u.kind, u.kind) }}</td><td class="mono small">{{ u.component }}</td><td>{{ u.uses }}</td>
+        <td>{% if u.errors %}<span class="badge danger">{{ u.errors }}</span>{% else %}0{% endif %}</td><td class="small nowrap">{{ u.last_at|datetime }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% endif %}
+  {% else %}
+  <p class="muted">Nenhum pedido usou este plugin ainda. Ligue-o a um roteador e teste no <a href="/playground">playground</a>: cada execução mostra quais playbooks, tools, skills e bases do plugin participaram.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Histórico</h2>
+  {% if p.events %}
+  <ul class="timeline">
+    {% for e in p.events %}
+    <li><span class="step-name">{{ plugin_event_labels.get(e.action, e.action) }}</span>
+      <span class="step-ms">{{ e.at|datetime }} · v{{ e.version }}{% if e.actor %} · {{ e.actor }}{% endif %}</span>
+      {% if e.summary %}<div class="small muted">{{ e.summary }}</div>{% endif %}</li>
+    {% endfor %}
+  </ul>
+  {% else %}<p class="muted">Sem registros.</p>{% endif %}
+</div>
+{% endblock %}

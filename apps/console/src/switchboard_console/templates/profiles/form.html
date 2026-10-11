@@ -62,6 +62,16 @@
       {% else %}<p class="muted">Nenhuma base criada. <a href="/knowledge/new">Criar</a></p>{% endfor %}
     </div>
 
+    <div class="section-title">Plugins</div>
+    <div class="choices full">
+      {% for pl in plugins %}
+      <label class="check"><input type="checkbox" name="plugin_ids" value="{{ pl.id }}" {% if pl.id in values.plugin_ids %}checked{% endif %}>
+        <div><strong>{{ pl.name }} <span class="muted mono small">v{{ pl.version }}</span> <span class="badge {{ plugin_tones.get(pl.state, '') }}">{{ plugin_labels.get(pl.state, pl.state) }}</span></strong>
+          <span>{{ pl.description or 'sem descrição' }} · {{ pl.counts.connectors }} conector(es), {{ pl.counts.agents }} agente(s), {{ pl.counts.knowledge_bases }} base(s), {{ pl.counts.playbooks }} playbook(s)</span></div></label>
+      {% else %}<p class="muted">Nenhum plugin instalado. <a href="/plugins/new">Subir um plugin</a></p>{% endfor %}
+    </div>
+    {% if plugins %}<p class="muted small full" style="grid-column: 1 / -1">Um plugin traz seus conectores, agentes, bases e playbooks para este roteador. Só entra em uso quando está <strong>ativo</strong> (aprovado e configurado); os itens dele não aparecem nas listas acima.</p>{% endif %}
+
     <div class="section-title">Comportamento</div>
     {{ field("top_k", "Trechos por pergunta (top-k)", values.top_k, type="number", attrs='min="1" max="20"') }}
     {{ field("min_score", "Similaridade mínima", values.min_score, type="number", attrs='step="0.01" min="0" max="1"', help="Trechos abaixo disso não entram no prompt. Com o embedder hashing, 0,15 a 0,25 costuma ir bem.") }}

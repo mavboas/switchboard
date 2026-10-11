@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% from "_macros.html" import route_badge, run_badge, state_badge, kind_badge %}
+{% set plugin_uses = trace.plugins or [] %}
 {% block title %}Execução {{ trace.trace_id[:8] }}{% endblock %}
 {% block head %}{% if refresh_s %}<meta name="sb-autorefresh" content="{{ refresh_s }}">{% endif %}{% endblock %}
 {% block content %}
@@ -85,6 +86,27 @@
     </ul>
   </details>
   {% endfor %}
+</div>
+{% endif %}
+
+{% if plugin_uses %}
+<div class="card">
+  <h2>Plugins <span class="muted">({{ plugin_uses|map(attribute='plugin')|unique|list|length }})</span></h2>
+  <p class="muted small">O que veio de plugins nesta execução: o playbook que entrou no prompt, as tools e skills dos plugins que foram acionadas e as bases consultadas. O uso é contado por plugin e por versão.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Plugin</th><th>Versão</th><th>Tipo</th><th>Componente</th><th>Resultado</th></tr></thead>
+    <tbody>
+    {% for u in plugin_uses %}
+      <tr>
+        <td><a href="/plugins#{{ u.plugin }}"><strong>{{ u.plugin }}</strong></a></td>
+        <td class="mono small">{{ u.version }}</td>
+        <td class="small">{{ use_labels.get(u.kind, u.kind) }}</td>
+        <td class="mono small">{{ u.component }}</td>
+        <td>{% if u.ok is none %}<span class="muted">—</span>{% elif u.ok %}<span class="badge ok">ok</span>{% else %}<span class="badge danger">erro</span>{% endif %}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
 </div>
 {% endif %}
 

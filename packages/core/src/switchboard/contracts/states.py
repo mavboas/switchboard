@@ -34,6 +34,8 @@ BREACHED = "violado"
 
 TERMINAL = frozenset({COMPLETED, FAILED, REJECTED, CANCELED, EXPIRED, BREACHED})
 OPEN = frozenset({PROPOSED, ACTIVE, INPUT_REQUIRED})
+# fins que contam como erro da skill (cancelado foi pedido do cliente, não falha do agente)
+FAILURES = frozenset({FAILED, REJECTED, EXPIRED, BREACHED})
 ALL = OPEN | TERMINAL
 
 LABELS = {

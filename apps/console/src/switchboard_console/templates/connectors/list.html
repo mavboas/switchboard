@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import status_badge, delete_button, empty %}
+{% from "_macros.html" import status_badge, delete_button, empty, plugin_badge %}
 {% block title %}Conectores MCP{% endblock %}
 {% block content %}
 <div class="page-head">
@@ -17,7 +17,7 @@
     <tbody>
     {% for a in connectors %}
       <tr>
-        <td><a href="/connectors/{{ a.id }}"><strong>{{ a.name }}</strong></a><span class="sub">{{ a.description or (a.info.description if a.info else '') }}</span></td>
+        <td><a href="/connectors/{{ a.id }}"><strong>{{ a.name }}</strong></a> {{ plugin_badge(a.plugin, a.plugin_id) }}<span class="sub">{{ a.description or (a.info.description if a.info else '') }}</span></td>
         <td>{% if a.enabled %}{{ status_badge(a.info) }}{% else %}<span class="badge">desabilitado</span>{% endif %}
           {% if a.info and a.info.status == 'online' %}<span class="sub">{{ '%.0f'|format(a.info.latency_ms) }} ms</span>{% endif %}</td>
         <td>
@@ -29,8 +29,9 @@
         <td class="mono small">{{ a.url }}<span class="sub">{{ a.transport }}</span></td>
         <td class="right nowrap">
           <a class="btn small" href="/connectors/{{ a.id }}?refresh=1">Descobrir</a>
-          <a class="btn small" href="/connectors/{{ a.id }}/edit">Editar</a>
-          {{ delete_button("/connectors/" ~ a.id ~ "/delete", confirm="Remover o conector " ~ a.name ~ "?") }}
+          {% if a.plugin_id %}<a class="btn small" href="/plugins/{{ a.plugin_id }}#config" title="o conector muda com a configuração do plugin">Config. do plugin</a>
+          {% else %}<a class="btn small" href="/connectors/{{ a.id }}/edit">Editar</a>
+          {{ delete_button("/connectors/" ~ a.id ~ "/delete", confirm="Remover o conector " ~ a.name ~ "?") }}{% endif %}
         </td>
       </tr>
     {% endfor %}
