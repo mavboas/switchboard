@@ -2,12 +2,12 @@
 
 O Switchboard separa **quem configura** de **quem atende**, como um gateway separa control plane de data plane:
 
-- **Console** (`apps/console`) — UI server-rendered (FastAPI + Jinja) e API admin em JSON. Grava modelos, conectores MCP, agentes A2A, bases e roteadores no banco, indexa documentos e mostra execuções, contratos e spans.
+- **Console** (`apps/console`) — UI server-rendered (FastAPI + Jinja) e API admin em JSON. Grava modelos, conectores MCP, agentes A2A, bases, plugins e roteadores no banco, indexa documentos e mostra execuções, contratos e spans.
 - **Router** (`apps/router`) — API de chat. Lê a configuração do banco (cache de 5 s), atende os pedidos, abre e acompanha os contratos com agentes (supervisor em segundo plano) e grava execuções, contratos e spans.
 - **Core** (`packages/core`, pacote `switchboard`) — o framework usado pelos dois: LLMs, cliente do Jev, embeddings, RAG, conectores MCP, cliente A2A, contratos, motor de roteamento, spans e storage. Também roda sozinho, configurado por YAML.
 - **Agentkit** (`packages/agentkit`) — o lado do agente do contrato, sobre o SDK oficial do A2A.
 
-As decisões de desenho estão na [ADR 0001](adr/0001-decisao-hibrida-e-contratos-a2a.md); o contrato com agentes, em [a2a-contrato.md](a2a-contrato.md).
+As decisões de desenho estão nos ADRs [0001](adr/0001-decisao-hibrida-e-contratos-a2a.md) (decisão híbrida e contratos) e [0002](adr/0002-plugins-declarativos.md) (plugins); o contrato com agentes, em [a2a-contrato.md](a2a-contrato.md); o formato e o ciclo de vida dos plugins, em [plugins.md](plugins.md).
 
 ## Fluxo de um pedido
 
@@ -56,7 +56,7 @@ As duas etapas rodam em paralelo.
 
 **Descoberta.** Para cada conector MCP, o catálogo abre uma sessão (Streamable HTTP ou SSE), faz o handshake e chama `tools/list` (seguindo a paginação). Para cada agente A2A, o diretório busca o Agent Card, escolhe a interface JSON-RPC 1.x, confere que ela está na mesma origem da URL cadastrada e lê os termos de cada skill na extensão do contrato. Os dois têm timeout curto (5 s) e cache (30 s online, 15 s offline); quando o cache vence, o valor antigo é servido na hora e a nova descoberta roda em segundo plano — um servidor travado nunca segura os pedidos. Quem está fora do ar sai do catálogo e gera um aviso no trace; as allowlists (`allowed_tools`, `allowed_skills`) filtram antes de chegar ao decisor.
 
-O resultado é um **catálogo único de capacidades** (`switchboard.routing.capabilities`): cada tool MCP e cada skill A2A, identificada por `dono/nome`, com descrição, exemplos e o schema de argumentos. Skills com contrato básico recebem o schema de uma instrução em texto (`instrucao`); skills com schemas inválidos ficam de fora.
+O resultado é um **catálogo único de capacidades** (`switchboard.routing.capabilities`): cada tool MCP e cada skill A2A, identificada por `dono/nome`, com descrição, exemplos e o schema de argumentos. Skills com contrato básico recebem o schema de uma instrução em texto (`instrucao`); skills com schemas inválidos ficam de fora. Os conectores e agentes dos [plugins](#plugins) ativos já chegam misturados aos do roteador (como `plugin.componente`), e as frases de exemplo do plugin entram antes das do próprio agente.
 
 ### 2. Decisão
 
@@ -121,6 +121,7 @@ Cada execução é uma árvore de spans (`switchboard.tracing`), gravada na tabe
 |---|---|
 | `pedido` | a raiz: do pedido à resposta (a primeira, se a execução continuar em segundo plano) |
 | `rag` · `descoberta` | busca nas bases; tools e skills descobertas (e quem está fora do ar) |
+| `playbooks` | quantos playbooks de plugins estavam disponíveis e quais entraram no prompt, com a pontuação e o motivo |
 | `decisao` → `jev` · `llm` | a decisão, com as perguntas ao Jev (probabilidades) e as chamadas ao LLM (tokens) |
 | `tool_mcp` · `sintese` | a chamada à tool e a redação da resposta |
 | `delegacao` → `contrato: agente/skill` | um span **por spawn**, aberto até o estado final do contrato e ligado a ele (id, estado, tipo); os eventos do agente ficam na linha do tempo do contrato |
@@ -132,7 +133,19 @@ O console desenha a cascata (waterfall) a partir desses spans, no servidor e no 
 
 ## Recarga de configuração
 
-O router relê cada roteador do banco a cada `SWITCHBOARD_CONFIG_TTL_S` (5 s) e só recria o motor quando o fingerprint da configuração efetiva muda (spec do roteador + modelos + conectores + agentes). Clientes HTTP de modelos que saíram de uso são fechados depois de 5 minutos, para não cortar pedidos em andamento. Os contratos abertos não dependem do motor: o supervisor continua com eles mesmo se o roteador for editado, e se ele for removido a consolidação sai sem LLM.
+O router relê cada roteador do banco a cada `SWITCHBOARD_CONFIG_TTL_S` (5 s) e só recria o motor quando o fingerprint da configuração efetiva muda (spec do roteador + modelos + conectores + agentes + o que vem dos plugins: versões, playbooks, frases de exemplo e avisos). Assim, aprovar, configurar, desligar ou atualizar um plugin chega ao roteamento em segundos, sem reiniciar. Clientes HTTP de modelos que saíram de uso são fechados depois de 5 minutos, para não cortar pedidos em andamento. Os contratos abertos não dependem do motor: o supervisor continua com eles mesmo se o roteador for editado, e se ele for removido a consolidação sai sem LLM.
+
+## Plugins
+
+Um plugin é um pacote declarativo (o formato está em [plugins.md](plugins.md); as razões, no [ADR 0002](adr/0002-plugins-declarativos.md)). O caminho dele até o pedido:
+
+1. **Leitura** (`switchboard.plugins`): o `.zip` é aberto em memória com limites (tamanho, número de arquivos, razão de compressão, só texto), o manifesto é validado, as skills viram playbooks, os placeholders `${config.X}` são conferidos e a varredura gera os achados. Um pacote no formato do Claude passa antes pelo conversor (`plugins.claude`). O resultado é um `PluginBundle`: manifesto, achados, playbooks e o pacote normalizado (`pack()`: mesma ordem e datas, mesmos bytes), com o `sha256` do conteúdo.
+2. **Instalação** (`storage.plugins`, numa transação): grava o plugin (`plugins`), aplica a configuração (segredos cifrados), cria ou atualiza os componentes nas tabelas de sempre (`mcp_connectors`, `a2a_agents`, `knowledge_bases`) com `plugin_id` e nome `plugin.componente`, remove os que saíram da versão nova e registra o evento (`plugin_events`). Fora da transação, o `PluginService` (`storage.plugin_service`, usado pelo console) indexa os documentos das bases; se o embedder falha, o plugin fica instalado com um aviso, e **Sincronizar documentos** refaz a indexação depois.
+3. **Resolução** (`repo.resolve_profile`): ao montar um roteador, os plugins ligados a ele (`profile_plugins`) que estão **prontos** (ligados, sem achado pendente, configuração completa) somam seus conectores, agentes, bases, playbooks e frases de exemplo aos do roteador; os demais viram um aviso em cada execução. No modo YAML, o mesmo `PluginBundle` é montado a partir de `plugins:` (com `allow:` no lugar da aprovação) e entra no roteador sem banco.
+4. **No pedido** (`routing.playbooks`): depois do RAG e da descoberta, os playbooks recebem pontos pelo texto do pedido e do turno anterior (3 por gatilho que aparece, 2 por palavra do nome da skill, 1 por palavra da descrição; mínimo 3; até 3 por pedido, além dos `always`), e só concorrem os que cobrem um componente disponível. Os escolhidos entram no prompt da decisão e da resposta; na execução (argumentos, síntese, consolidação), entram os que cobrem o componente acionado. O texto vai sob o cabeçalho `ORIENTAÇÕES DOS PLUGINS`, com orçamento (3.000 caracteres por playbook, 6.000 por prompt) e depois do `system_prompt`, nunca no lugar dele. O span `playbooks` registra a escolha.
+5. **Uso** (`plugin_usage`): cada execução grava, por plugin e versão, os playbooks usados, as tools e skills de componentes do plugin (com o resultado) e as bases citadas, na mesma transação da execução. O console soma por versão e por componente; o modo YAML guarda o das execuções com agentes em memória.
+
+O pacote guardado em `plugins.package` é a fonte de verdade: reenviar o mesmo conteúdo só atualiza a configuração, **Refazer varredura** reaplica as regras atuais ao mesmo pacote e baixar o pacote devolve o `.zip` normalizado. O `digest` mostrado no console é o hash do conteúdo (caminho e bytes de cada arquivo), e não do `.zip`, então o mesmo conteúdo compactado de outro jeito é reconhecido como o mesmo pacote.
 
 ## Modelo de dados
 
@@ -143,6 +156,11 @@ erDiagram
     ROUTER_PROFILES }o--o{ MCP_CONNECTORS : profile_connectors
     ROUTER_PROFILES }o--o{ A2A_AGENTS : profile_agents
     ROUTER_PROFILES }o--o{ KNOWLEDGE_BASES : profile_knowledge_bases
+    ROUTER_PROFILES }o--o{ PLUGINS : profile_plugins
+    PLUGINS ||--o{ MCP_CONNECTORS : "plugin_id"
+    PLUGINS ||--o{ A2A_AGENTS : "plugin_id"
+    PLUGINS ||--o{ KNOWLEDGE_BASES : "plugin_id"
+    TRACES ||--o{ PLUGIN_USAGE : "uso por versão"
     KNOWLEDGE_BASES ||--o{ DOCUMENTS : contém
     DOCUMENTS ||--o{ CHUNKS : "quebrado em"
     TRACES ||--o{ CONTRACTS : "execução"
@@ -159,6 +177,10 @@ erDiagram
 - `contracts` — partes, skill, tipo (completo/básico), estado, termos (schemas e hashes, prazo), entrada, saída, artefatos, ids da tarefa remota, modo de retorno (push/polling), hash do token de push e o agendamento do supervisor.
 - `contract_events` — a linha do tempo de cada contrato, com a origem de cada evento (`router`, `response`, `push`, `poll`).
 - `spans` — os spans de cada execução.
+- `plugins` — o pacote normalizado (`package`) e o hash do conteúdo, a versão, o manifesto, os achados da varredura, os playbooks, as frases de exemplo, a configuração (segredos como `enc:` ou `env:`), as impressões digitais dos achados aprovados (com quem aprovou e quando) e se está ligado. Conectores, agentes e bases de um plugin são linhas comuns das tabelas acima, com `plugin_id` (apagadas junto com o plugin) e nome `plugin.componente`.
+- `profile_plugins` — os roteadores que usam cada plugin.
+- `plugin_events` — o histórico de cada plugin (instalação, atualização, reenvio do mesmo pacote, aprovação, configuração, ativação e desativação, varredura refeita, roteadores e remoção), com quem fez e a versão. Guarda o nome do plugin, não a chave, e por isso sobrevive à remoção.
+- `plugin_usage` — o uso por execução, plugin e versão: tipo (`playbook`, `tool`, `skill`, `knowledge`), componente e resultado.
 - `switchboard_meta` — a versão do schema.
 
 As tabelas são criadas e migradas na subida (`Database.init`, protegido por advisory lock no PostgreSQL para console e router subirem juntos). As migrações são aditivas e idempotentes: um banco da v0.1 ganha as colunas novas e os antigos "agentes" (servidores MCP) viram conectores, com os vínculos aos roteadores preservados.

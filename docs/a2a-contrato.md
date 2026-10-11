@@ -67,6 +67,10 @@ Na descoberta o roteador também confere que o endpoint JSON-RPC do card está *
 - **Completo**: a skill declara termos na extensão. Entrada e saída são dados estruturados (parte `data`), validados dos dois lados, e os schemas viajam como hash em cada mensagem.
 - **Básico**: o agente não conhece a extensão (qualquer agente A2A 1.0). O roteador envia uma instrução em texto autocontida (o decisor preenche `{"instrucao": "…"}`) e aceita a resposta em texto. O contrato continua valendo para prazo, estados e cancelamento.
 
+### Agentes que vêm de um plugin
+
+Um [plugin](plugins.md) pode trazer agentes A2A (`acme-credito.analise-credito`). Eles seguem exatamente este contrato: mesma descoberta, mesma checagem de origem, mesmos schemas, prazos e estados. O plugin só declara o agente; a URL e o token vêm da configuração de quem instala, e `allow_cross_origin: true` num pacote é retido pela varredura até alguém aprovar. O playbook do plugin pode orientar como preencher os argumentos e como consolidar o resultado, mas não muda os termos: o que entra e o que sai continua validado contra os schemas do card. Remover um plugin com contratos em aberto exige confirmação, porque o roteador deixa de acompanhá-los.
+
 ## O que viaja em cada mensagem
 
 O `SendMessage` que abre o contrato leva a entrada, os termos e a configuração de retorno:

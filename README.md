@@ -15,6 +15,8 @@ A cada pedido o roteador escolhe uma rota:
 
 Tudo é configurável sem mexer em código: **qual LLM** (OpenAI, Anthropic, Azure OpenAI, Gemini, Ollama, OpenRouter, Groq ou qualquer API compatível com OpenAI), **qual modelo de decisão**, **quais conectores MCP**, **quais agentes A2A** e **quais bases de conhecimento** cada roteador usa. A configuração fica num banco (PostgreSQL por padrão) e é editada por um console web; o router aplica mudanças em segundos, sem reiniciar.
 
+Um domínio inteiro também pode chegar pronto, como **[plugin](#plugins)**: um pacote `.zip` com conectores, agentes, bases e o jeito de usá-los (playbooks no formato Agent Skills), que se sobe, revisa, configura e liga a um roteador pelo console. O roteador continua o mesmo; o plugin é só dado, nunca código.
+
 ![Playground do console: delegação a um agente A2A que termina depois da resposta provisória](docs/img/playground.png)
 
 ## Arquitetura
@@ -29,6 +31,7 @@ flowchart LR
     R -->|"MCP: tools/list · tools/call"| M["Conectores MCP<br/>crédito · chamados"]
     R <-->|"A2A: SendMessage · GetTask · push"| A["Agentes A2A<br/>análise de crédito · risco"]
     C -->|playground| R
+    P[/"Plugins (.zip)<br/>conectores · agentes · bases · playbooks"/] -->|"upload · varredura · aprovação"| C
 ```
 
 É um monorepo com [uv workspaces](https://docs.astral.sh/uv/concepts/projects/workspaces/):
@@ -42,14 +45,15 @@ switchboard/
 ├── apps/console/         switchboard-console — UI e API admin (control plane)
 ├── examples/agents/      conectores MCP (crédito, chamados) e agentes A2A (análise de crédito, risco) de exemplo
 ├── examples/knowledge/   documentos da base de demonstração (empresa fictícia)
+├── examples/plugins/     plugin de exemplo (acme-credito): manifesto, playbook e base
 ├── examples/switchboard.yaml   configuração do modo framework (sem banco)
 ├── scripts/              dev.sh / dev.ps1 (stack sem Docker) e smoke.py (teste ponta a ponta)
-├── docs/                 arquitetura, API, contrato A2A e ADRs
+├── docs/                 arquitetura, API, contrato A2A, plugins e ADRs
 ├── Dockerfile            imagem única para os serviços Python
 └── docker-compose.yml    stack completa
 ```
 
-Detalhes do fluxo e do modelo de dados em [docs/arquitetura.md](docs/arquitetura.md); endpoints em [docs/api.md](docs/api.md); o contrato com agentes em [docs/a2a-contrato.md](docs/a2a-contrato.md); as decisões de desenho em [docs/adr](docs/adr/0001-decisao-hibrida-e-contratos-a2a.md).
+Detalhes do fluxo e do modelo de dados em [docs/arquitetura.md](docs/arquitetura.md); endpoints em [docs/api.md](docs/api.md); o contrato com agentes em [docs/a2a-contrato.md](docs/a2a-contrato.md); os plugins em [docs/plugins.md](docs/plugins.md); as decisões de desenho nos ADRs ([0001](docs/adr/0001-decisao-hibrida-e-contratos-a2a.md): decisão híbrida e contratos A2A; [0002](docs/adr/0002-plugins-declarativos.md): plugins declarativos).
 
 ## Subir em dois minutos (Docker)
 
@@ -214,6 +218,36 @@ Em **Conhecimento**, crie uma base e envie arquivos (`.md`, `.txt`, `.pdf`, `.ht
 
 No PostgreSQL com pgvector a similaridade é calculada pelo banco; sem a extensão (ou no SQLite) os vetores ficam em JSON e a conta é feita na aplicação.
 
+## Plugins
+
+Colocar um domínio no roteador costuma exigir quatro cadastros feitos à mão em cada ambiente: o conector, o agente, a base e um `system_prompt` explicando como usá-los. Um **plugin** junta tudo num pacote versionado:
+
+```
+acme-credito.zip
+├── plugin.yaml                          manifesto: versão, configuração, conectores, agentes, bases
+├── skills/politica-de-credito/SKILL.md  playbook (formato Agent Skills): como atender esse assunto
+└── knowledge/politica-de-credito.md     documentos da base
+```
+
+Em **Plugins → Subir plugin**, o console mostra, antes de gravar qualquer coisa, o que o pacote traz, o que a varredura de segurança encontrou e o que muda em relação à versão instalada. Depois de instalado, a página do plugin diz o que falta para ele entrar em uso: aprovar o que a varredura reteve, informar endereços e tokens e ligá-lo a roteadores.
+
+![Plugin instalado: o que falta para entrar em uso e o uso por versão](docs/img/plugin.png)
+
+O que muda no roteamento:
+
+- os componentes ganham o nome `plugin.componente` (`acme-credito.credito`) e entram no catálogo do roteador como os demais, sob as mesmas allowlists, schemas e contratos;
+- o playbook entra no prompt do LLM **só nos pedidos a que se refere** (pelos gatilhos, pelo nome e pela descrição da skill), com orçamento de texto e sob um cabeçalho que o identifica como texto de terceiros, sem substituir o `system_prompt`;
+- cada execução registra o que veio de qual plugin e de qual versão, e a página do plugin compara o uso entre versões.
+
+O pacote nunca traz endereços nem tokens: eles são `${config.CHAVE}` que quem instala preenche, e os segredos ficam cifrados. Só entram arquivos de texto, lidos em memória e com limites. A varredura bloqueia o que é claramente perigoso (segredo no pacote, caminho que escapa do zip, texto invisível) e retém para aprovação o que pede julgamento (texto que dá ordens ao modelo, endereço de rede interna). Plugins no formato do Claude (`.claude-plugin/plugin.json`) são importados só pelas partes declarativas: skills, servidores MCP remotos e `userConfig`.
+
+```bash
+uv run switchboard plugin validate examples/plugins/acme-credito   # varredura (--strict falha também com avisos)
+uv run switchboard plugin pack examples/plugins/acme-credito -o acme-credito.zip
+```
+
+No modo framework, o plugin entra no YAML (`plugins:`, com `path` e `config`) e o roteador o usa com `plugins: [acme-credito]`. O guia completo, com o formato do manifesto, o ciclo de vida e as regras da varredura, está em [docs/plugins.md](docs/plugins.md); o porquê do desenho, no [ADR 0002](docs/adr/0002-plugins-declarativos.md).
+
 ## Usando o router
 
 | Endpoint | Para quê |
@@ -223,6 +257,7 @@ No PostgreSQL com pgvector a similaridade é calculada pelo banco; sem a extens�
 | `GET /v1/runs/{id}` · `/events` · `POST /cancel` | acompanha (polling ou SSE) ou cancela uma execução com agentes |
 | `GET /v1/models` | lista os roteadores ativos |
 | `GET /v1/connectors` · `GET /v1/agents` | conectores MCP e agentes A2A do roteador, com o resultado da descoberta |
+| `GET /v1/plugins` | o que os plugins ativos trazem para o roteador (versão, componentes e playbooks) e os que ficaram de fora, com o motivo |
 
 Com qualquer SDK da OpenAI:
 
@@ -243,14 +278,15 @@ No endpoint compatível com OpenAI, uma delegação pendente volta com a respost
 
 ## Modo framework (sem console nem banco)
 
-O núcleo funciona como biblioteca, configurado por YAML — veja [examples/switchboard.yaml](examples/switchboard.yaml), que tem os quatro servidores de exemplo e um roteador com Jev:
+O núcleo funciona como biblioteca, configurado por YAML — veja [examples/switchboard.yaml](examples/switchboard.yaml), que tem os quatro servidores de exemplo, um roteador com Jev e o plugin de exemplo (roteador `credito-pack`):
 
 ```bash
 uv sync
-uv run switchboard -c examples/switchboard.yaml check
+uv run switchboard -c examples/switchboard.yaml check        # valida o YAML e varre os plugins
 uv run switchboard -c examples/switchboard.yaml connectors   # tools dos conectores MCP
 uv run switchboard -c examples/switchboard.yaml agents       # skills e contratos dos agentes A2A
 uv run switchboard -c examples/switchboard.yaml ask "Qual o horário de atendimento aos sábados?"
+uv run switchboard -c examples/switchboard.yaml ask -p credito-pack "Quais documentos são necessários para o empréstimo?"
 SWITCHBOARD_CONFIG_FILE=examples/switchboard.yaml uv run switchboard-router   # router lendo o YAML
 ```
 
@@ -275,7 +311,7 @@ A URL segue o padrão do SQLAlchemy em `SWITCHBOARD_DATABASE_URL`:
 - **PostgreSQL** (padrão): `postgresql://usuario:senha@host:5432/banco` — habilita a extensão `vector` sozinho quando tem permissão.
 - **SQLite** (desenvolvimento): `sqlite:///./data/switchboard.db`.
 
-As tabelas são criadas na subida e as migrações são aditivas e automáticas: um banco da v0.1 é atualizado na primeira subida da v0.2 (os antigos "agentes" MCP viram conectores, com os vínculos preservados). O acesso a dados passa por uma camada única (`switchboard.storage`), então outros bancos suportados pelo SQLAlchemy entram sem mudar o resto do código.
+As tabelas são criadas na subida e as migrações são aditivas e automáticas: um banco da v0.1 é atualizado na primeira subida da v0.2 (os antigos "agentes" MCP viram conectores, com os vínculos preservados), e um banco sem plugins ganha as tabelas deles sem mudar o que já existe. O acesso a dados passa por uma camada única (`switchboard.storage`), então outros bancos suportados pelo SQLAlchemy entram sem mudar o resto do código.
 
 ## Desenvolvimento
 
@@ -291,7 +327,7 @@ make test-pg            # inclui PostgreSQL: precisa de um pgvector em localhost
 make lint               # ruff
 ```
 
-A suíte cobre provedores (com transporte HTTP simulado), o cliente do Jev, RAG, conectores MCP com servidores em processo, agentes A2A construídos com o SDK oficial (contratos completos e básicos, push, polling, prazos, violações e pedidos de entrada), o motor de roteamento com um LLM roteirizado, as APIs do router e do console e o storage em SQLite e PostgreSQL. O CI roda lint, testes com PostgreSQL e o `scripts/smoke.py` contra a stack inteira via Docker Compose.
+A suíte cobre provedores (com transporte HTTP simulado), o cliente do Jev, RAG, conectores MCP com servidores em processo, agentes A2A construídos com o SDK oficial (contratos completos e básicos, push, polling, prazos, violações e pedidos de entrada), o motor de roteamento com um LLM roteirizado, os plugins (leitura do pacote com limites, cada regra da varredura, playbooks no prompt, importação do formato Claude, instalação, atualização e remoção), as APIs do router e do console e o storage em SQLite e PostgreSQL. O CI roda lint, testes com PostgreSQL, a validação do plugin de exemplo (`switchboard plugin validate --strict`) e o `scripts/smoke.py` contra a stack inteira via Docker Compose.
 
 ## Segurança
 
@@ -300,6 +336,7 @@ A suíte cobre provedores (com transporte HTTP simulado), o cliente do Jev, RAG,
 - **Agentes A2A**: o endpoint JSON-RPC do Agent Card precisa estar na mesma origem da URL cadastrada (senão, `allow_cross_origin` explícito); cada contrato tem um token de push exclusivo (o banco guarda só o hash) e o endpoint de push recusa token errado; `callback_url` só aceita hosts de `SWITCHBOARD_CALLBACK_HOSTS`; os agentes de exemplo só mandam push para os destinos de `AGENT_PUSH_HOSTS` (padrão: a própria máquina) e o `switchboard-agentkit` pode exigir o token do roteador (`auth_tokens`) no JSON-RPC. Entrada e saída são validadas contra os schemas do contrato dos dois lados.
 - **Console**: senha opcional (HTTP Basic) e bloqueio de formulários vindos de outra origem.
 - **Router**: chaves de API opcionais; allowlist de tools por conector e de skills por agente; argumentos validados contra o schema antes do `tools/call` ou do `SendMessage`.
+- **Plugins**: são só dado (nenhum código do pacote é executado); o pacote é lido em memória, com limites de tamanho, de número de arquivos e de compressão, e só aceita arquivos de texto; endereços e tokens vêm da configuração de quem instala (segredos cifrados); o nome `plugin.componente` é reservado, para que nada manual se passe por um plugin; a varredura bloqueia ou retém para aprovação, e o plugin só entra em uso depois de aprovado. O texto dos playbooks entra no prompt com orçamento, sob um cabeçalho de texto de terceiros e sem substituir o `system_prompt`. A varredura é uma triagem, não uma prova de que o pacote é seguro: revise o que aprovar.
 - **Resiliência**: conector ou agente lento não trava os pedidos (descoberta com timeout curto e cache servido enquanto revalida); Jev fora → decide o LLM; LLM fora ou resposta inválida → decide o heurístico, com aviso no trace; contratos têm prazo e são retomados depois de um restart.
 - Ainda não tem: login com OIDC/SSO, perfis de acesso no console, rate limiting e migrações versionadas com Alembic.
 
@@ -311,6 +348,7 @@ A suíte cobre provedores (com transporte HTTP simulado), o cliente do Jev, RAG,
 - Compatibilidade com agentes A2A 0.3 (`message/send`).
 - Políticas de acesso por agente/usuário (OPA) e autenticação OIDC no console e no router.
 - Migrações com Alembic e índices ANN (HNSW) por dimensão no pgvector.
+- Plugins: assinatura de pacotes e catálogo, seleção de playbooks por embeddings ou pelo Jev, e `references/` das skills carregadas sob demanda.
 
 ## Licença
 

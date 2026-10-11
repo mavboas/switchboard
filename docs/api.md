@@ -53,7 +53,8 @@ Resposta de uma **tool MCP** (`200`):
   "latency_ms": 191.8,
   "usage": {"input_tokens": 0, "output_tokens": 0},
   "warnings": [],
-  "error": null
+  "error": null,
+  "plugins": []
 }
 ```
 
@@ -83,6 +84,8 @@ Resposta de uma **delegação** que passou da espera (`202`):
 - `contracts`: um resumo por contrato (id, agente, skill, tipo, estado, prazo, última mensagem, erro).
 - `sources`: cada item tem `index`, `kb`, `document`, `section`, `chunk_id`, `score` e `snippet`.
 - `spans`: a árvore completa da execução (ver [arquitetura](arquitetura.md#spans)); `steps` é um resumo por etapa, mantido por compatibilidade com a v0.1.
+- `plugins`: o que veio de [plugins](plugins.md) nesta execução, um item por uso: `plugin`, `version`, `kind` (`playbook` que entrou no prompt, `tool` MCP, `skill` A2A ou base de `knowledge` citada), `component` e `ok` (resultado da tool ou skill; `null` para playbook e base).
+- `warnings`: o que não impediu a resposta mas merece atenção, como um conector fora do ar, uma decisão que subiu para o LLM ou um plugin ligado ao roteador que não está ativo (`plugin acme-credito 1.0.0 não está ativo: aguardando aprovação`).
 
 ### Execuções: `/v1/runs/{run_id}`
 
@@ -108,13 +111,26 @@ curl -s localhost:8080/v1/chat -H 'Content-Type: application/json' \
 
 ### `POST /v1/chat/completions`
 
-Compatível com a API de Chat Completions da OpenAI. `model` é o nome do roteador (aceita `switchboard/<nome>`); `stream: true` devolve SSE (`chat.completion.chunk` e `[DONE]`). A resposta inclui o campo extra `switchboard` com `trace_id`, `run_id`, `status`, `route`, `decided_by`, `agent`, `tool`, `sources`, `contracts` e, numa delegação, `links`. Para retomar uma execução em `needs_input` ou ajustar a espera, envie `"switchboard": {"run_id": "...", "wait_s": 0}` no corpo. Roteador inexistente: HTTP 404 com `{"error": {"code": "model_not_found", ...}}`.
+Compatível com a API de Chat Completions da OpenAI. `model` é o nome do roteador (aceita `switchboard/<nome>`); `stream: true` devolve SSE (`chat.completion.chunk` e `[DONE]`). A resposta inclui o campo extra `switchboard` com `trace_id`, `run_id`, `status`, `route`, `decided_by`, `agent`, `tool`, `sources`, `contracts`, `plugins` e, numa delegação, `links`. Para retomar uma execução em `needs_input` ou ajustar a espera, envie `"switchboard": {"run_id": "...", "wait_s": 0}` no corpo. Roteador inexistente: HTTP 404 com `{"error": {"code": "model_not_found", ...}}`.
 
 ### Outros
 
 - `GET /v1/models` — roteadores ativos no formato de lista de modelos da OpenAI.
 - `GET /v1/connectors?profile=default&refresh=true` — conectores MCP do roteador com status, latência, tools e schemas.
 - `GET /v1/agents?profile=default&refresh=true` — agentes A2A do roteador com status, versão do protocolo, push, skills e termos do contrato.
+- `GET /v1/plugins?profile=default` — o que os plugins **ativos** trazem para o roteador; os ligados que ainda não estão ativos ficam de fora, com o motivo em `warnings`:
+
+  ```json
+  {"profile": "default",
+   "plugins": [{"name": "acme-credito", "version": "1.0.0",
+                "connectors": ["acme-credito.credito"], "agents": ["acme-credito.analise-credito"],
+                "knowledge_bases": ["acme-credito.politicas"],
+                "playbooks": [{"skill": "politica-de-credito", "description": "...", "applies_to": ["credito", "analise-credito"],
+                               "triggers": ["financiamento", "empréstimo", "parcela", "…"], "always": false}]}],
+   "warnings": []}
+  ```
+
+  O texto dos playbooks não sai por aqui (está na API admin do console).
 - `POST /a2a/push/{contract_id}` — recebe as push notifications dos agentes (`StreamResponse` A2A). Autenticado pelo token exclusivo do contrato no cabeçalho `X-A2A-Notification-Token`; token errado recebe 401.
 - `GET /healthz` — processo no ar. `GET /readyz` — banco acessível (503 se não).
 
@@ -137,11 +153,13 @@ Mesma configuração da UI, para automação e config-as-code. Com `SWITCHBOARD_
 | `DELETE /api/knowledge-bases/{id}/documents/{doc}` | remove documento |
 | `POST /api/knowledge-bases/{id}/search` | `{"query", "top_k", "min_score"}` |
 | `POST /api/knowledge-bases/{id}/reindex` | recalcula vetores |
-| `GET·POST /api/profiles` · `PUT·DELETE /api/profiles/{id}` | roteadores, referenciando modelos, conectores, agentes e bases **pelo nome** |
+| `GET·POST /api/profiles` · `PUT·DELETE /api/profiles/{id}` | roteadores, referenciando modelos, conectores, agentes, bases e plugins (`plugins`) **pelo nome** |
 | `GET /api/traces?profile=&route=&status=&limit=&offset=` · `GET /api/traces/{id}` | execuções (o detalhe traz spans e contratos com eventos) |
 | `GET /api/contracts?state=&agent=&profile=&limit=&offset=` · `GET /api/contracts/{id}` | contratos (o detalhe traz termos, entrada, saída e a linha do tempo) |
 
 Mandar um servidor MCP para `/api/agents` (com `transport` ou `allowed_tools`) devolve 400 indicando `/api/connectors`.
+
+Conectores, agentes e bases que vieram de um plugin aparecem com o campo `plugin` preenchido e o nome `plugin.componente`. Eles só mudam pelo plugin: `PUT`/`DELETE` neles (e enviar documentos a uma base de plugin) devolvem **409**; numa base de plugin, o `PUT` só troca o embedder. Um roteador não os escolhe um a um (400): liga-se o plugin (`plugins` no roteador, ou `PUT /api/plugins/{nome}/profiles`). Nomes com ponto são reservados a plugins, e um cadastro manual com ponto recebe 400.
 
 Exemplo — um roteador com Claude redigindo e o Jev decidindo:
 
@@ -156,6 +174,44 @@ curl -s -X POST localhost:8000/api/profiles -H 'Content-Type: application/json' 
   "name": "atendimento", "model": "claude", "decision_model": "jev", "decision_threshold": 0.6,
   "connectors": ["credito", "chamados"], "agents": ["analise-credito", "risco"],
   "knowledge_bases": ["manual-atendimento"], "wait_s": 8, "max_parallel": 3, "deadline_s": 600}'
+```
+
+### Plugins
+
+Instalação e ciclo de vida dos [plugins](plugins.md). Nos caminhos, `{ref}` é o nome do plugin (ou o id).
+
+| Método e caminho | Descrição |
+|---|---|
+| `GET /api/plugins` | plugins instalados: situação (`state`: `pronto`, `desativado`, `aguardando_aprovacao`, `config_incompleta` ou `invalido`, com `state_label`), achados por nível (`counts`), quantos esperam aprovação (`pending`), configuração que falta (`missing`), roteadores ligados (`profiles`) e componentes por tipo |
+| `POST /api/plugins/validate` | multipart (`file`): lê e varre o pacote **sem gravar**. Devolve o manifesto resumido (configuração, conectores, agentes, bases, playbooks), os achados, `ok` (falso se algo bloqueia) e `preview`: `action` (`install`, `upgrade`, `unchanged` ou `downgrade`), a versão instalada, os achados que vão pedir aprovação (`pending`) e quantos aprovados continuam valendo (`carried`) |
+| `POST /api/plugins` | multipart: `file`, `config` (JSON `{"CHAVE": "valor"}`), `clear` (chaves a apagar, separadas por vírgula) e `allow_downgrade`. **201** na primeira instalação, **200** em atualização ou repetição. Devolve `action`, `previous_version`, `pending`, `missing`, `notes` (por exemplo, falha ao indexar) e o `plugin` |
+| `GET /api/plugins/{ref}` | detalhe: configuração (segredos só dizem se existem), achados (com `approved`), componentes, playbooks (com o texto), uso por versão (`usage`) e por componente (`components_usage`), histórico (`events`) e contratos em aberto (`open_contracts`) |
+| `GET /api/plugins/{ref}/package` | o pacote guardado (`.zip` normalizado). O `digest` do plugin é o sha256 do conteúdo (caminho e bytes de cada arquivo), não do `.zip` |
+| `PUT /api/plugins/{ref}/config` | `{"config": {"CHAVE": "valor"}, "clear": ["CHAVE"]}`; segredo como texto (fica cifrado) ou `env:NOME`; valor vazio mantém o atual |
+| `POST /api/plugins/{ref}/approve` | aprova os achados que exigem aprovação (registra quem aprovou e quando). Corpo opcional `{"digest": "..."}` com o `digest` que você revisou: se outro pacote foi instalado depois, responde **409** e nada é aprovado |
+| `POST /api/plugins/{ref}/enable` · `POST /api/plugins/{ref}/disable` | liga ou desliga, sem apagar nada |
+| `PUT /api/plugins/{ref}/profiles` | `{"profiles": ["default"]}`: liga o plugin **exatamente** a estes roteadores (os demais deixam de usá-lo) |
+| `POST /api/plugins/{ref}/rescan` | refaz a varredura do pacote guardado (por exemplo, depois de atualizar o Switchboard) |
+| `POST /api/plugins/{ref}/sync` | deixa as bases do plugin com exatamente os documentos do pacote guardado |
+| `DELETE /api/plugins/{ref}?force=false` | remove o plugin com os conectores, agentes e bases dele (**204**); o histórico e o uso continuam registrados |
+| `GET /api/plugins/usage?plugin=` | uso por plugin e versão: `requests`, `uses`, `errors`, `kinds` (`playbook`, `tool`, `skill`, `knowledge`) e `last_at` |
+| `GET /api/plugins/events?plugin=&limit=50` | histórico (instalar, atualizar, aprovar, configurar, ligar, remover…) com quem fez; sobrevive à remoção do plugin |
+
+Cada achado tem `level` (`block`, `held`, `warning` ou `note`), `code`, `message`, `where` (arquivo e linha) e `evidence` (o trecho, resumido; um segredo nunca aparece inteiro).
+
+Erros: instalar um pacote com achado que bloqueia (inclusive um arquivo que não é `.zip`) → **422** com `{"detail": {"message": "...", "findings": [...]}}`, e nada é gravado (a validação do mesmo pacote responde 200 com `ok: false`); arquivo ausente, vazio ou acima do limite, `config` inválida (JSON malformado ou chave que o plugin não declara) ou roteador inexistente → **400**; plugin inexistente → **404**; remover com contratos em aberto sem `force=true` → **409**.
+
+```bash
+curl -s -F file=@acme-credito.zip localhost:8000/api/plugins/validate | python3 -m json.tool
+
+curl -s -F file=@acme-credito.zip \
+  -F 'config={"CREDITO_URL": "http://credito:8101/mcp", "ANALISE_URL": "http://analise:8201", "ANALISE_TOKEN": "env:A2A_ANALISE_TOKEN"}' \
+  localhost:8000/api/plugins
+
+curl -s -X PUT localhost:8000/api/plugins/acme-credito/profiles \
+  -H 'Content-Type: application/json' -d '{"profiles": ["atendimento"]}'
+
+curl -s localhost:8000/api/plugins/usage?plugin=acme-credito
 ```
 
 ## Variáveis de ambiente
